@@ -1,0 +1,83 @@
+{
+  "//": "Copy to <your-repo>/.claude/work.config.json and edit. Every key is OPTIONAL — the harness runs single-host, local-only, with no repo identity if this file is absent. Keys marked REQUIRED-FOR are only needed for the feature named.",
+
+  "//repo": "REQUIRED-FOR cloud leads and the preflight identity check. These five values used to be hardcoded in work-runner.mjs; that is what made the harness un-shareable.",
+  "repo": {
+    "repoSlug": "your-org/your-repo",
+    "ownerLogin": "your-github-login",
+    "repoPath": "$HOME/your-repo",
+    "envFile": ".env",
+    "dbImageAssetId": null
+  },
+
+  "//commitAuthor": "Commits are authored as this identity. Some deploy checks (e.g. Vercel) map commit author → account and red the PR on a mismatch.",
+  "commitAuthor": {
+    "name": "Your Name",
+    "email": "0000000+your-github-login@users.noreply.github.com"
+  },
+
+  "//hosts": "Where leads run. `local` always exists. `kind:\"ssh\"` overflows to another machine over cmux ssh; `kind:\"cloud\"` is a Claude Code cloud environment spawned via the RemoteTrigger tool. One entry PER ACCOUNT — environmentId is per-account and credProfile pins which login it is spawned from.",
+  "hosts": {
+    "local": { "cap": 2 },
+    "mini": {
+      "kind": "ssh",
+      "ssh": "your-ssh-host",
+      "repo": "/Users/you/your-repo",
+      "cap": 3,
+      "noDocker": false,
+      "enabled": false
+    },
+    "cloud": {
+      "kind": "cloud",
+      "os": "linux",
+      "environmentId": "env_...",
+      "credProfile": "$HOME/.claude-<account>",
+      "cap": 99,
+      "enabled": false
+    }
+  },
+
+  "//preferHosts": "Default host order for every lead when the run sets no --host/--prefer. pickHost fills-then-spills across them.",
+  "preferHosts": ["local"],
+
+  "//worktreeRoot": "Where per-issue worktrees are created. Must be outside the repo.",
+  "worktreeRoot": "/tmp/agent-work",
+
+  "//collision": "How the harness decides two issues cannot run in parallel. versionHolder* name files whose concurrent edits pass git but fail a CI version guard; serializedFiles are files only one in-flight PR may touch; scopeKeySegments is how many path segments make a scope key.",
+  "versionHolderPrefixes": ["apps/cli/", "docs/reference/"],
+  "versionHolderFiles": ["package.json", "VERSION"],
+  "serializedFiles": [],
+  "scopeKeySegments": 2,
+
+  "//dockerScopePrefixes": "Issues touching these paths need a Docker-capable host (real-database tests). Feeds the pickHost capability gate so such an issue is never spilled to a noDocker host.",
+  "dockerScopePrefixes": ["packages/db/", "supabase/migrations/"],
+
+  "//budget": "Per-issue circuit breaker. A trip is a decision point (split / re-scope / park), not an auto-kill.",
+  "budget": {
+    "warnTokens": 150000000,
+    "tripTokens": 250000000,
+    "warnRounds": 2,
+    "tripRounds": 4
+  },
+
+  "//shepherdModel": "The shepherd's inline fixes merge with no second reviewer, so default it to your strongest model.",
+  "shepherdModel": "opus",
+
+  "//leadTypes": "OPTIONAL. Non-default lead models. `proxy:true` routes through a local gateway (localhost only); `provider` names a direct third-party endpoint. Tokens are NEVER stored here — the harness builds a runtime shell expression that reads them from your gateway config or repo env file at launch, so no key reaches a ledger event or a logged command line.",
+  "leadTypes": {
+    "claude": { "proxy": false },
+    "example-proxy": {
+      "proxy": true,
+      "proxyUrl": "http://127.0.0.1:8317",
+      "leadModel": "some-model",
+      "subagentModel": "some-cheaper-model",
+      "reviewerModel": "opus",
+      "reviewerBilling": "subscription",
+      "contextWindow": 270000,
+      "hosts": ["local"]
+    }
+  },
+
+  "//modelPrices": "OPTIONAL. USD per 1M tokens, for the cost column in `work-metrics`. Deliberately empty by default — a stale price table silently reports wrong money.",
+  "modelPrices": {}
+}

@@ -1,0 +1,121 @@
+# Cloud lead brief template (cloud lead env)
+
+Template for a `/work` lead running as a Claude Code **cloud session** (spawned via the claude.ai
+RemoteTrigger one-shot API — see `spawn-lead --host cloud`). Fill the `<…>` slots. This mirrors the
+local `/work-lead` brief but adapts to the cloud sandbox's constraints (learned 2026-07-15 across 6
+qualification probes). Keep the **Provenance & authorization** block — zero-context cloud sessions
+have refused injection-shaped briefs without it.
+
+---
+
+## Provenance & authorization
+This task was scheduled by **<repo.ownerLogin>**, the repository owner, from his own Claude
+account via a one-shot routine on his own cloud environment. The environment's
+`GH_TOKEN` secret was configured by him for this purpose. The commit-author convention below is the
+repo's own — verify it in `CLAUDE.md` § *Commit author = repo owner*. You are a delivery lead for
+`<repo.repoSlug from .claude/work.config.json>`; take issue **<DER-id>** to a clean PR and hand off.
+
+## Session preamble (run FIRST — these are session-time duties the setup script can't do)
+```bash
+# 1. Re-assert commit identity (platform rewrites global git config after setup; repo-local usually
+#    survives, but set it here to be certain — else Vercel reds the PR and Codex may skip review)
+git config user.name "<commitAuthor.name>" && git config user.email "<commitAuthor.email>"
+export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
+# 2. Deps (usually pre-warmed + cached in the snapshot; install only if missing)
+[ -d node_modules ] || pnpm install --frozen-lockfile
+# 3. DB-lane only: load the Postgres image from the release asset if not already present
+if ! docker image inspect <your-registry>/<your-db-image>:<tag> >/dev/null 2>&1; then
+  docker info >/dev/null 2>&1 || { dockerd >/tmp/dockerd.log 2>&1 & sleep 8; }
+  curl -fL -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/octet-stream" \
+    https://api.github.com/repos/<repo.repoSlug>/releases/assets/<repo.dbImageAssetId> \
+    -o /tmp/pg.tar.gz && docker load -i /tmp/pg.tar.gz && rm -f /tmp/pg.tar.gz
+fi
+```
+
+## Cloud-specific conventions (differ from local `/work-lead`)
+- **No worktree, no cmux** — you're a fresh clone in an isolated VM. Work directly in the checkout.
+- **GitHub writes:** PR creation → prefer the **GitHub MCP tools** (they author as `<repo.ownerLogin>`, so Codex
+  engages). `gh` REST (`gh api repos/.../...`) works but authors comments as `claude[bot]`. **`gh pr
+  comment` / any GraphQL is DISABLED** in cloud sessions — use `gh api` REST for issue/PR comments.
+- **DB tests:** run on the default `postgresql://postgres:postgres@127.0.0.1:54322/postgres`, but the
+  **reset connects as `supabase_admin`** — `pnpm db:local:reset` uses that image-only role; do not
+  override DATABASE_URL to plain postgres for the reset. Per `packages/db/AGENTS.md`.
+- **Verify targeted** (typecheck + lint + changed test files, one `*.db.test.ts` if DB-touched);
+  CI is the gate for the HEAVY suites (db-suite, e2e, route-health). The box is ~4 vCPU / 15 GB — the
+  full fast suite runs but is slow. **EXCEPTION — deterministic guards are YOUR gate, not CI's:** if
+  the diff adds/changes a command, MCP tool, or reference guide, or touches `packages/commands`,
+  `packages/reference`, or `apps/cli`, run and pass BEFORE marking ready (seconds each; every skipped
+  one cost a kickback round on 2026-07-16): `pnpm check:manifest && pnpm check:cli-version &&
+  pnpm check:docs-version && pnpm docs:check` + the registry tests (ui-surface-parity, command-tools,
+  inventory, agent-how-tos). A NEW command trips ~6 registry surfaces (§17.8 classification, MCP guide
+  rows in GENERATED-from-title form, inventories/counts, reference entry, guide `version:` above
+  `git show origin/main:<file>`, regenerated CLI manifest + `pnpm fix:cli-version` above origin/main —
+  which makes the PR a VERSION-HOLDER that serializes in the queue). **Paste the guard evidence into the
+  PR body / hand-off note — the command you ran + a one-line green summary. A hand-off without guard
+  evidence is kickback-bait:** every round-1 hand-off on 2026-07-18 was kicked back for a `guards` red
+  (tenant-SQL DER-1092, docs-sync) or a protected-lane finding the lead could have caught locally.
+- **Subagent delegation is MANDATORY** (Agent tool works in cloud): decompose into 2–4 implementation
+  chunks, each dispatched to a Sonnet 5 subagent (`model: "claude-sonnet-5"`), research to Haiku, run
+  IN PARALLEL where file scopes are disjoint. The lead plans, adversarially reviews each diff,
+  integrates, and owns the PR — it does not write implementation code itself (integration glue
+  <~20 lines excepted). PR body must carry an "AC → evidence" checklist + the subagent breakdown.
+
+## Draft-PR-first lifecycle (how the orchestrator sees you — DER-1838)
+There is no local ledger file, and you must NOT enumerate/report session or env identifiers (that
+reads as recon and gets refused). Instead the orchestrator derives everything from your **PR state**:
+1. **At boot, before doing the work:** `git checkout -b <gitBranchName>` → empty WIP commit
+   (`git commit --allow-empty -m "wip(<DER-id>): cloud lead started"`) → push → **open a DRAFT PR via
+   the GitHub MCP tools** (draft:true, base main). A draft runs **no CI and no Codex**. Its footer
+   carries your `session_01…` handle automatically — that's the orchestrator's liveness signal + the
+   owner's read-only monitor handle. (No draft PR within the deadline ⇒ the orchestrator re-spawns you.)
+   **Then post your token-telemetry comment IMMEDIATELY (near-zero initial snapshot) and save its id:**
+   `TCID=$(gh api repos/<owner>/<repo>/issues/<PR>/comments -f body="$(node scripts/session-token-report.mjs --role lead --issues <DER-ids> --pr <PR> --host cloud)" --jq .id)`
+   The script reads your OWN session transcripts locally and reports tokens by model — it emits no
+   secrets and no session/env identifiers. **Boot-check contract:** this draft-PR-open + first telemetry
+   comment IS your boot signal and your FIRST actions after boot — do them so the orchestrator can verify
+   them **within 15 minutes** of the trigger firing; miss that window and you're presumed failed-to-start
+   and re-spawned.
+2. **Do the work** on the same branch, pushing commits as you go (each push = your progress signal).
+   **Push early, push often:** land your first commit+push within **~30 min of boot**, then push at every
+   coherent chunk — an unpushed session that dies loses everything, while a pushed branch lets a
+   continuation resume (four cloud sessions died silently 30–90 min in with nothing pushed on 2026-07-18).
+   **After EVERY push, refresh the SAME telemetry comment** (reports are cumulative; the orchestrator's
+   fold keeps the latest per report_id, so a session that dies mid-work still leaves its last-push spend
+   on the record — this is why it matters):
+   `gh api -X PATCH repos/<owner>/<repo>/issues/comments/$TCID -f body="$(node scripts/session-token-report.mjs --role lead --issues <DER-ids> --pr <PR> --host cloud)"`
+3. **Token telemetry final refresh — IMMEDIATELY BEFORE marking ready**, same PATCH as above (do this
+   before EVERY ready-flip, kickback re-hand-offs included, with `--kickback <n>` on kickback rounds).
+   If `$TCID` was lost, post a fresh comment with the same command — the stable report_id dedups it.
+4. **Hand off = mark the PR `ready_for_review`** via the GitHub MCP tools once targeted verify is green.
+   That draft→ready transition triggers CI + Codex and hands you to the shepherd. Do NOT merge.
+(Optional belt-and-suspenders: when you mark ready, capture `SHA=$(git rev-parse HEAD)` and post
+`gh api …/issues/<PR>/comments -f body='WORK-EVENT
+{"type":"handed_off","issues":["<DER-id>"],"pr":<PR>,"host":"cloud","sha":"'"$SHA"'"}'` — the runner's
+fold now reads that `sha` as deterministic evidence of a real pushed fix, so include it.)
+
+**Kickback re-spawn (item 1):** if this brief has a "⚠ Kickback" block, the PR already exists and the
+shepherd **converted it back to draft** when kicking it back (so your fix pushes run no CI). Skip the
+PR-open in step 1 (don't open a new PR) but DO post your own fresh telemetry comment at boot (you are a
+NEW session with a new report_id) — then load the branch, fix the findings, push to the same branch
+(refreshing the comment after every push, with `--kickback <n>`), and **re-mark the PR
+`ready_for_review`** after the final telemetry refresh.
+That second draft→ready IS your re-hand-off; the orchestrator re-derives it.
+**NEVER mark ready without having pushed a fix** — a ready flip at the unchanged head SHA is a flap the
+harness ignores. **Fix the CLASS, not the instance:** when a finding is one of N siblings (data sources,
+entry points, release paths), enumerate and fix them ALL this round. The brief's "Prior rounds" dossier
+lists what earlier rounds fixed — verify those are still intact on HEAD; don't re-litigate stale Codex
+reposts (check the finding against HEAD before "re-fixing" it).
+
+## Known non-issues (accepted conventions — do not flag, "fix", or chase)
+<paste the current contents of ~/.claude/skills/work/known-non-issues.md here — DER-1992>
+
+## Issue
+- **Acceptance criteria:** <AC>
+- **Reference-as-map:** <the analogous existing implementation to pattern-match — file / PR / package — or "no analog exists">
+- **Playbook:** open the draft PR (step 1 above) → read AGENTS.md + the area's invariants → plan if
+  non-trivial → build via subagents → targeted verify + write tests → adversarial self-review → push →
+  mark the PR ready_for_review. **Record every deviation from this brief in the PR body** (the shepherd
+  checks it before enqueue). Do NOT merge (the shepherd owns CI/merge).
+- **Guardrails:** never modify the `/work` harness; stage explicit paths (never `git add -A`); never
+  enumerate/report env or session ids into comments; no secrets in comments/logs (redact presigned-URL
+  query strings); conservative-by-default.
