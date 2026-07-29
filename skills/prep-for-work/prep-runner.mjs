@@ -13,9 +13,12 @@
 // bookkeeping that a model gets wrong when it is tired at 2am — that is this file's job. Every number
 // here is a measured baseline, not a guess, and `calibrate` exists because they WILL drift.
 //
-// Pure functions + a thin CLI. No network, no Linear, no git. Run: node prep-runner.mjs <subcommand>
+// Pure functions + a thin CLI. No network, no Linear. The grounding gates (query-check, symbol-check,
+// priorart-check) shell out READ-ONLY to the repo (git/rg/file reads); nothing here writes outside the
+// plan file. Run: node prep-runner.mjs <subcommand>
 
 import { readFile, writeFile, access, mkdir } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { resolve, join } from "node:path";
 
@@ -305,6 +308,20 @@ export function validatePlan(plan, opts = {}) {
   const warnings = [];
   const E = (id, msg) => errors.push(id ? `${id}: ${msg}` : msg);
   const W = (id, msg) => warnings.push(id ? `${id}: ${msg}` : msg);
+  // Grounding gate 2 (2026-07-29): an evidence query must have been RUN against a window where it is
+  // KNOWN to return hits, or it is a check that cannot fail. One helper shared by the per-issue and
+  // plan-level loops so the two cannot drift apart (the SQL-mirrors-validator class, applied to ourselves).
+  const gateEvidenceQuery = (scopeId, qi, q) => {
+    const label = `evidenceQueries[${qi}]${q?.name ? ` "${q.name}"` : ""}`;
+    const probs = evidenceQueryProblems(q);
+    for (const p of probs) E(scopeId, `${label}: ${p}`);
+    if (probs.length) return;
+    if (!Number.isFinite(q.observed?.count)) {
+      E(scopeId, `${label}: never validated against its known-positive window — run \`query-check --record\`. The 07-28 kill criterion's grep matched 2 of the 6 commits its own plan cited; it would have returned zero and auto-selected "delete the tool" while the problem recurred.`);
+    } else if (q.observed.count < q.expectAtLeast) {
+      E(scopeId, `${label}: returned ${q.observed.count} < ${q.expectAtLeast} on its known-positive window (${q.window}) — the query is BLIND to the history it cites; fix the QUERY, not the floor`);
+    }
+  };
 
   if (!plan || typeof plan !== "object") return { ok: false, errors: ["plan is not an object"], warnings };
   const issues = Array.isArray(plan.issues) ? plan.issues : null;
@@ -396,6 +413,35 @@ export function validatePlan(plan, opts = {}) {
       }
     }
 
+    // --- grounding gates (2026-07-29): what a plan entry CLAIMS must be grounded, not asserted. A plan
+    // in this repo shipped SIX vacuous checks while its author explicitly cited "a check that cannot
+    // fail is not evidence" and revised twice hunting that exact class — attention does not prevent
+    // this; arithmetic does. (Gate 4, prior-art, is advisory — after the loop.)
+    if (it.checks !== undefined && !Array.isArray(it.checks)) E(id, "checks must be an array");
+    for (const [ci, c] of (Array.isArray(it.checks) ? it.checks : []).entries()) {
+      for (const p of checkEntryProblems(c)) E(id, `checks[${ci}]${c?.name ? ` "${c.name}"` : ""}: ${p}`);
+    }
+    if (it.evidenceQueries !== undefined && !Array.isArray(it.evidenceQueries)) E(id, "evidenceQueries must be an array");
+    for (const [qi, q] of (Array.isArray(it.evidenceQueries) ? it.evidenceQueries : []).entries()) gateEvidenceQuery(id, qi, q);
+    if (it.symbols !== undefined && !Array.isArray(it.symbols)) E(id, "symbols must be an array");
+    for (const [si, s] of (Array.isArray(it.symbols) ? it.symbols : []).entries()) {
+      const label = `symbols[${si}]${s?.name ? ` "${s.name}"` : ""}`;
+      const probs = symbolShapeProblems(s);
+      for (const p of probs) E(id, `${label}: ${p}`);
+      if (probs.length) continue;
+      const use = s.use ?? "test";
+      if (!s.resolved?.status) {
+        E(id, `${label}: never resolved against the repo — run \`symbol-check --record\`. A brief was written demanding a behavioral test of a non-exported function; the lead burns a full round discovering that.`);
+      } else if (s.resolved.status === "not-found") {
+        E(id, `${label}: NOT FOUND in ${s.from} — the plan names a target that is not there; fix the plan, not the repo`);
+      } else if (s.resolved.status === "private" && use !== "edit") {
+        E(id, `${label}: PRIVATE in ${s.from} — unimplementable as a ${use} target as written. Re-scope to the public entry that reaches it; exporting a private function solely so a test can import it is the shape AGENTS.md's test-binds-symbol rule rejects. (Mark use:"edit" if the plan only modifies it in place.)`);
+      }
+    }
+    if (it.priorArt?.checkedAt && (it.priorArt.candidates?.length ?? 0) > 0 && !it.priorArt.disposition) {
+      W(id, `prior-art sweep found ${it.priorArt.candidates.length} candidate(s) and no disposition — JUDGE them and record the call in priorArt.disposition (cut or narrow the issue in Linear if something already covers it)`);
+    }
+
     // --- unresolved founder gates: the reason this phase is PRE-run
     const gate = it.gate ?? it.openQuestion;
     if (gate && !(typeof gate === "object" ? gate.answer : false)) {
@@ -445,6 +491,17 @@ export function validatePlan(plan, opts = {}) {
     if (!serialized && !bundled) {
       E(null, `${ids.join(" + ")} all hold version axis "${axis}" — serialize them (plan.serialization) or bundle them. Re-derive holder status from the CURRENT diff after every kickback round: a P1 fix can ADD an axis a PR did not hold at open time.`);
     }
+  }
+
+  // --- plan-level evidence queries (kill criteria and the like) gate identically to per-issue ones
+  if (plan.evidenceQueries !== undefined && !Array.isArray(plan.evidenceQueries)) E(null, "evidenceQueries must be an array");
+  for (const [qi, q] of (Array.isArray(plan.evidenceQueries) ? plan.evidenceQueries : []).entries()) gateEvidenceQuery(null, qi, q);
+
+  // --- gate 4 (prior art) is ADVISORY: warn, never refuse. The sweep is heuristic and the judgement is
+  // a human's — a refuse-gate satisfied by heuristic noise trains the operator to rubber-stamp it.
+  const unswept = issues.filter((i) => i?.id && byId.has(i.id) && !i.priorArt?.checkedAt);
+  if (unswept.length) {
+    W(null, `${unswept.length} issue(s) carry no prior-art sweep (${unswept.slice(0, 6).map((i) => i.id).join(", ")}${unswept.length > 6 ? ", …" : ""}) — run \`priorart-check --record\`: two of one wave's planned deliverables already existed in full (the test at cli-adapter.test.ts:1148, the collision guard scripts/db-next-migration.mjs)`);
   }
 
   // --- decisions must actually be decided
@@ -586,6 +643,9 @@ export function scaffoldPlan({ issues = [], label = null, date = null, specRef =
       bundleWith: [],
       versionAxes: [],
       dependsOn: [],
+      checks: [],
+      evidenceQueries: [],
+      symbols: [],
       notes: null,
       splitFrom: null,
     })),
@@ -804,6 +864,149 @@ export function applyPlanReview(issue, review, { sha = null, model = "codex", co
 }
 
 // ---------------------------------------------------------------------------
+// Grounding gates (2026-07-29) — deterministic complements to the plan review
+// ---------------------------------------------------------------------------
+// Why these exist: an implementation plan in this repo was written by an agent that explicitly cited
+// "a check that cannot fail is not evidence", was revised twice while actively hunting that exact class,
+// and still shipped SIX vacuous checks — found only by two independent reviewers. The class survives
+// attention; it does not survive arithmetic. The codex plan review (above) is the probabilistic
+// instrument that catches what a plan FAILS to claim; these four are the deterministic instrument that
+// grounds what it DOES claim:
+//   1. mutation-check  — every declared check names the mutation that makes it FAIL, and post-
+//      implementation the failure actually OBSERVED (a described failure is not an observed one).
+//   2. query-check     — every query used as evidence must reproduce a known-positive historical window.
+//      The 07-28 kill criterion's grep matched 2 of the 6 commits its own plan cited: it would have
+//      returned zero and auto-selected "delete the tool" while the problem recurred.
+//   3. symbol-check    — every named call/test target must exist and be importable from where the plan
+//      implies (a brief demanding a test of a non-exported function is unimplementable as written).
+//   4. priorart-check  — sweep tests/guards for prior art already asserting the property (two of one
+//      wave's planned deliverables existed in full). ADVISORY: candidates for human judgement, never cuts.
+// Gates 1–3 REFUSE in `validate`; gate 4 warns. The split is deliberate: 1–3 detect claims that are
+// mechanically false, while 4 is a heuristic whose false positives would train the operator to
+// rubber-stamp a refusal — and deleting work is a human call, never the tool's.
+
+// A declared check must name the edit that breaks it. `observedFailure` is filled in by the IMPLEMENTER
+// after seeing the check fail — demanded by `mutation-check --require-observed` (post-implementation),
+// not by plan-time validate, because at plan time the check does not yet exist to observe.
+export function checkEntryProblems(check) {
+  if (!check || typeof check !== "object") return ["not an object — checks are {name, mutation, observedFailure}"];
+  const problems = [];
+  if (!check.name || typeof check.name !== "string" || !check.name.trim()) problems.push("needs a name");
+  if (!check.mutation || typeof check.mutation !== "string" || !check.mutation.trim()) {
+    problems.push("declares no mutation — name the EXACT edit that makes this check fail. A check whose author cannot name what breaks it is the vacuous-check class this gate exists for.");
+  }
+  return problems;
+}
+
+export function checkMutations(plan, issueId = null, { requireObserved = false } = {}) {
+  const rows = [];
+  for (const it of plan?.issues ?? []) {
+    if (issueId && it.id !== issueId) continue;
+    if (it.checks !== undefined && !Array.isArray(it.checks)) {
+      rows.push({ id: it.id, index: null, name: null, problems: ["checks must be an array"] });
+      continue;
+    }
+    for (const [ci, c] of (it.checks ?? []).entries()) {
+      const problems = checkEntryProblems(c);
+      if (requireObserved && !(typeof c?.observedFailure === "string" && c.observedFailure.trim())) {
+        problems.push("no observedFailure recorded — APPLY the mutation, SEE the check fail, record the exact failure message, then revert. A described failure is not an observed one.");
+      }
+      rows.push({ id: it.id, index: ci, name: c?.name ?? null, problems });
+    }
+  }
+  return { rows, failures: rows.filter((r) => r.problems.length), ok: rows.every((r) => !r.problems.length) };
+}
+
+export const MUTATION_AC_MARKER = "**Must-fail checks (mutation gate):**";
+
+// The AC block `mutation-check --record` folds into `notes` — the field `write-brief --acceptance`
+// carries into the lead's brief verbatim. The criterion requires OBSERVING the failure, not describing it.
+export function mutationAcBlock(checks = []) {
+  return [
+    `${MUTATION_AC_MARKER} for each check below: apply the mutation, run the check, OBSERVE it fail, record the exact failure message in this plan entry's checks[].observedFailure, then revert the mutation. A described failure is not an observed one; \`mutation-check --require-observed\` verifies the record.`,
+    ...checks.filter((c) => c?.name && c?.mutation).map((c) => `- ${c.name} → mutate: ${c.mutation}`),
+  ].join("\n");
+}
+
+export function evidenceQueryProblems(q) {
+  if (!q || typeof q !== "object") return ["not an object — evidence queries are {name, query, window, expectAtLeast}"];
+  const problems = [];
+  if (!q.query || typeof q.query !== "string" || !q.query.trim()) problems.push("has no query");
+  if (!Number.isFinite(q.expectAtLeast) || q.expectAtLeast < 1) {
+    problems.push("has no known-positive floor — set expectAtLeast ≥ 1: the count the query MUST return on a window where the thing is KNOWN to have happened");
+  }
+  if (!q.window || typeof q.window !== "string" || !q.window.trim()) {
+    problems.push(`names no historical window — say WHICH known-positive history the floor comes from (e.g. "2026-07-20..26, the 6 axis-collision commits the plan cites")`);
+  }
+  return problems;
+}
+
+// Non-empty stdout lines are the match count. A query that errors produces no stdout and so counts 0 —
+// fail-closed, never "no output means clean".
+export function evaluateQueryOutput(stdout, expectAtLeast) {
+  const count = String(stdout ?? "").split("\n").filter((l) => l.trim()).length;
+  return { count, ok: count >= expectAtLeast };
+}
+
+export function collectEvidenceQueries(plan, issueId = null) {
+  const rows = [];
+  if (!issueId) for (const [qi, q] of (Array.isArray(plan?.evidenceQueries) ? plan.evidenceQueries : []).entries()) rows.push({ id: null, index: qi, q });
+  for (const it of plan?.issues ?? []) {
+    if (issueId && it.id !== issueId) continue;
+    for (const [qi, q] of (Array.isArray(it?.evidenceQueries) ? it.evidenceQueries : []).entries()) rows.push({ id: it.id, index: qi, q });
+  }
+  return rows;
+}
+
+export const SYMBOL_USES = ["test", "call", "edit"];
+
+export function symbolShapeProblems(s) {
+  if (!s || typeof s !== "object") return ["not an object — symbols are {name, from, use?}"];
+  const problems = [];
+  if (!s.name || typeof s.name !== "string" || !s.name.trim()) problems.push("needs a name");
+  if (!s.from || typeof s.from !== "string" || !s.from.trim()) problems.push("needs `from` — the repo-relative file the plan implies it lives in");
+  if (s.use !== undefined && !SYMBOL_USES.includes(s.use)) problems.push(`use must be one of ${SYMBOL_USES.join("|")} (got ${JSON.stringify(s.use)})`);
+  return problems;
+}
+
+// Heuristic ESM/TS export classifier — a regex, not a parser. Good enough to catch the motivating case
+// (a plan demanding a behavioral test of a non-exported `async function`); a re-export from ANOTHER
+// module is out of scope and reads as "private" here, which correctly prompts the same question the gate
+// exists to force: what actually imports this?
+export function classifySymbol(source, name) {
+  const src = String(source ?? "");
+  // `export { a, b as c }` — a rename exports the RIGHT-hand name; the left side is not importable.
+  for (const m of src.matchAll(/export\s*\{([^}]*)\}/g)) {
+    for (const entry of m[1].split(",")) {
+      const parts = entry.trim().split(/\s+as\s+/);
+      if ((parts[parts.length - 1] ?? "").trim() === name) return "exported";
+    }
+  }
+  const n = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  if (new RegExp(`export\\s+(?:default\\s+)?(?:async\\s+)?(?:function\\*?|class)\\s+${n}\\b`).test(src)) return "exported";
+  if (new RegExp(`export\\s+(?:const|let|var|type|interface|enum)\\s+${n}\\b`).test(src)) return "exported";
+  if (new RegExp(`(?:^|[\\s;{}])(?:async\\s+)?(?:function\\*?|class)\\s+${n}\\b`).test(src)) return "private";
+  if (new RegExp(`(?:^|[\\s;{}])(?:const|let|var|type|interface|enum)\\s+${n}\\b`).test(src)) return "private";
+  return "not-found";
+}
+
+// Term derivation for the prior-art sweep. Declared terms (issue.priorArt.terms) win; otherwise pull
+// identifiers out of the title/notes — backticked spans, camelCase, dotted/kebab/snake tokens — and skip
+// unit ids. Deliberately heuristic: the output is candidates for a HUMAN, never a verdict.
+export function deriveSearchTerms(issue = {}) {
+  const declared = issue?.priorArt?.terms;
+  if (Array.isArray(declared) && declared.length) return [...new Set(declared.filter((t) => typeof t === "string" && t.trim()))];
+  const text = [issue?.title, issue?.notes].filter(Boolean).join("\n");
+  const terms = new Set();
+  for (const m of text.matchAll(/`([^`\n]{3,80})`/g)) terms.add(m[1].trim());
+  for (const m of text.matchAll(/\b[a-z][a-z0-9]*(?:[A-Z][a-z0-9]*)+\b/g)) terms.add(m[0]);
+  for (const m of text.matchAll(/\b[A-Za-z][\w$]*(?:[._-][\w$]+)+\b/g)) {
+    if (!LINEAR_ID_RE.test(m[0]) && !SPEC_UNIT_RE.test(m[0])) terms.add(m[0]);
+  }
+  return [...terms].slice(0, 8);
+}
+
+// ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
 export function parseArgs(argv) {
@@ -813,6 +1016,8 @@ export function parseArgs(argv) {
     if (a === "--help" || a === "-h") o.help = true;
     else if (a === "--json") o.json = true;
     else if (a === "--verify") o.verify = true;
+    else if (a === "--record") o.record = true;
+    else if (a === "--require-observed") o.requireObserved = true;
     else if (a === "--surfaces") o.surfaces = argv[++i];
     else if (a === "--core") o.core = Number.parseInt(argv[++i], 10);
     else if (a === "--extra-files") o.extraFiles = Number.parseInt(argv[++i], 10);
@@ -853,6 +1058,25 @@ export function usage() {
     `  plan-review-record <plan.json> <DER-id> --review <out.json> --log <codex.jsonl> [--out plan.json]`,
     `        Fold an accepted review in as watchOuts + planReview. REFUSES a run that never completed or`,
     `        never searched the repo (command_execution=0 returns fabricated findings — DER-2504).`,
+    ``,
+    `  mutation-check <plan.json> [id] [--require-observed] [--record]`,
+    `        GROUNDING GATE 1 (refuses in validate). Every declared check (issues[].checks: [{name,`,
+    `        mutation, observedFailure}]) must name the exact edit that makes it FAIL. --require-observed`,
+    `        additionally demands the recorded OBSERVED failure (post-implementation; described is not`,
+    `        observed). --record folds the observe-the-failure AC into notes, which the brief carries.`,
+    `  query-check <plan.json> [id] [--repo-root <p>] [--record] [--out <plan.json>]`,
+    `        GROUNDING GATE 2 (refuses in validate). RUNS every evidenceQueries[] entry ({name, query,`,
+    `        window, expectAtLeast} — plan-level or per-issue) and fails any returning fewer non-empty`,
+    `        stdout lines than its known-positive floor. A query that errors counts 0 — fail-closed.`,
+    `        --record stamps observed counts; validate refuses unstamped or failing queries.`,
+    `  symbol-check <plan.json> [id] [--repo-root <p>] [--record] [--out <plan.json>]`,
+    `        GROUNDING GATE 3 (refuses in validate). Resolves every issues[].symbols[] ({name, from, use?})`,
+    `        target as exported / private / not-found. A private call/test target is a RE-SCOPE, not an`,
+    `        export (the test-binds-symbol rule); use:"edit" permits private. --record stamps resolutions.`,
+    `  priorart-check <plan.json> [id] [--repo-root <p>] [--record] [--out <plan.json>]`,
+    `        GROUNDING GATE 4 (advisory — warns in validate, never refuses, never cuts an issue). Sweeps`,
+    `        (rg, grep fallback) tests and guards for prior art already asserting what an issue proposes to add; reports`,
+    `        candidates for HUMAN judgement. --record stamps priorArt; record your call in priorArt.disposition.`,
     ``,
     `Surfaces: ${Object.keys(SURFACES).join(", ")}`,
     `Risk lanes: ${RISK_LANES.join(", ")}  (high: ${[...HIGH_RISK_LANES].join(", ")})`,
@@ -1003,6 +1227,160 @@ export async function runSubcommand(argv) {
         ].join("\n"),
         issue,
       };
+    }
+    case "mutation-check": {
+      const planPath = resolve(o.rest[0] ?? o.plan);
+      const plan = await readJson(planPath);
+      const id = o.rest[1] ?? o.issue ?? null;
+      const res = checkMutations(plan, id, { requireObserved: o.requireObserved });
+      const lines = res.rows.map((r) => r.problems.length
+        ? `🔴 ${r.id} checks[${r.index ?? "-"}]${r.name ? ` "${r.name}"` : ""}: ${r.problems.join(" · ")}`
+        : `ok   ${r.id} "${r.name}"${o.requireObserved ? " — failure observed and recorded" : ""}`);
+      if (!res.rows.length) lines.push(`no declared checks${id ? ` on ${id}` : ""} — nothing to gate. Declare them as issues[].checks: [{name, mutation, observedFailure}] so this gate can hold them.`);
+      if (o.record) {
+        let stamped = 0;
+        for (const it of plan.issues ?? []) {
+          if (id && it.id !== id) continue;
+          const checks = (Array.isArray(it.checks) ? it.checks : []).filter((c) => c?.name && c?.mutation);
+          if (!checks.length || it.notes?.includes(MUTATION_AC_MARKER)) continue;
+          const block = mutationAcBlock(checks);
+          it.notes = it.notes ? `${it.notes}\n\n${block}` : block;
+          stamped += 1;
+        }
+        const outPath = resolve(o.out ?? planPath);
+        await writeFile(outPath, `${JSON.stringify(plan, null, 2)}\n`, "utf8");
+        lines.push(``, `${stamped} observe-the-failure AC block(s) folded into notes. Plan written: ${outPath}`);
+      }
+      lines.push(``, res.ok
+        ? `🟢 every declared check names the mutation that makes it fail${o.requireObserved ? " AND records the observed failure" : ""}.`
+        : `🔴 ${res.failures.length} ungrounded check(s) — a check that cannot fail is not evidence.`);
+      return { stdout: lines.join("\n"), result: res, exitCode: res.ok ? 0 : 1 };
+    }
+    case "query-check": {
+      const planPath = resolve(o.rest[0] ?? o.plan);
+      const plan = await readJson(planPath);
+      const id = o.rest[1] ?? o.issue ?? null;
+      const repoRoot = resolve(o.repoRoot ?? process.cwd());
+      const rows = collectEvidenceQueries(plan, id);
+      if (!rows.length) return { stdout: `no evidence queries declared${id ? ` on ${id}` : ""} — nothing to gate. Declare them as evidenceQueries: [{name, query, window, expectAtLeast}] (plan-level or per-issue).`, exitCode: 0 };
+      const lines = [];
+      let failures = 0;
+      for (const r of rows) {
+        const label = `${r.id ?? "plan"} evidenceQueries[${r.index}]${r.q?.name ? ` "${r.q.name}"` : ""}`;
+        const probs = evidenceQueryProblems(r.q);
+        if (probs.length) { failures += 1; lines.push(`🔴 ${label}: ${probs.join(" · ")}`); continue; }
+        const run = spawnSync(r.q.query, { shell: true, cwd: repoRoot, encoding: "utf8", timeout: 60_000 });
+        const ev = evaluateQueryOutput(run.error ? "" : run.stdout, r.q.expectAtLeast);
+        r.q.observed = { count: ev.count, at: new Date().toISOString() };
+        if (run.error) { failures += 1; lines.push(`🔴 ${label}: the query itself failed to run (${run.error.message}) — counted as 0, fail-closed`); }
+        else if (!ev.ok) { failures += 1; lines.push(`🔴 ${label}: returned ${ev.count} < ${r.q.expectAtLeast} on its known-positive window (${r.q.window}) — the query is BLIND to the history it cites; fix the QUERY, not the floor`); }
+        else lines.push(`ok   ${label}: ${ev.count} ≥ ${r.q.expectAtLeast} on ${r.q.window}`);
+      }
+      if (o.record) {
+        const outPath = resolve(o.out ?? planPath);
+        await writeFile(outPath, `${JSON.stringify(plan, null, 2)}\n`, "utf8");
+        lines.push(``, `Observed counts stamped (failures too — validate stays honest about them). Plan written: ${outPath}`);
+      }
+      lines.push(``, failures
+        ? `🔴 ${failures} evidence quer${failures === 1 ? "y" : "ies"} cannot reproduce the history it cites — each would have "confirmed" a clean state it cannot see (the 07-28 kill criterion matched 2 of its own 6 cited commits and would have auto-selected "delete the tool").`
+        : `🟢 every evidence query returns on its known-positive window.`);
+      return { stdout: lines.join("\n"), exitCode: failures ? 1 : 0 };
+    }
+    case "symbol-check": {
+      const planPath = resolve(o.rest[0] ?? o.plan);
+      const plan = await readJson(planPath);
+      const id = o.rest[1] ?? o.issue ?? null;
+      const repoRoot = resolve(o.repoRoot ?? process.cwd());
+      const lines = [];
+      let failures = 0;
+      let declared = 0;
+      for (const it of plan.issues ?? []) {
+        if (id && it.id !== id) continue;
+        for (const [si, s] of (Array.isArray(it.symbols) ? it.symbols : []).entries()) {
+          declared += 1;
+          const label = `${it.id} symbols[${si}]${s?.name ? ` "${s.name}"` : ""}`;
+          const probs = symbolShapeProblems(s);
+          if (probs.length) { failures += 1; lines.push(`🔴 ${label}: ${probs.join(" · ")}`); continue; }
+          let src = null;
+          try { src = await readFile(join(repoRoot, s.from), "utf8"); } catch { /* missing file — handled below */ }
+          if (src == null) {
+            s.resolved = { status: "not-found", at: new Date().toISOString() };
+            failures += 1;
+            lines.push(`🔴 ${label}: ${s.from} does not exist in the repo — the plan implies a file that is not there`);
+            continue;
+          }
+          const status = classifySymbol(src, s.name);
+          s.resolved = { status, at: new Date().toISOString() };
+          const use = s.use ?? "test";
+          if (status === "exported") lines.push(`ok   ${label}: exported from ${s.from}`);
+          else if (status === "private" && use === "edit") lines.push(`ok   ${label}: private in ${s.from} — fine for an edit-in-place target`);
+          else if (status === "private") { failures += 1; lines.push(`🔴 ${label}: PRIVATE in ${s.from} — the brief is unimplementable as a ${use} target as written. Re-scope to the public entry that reaches it; do NOT export it just so a test can import it (that is the shape AGENTS.md's test-binds-symbol rule rejects).`); }
+          else { failures += 1; lines.push(`🔴 ${label}: NOT FOUND in ${s.from}`); }
+        }
+      }
+      if (!declared) return { stdout: `no symbols declared${id ? ` on ${id}` : ""} — nothing to gate. Declare call/test targets as issues[].symbols: [{name, from, use?}].`, exitCode: 0 };
+      if (o.record) {
+        const outPath = resolve(o.out ?? planPath);
+        await writeFile(outPath, `${JSON.stringify(plan, null, 2)}\n`, "utf8");
+        lines.push(``, `Resolutions stamped. Plan written: ${outPath}`);
+      }
+      lines.push(``, failures
+        ? `🔴 ${failures} unreachable target(s) — each is a full lead round burned discovering the brief cannot be implemented as written.`
+        : `🟢 every named target exists and is reachable as planned.`);
+      return { stdout: lines.join("\n"), exitCode: failures ? 1 : 0 };
+    }
+    case "priorart-check": {
+      const planPath = resolve(o.rest[0] ?? o.plan);
+      const plan = await readJson(planPath);
+      const id = o.rest[1] ?? o.issue ?? null;
+      const repoRoot = resolve(o.repoRoot ?? process.cwd());
+      const lines = [];
+      for (const it of plan.issues ?? []) {
+        if (id && it.id !== id) continue;
+        const terms = deriveSearchTerms(it);
+        if (!terms.length) {
+          lines.push(`—    ${it.id}: no searchable terms (give it notes, a title, or explicit priorArt.terms)`);
+          if (o.record) it.priorArt = { terms: [], candidates: [], checkedAt: new Date().toISOString(), disposition: it.priorArt?.disposition ?? null };
+          continue;
+        }
+        const seen = new Set();
+        const candidates = [];
+        // Prefer rg (gitignore-aware); fall back to grep — on some hosts "rg" is only an interactive
+        // shell shim, invisible to spawnSync, and a sweep that silently found nothing because its
+        // engine was missing would be this gate committing the exact sin it polices.
+        const sweep = (cmd, args) => {
+          const run = spawnSync(cmd, args, { cwd: repoRoot, encoding: "utf8", timeout: 60_000 });
+          return run.error ? null : String(run.stdout ?? "");
+        };
+        for (const term of terms) {
+          let out = sweep("rg", ["-in", "--no-heading", "-F", "-m", "2", "-g", "*.test.*", "-g", "*.db.test.*", "-g", "scripts/*", term, "."]);
+          if (out == null) {
+            const tests = sweep("grep", ["-rniFs", "-m", "2", "--include=*.test.*", "--include=*.db.test.*", "--exclude-dir=node_modules", "--exclude-dir=.git", term, "."]);
+            const scripts = sweep("grep", ["-rniFs", "-m", "2", "--exclude-dir=node_modules", "--exclude-dir=.git", term, "scripts"]);
+            out = tests == null && scripts == null ? null : `${tests ?? ""}\n${scripts ?? ""}`;
+          }
+          if (out == null) return { stdout: `priorart-check needs ripgrep (rg) or grep runnable from node — neither spawned`, exitCode: 1 };
+          for (const line of out.split("\n").filter(Boolean).slice(0, 6)) {
+            if (seen.has(line)) continue;
+            seen.add(line);
+            candidates.push({ term, match: line });
+          }
+          if (candidates.length >= 12) break;
+        }
+        if (o.record) it.priorArt = { terms, candidates: candidates.slice(0, 12), checkedAt: new Date().toISOString(), disposition: it.priorArt?.disposition ?? null };
+        if (!candidates.length) lines.push(`ok   ${it.id}: no prior art found for [${terms.join(", ")}]`);
+        else {
+          lines.push(`🟠   ${it.id}: ${candidates.length} candidate(s) — JUDGE these; an existing test/guard may already assert what this issue proposes to add:`);
+          for (const c of candidates.slice(0, 12)) lines.push(`       [${c.term}] ${c.match}`);
+        }
+      }
+      if (o.record) {
+        const outPath = resolve(o.out ?? planPath);
+        await writeFile(outPath, `${JSON.stringify(plan, null, 2)}\n`, "utf8");
+        lines.push(``, `Sweep stamped (existing dispositions preserved). Plan written: ${outPath}`);
+      }
+      lines.push(``, `🟢 advisory gate: candidates are for HUMAN judgement — this gate never cuts an issue (the JUDGEMENT, not the sweep, is what deletes work). Record your call in priorArt.disposition.`);
+      return { stdout: lines.join("\n"), exitCode: 0 };
     }
     default:
       return { stdout: usage() };

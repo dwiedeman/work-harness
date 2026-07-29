@@ -180,6 +180,28 @@ The GitHub Codex reviewer is a great pre-merge gate but its findings are the run
 
 This pass plus the P2-defer policy (shepherd skill, 2026-07-26) attacks the recycle bill from both ends: fewer findings get written, and the ones that are get triaged out of the round loop.
 
+### 7c. Grounding gates — the deterministic complement to 7b (2026-07-29)
+
+7b's codex review is probabilistic: it catches what the plan **fails** to claim. These four are deterministic: they ground what the plan **does** claim. Both exist because of one measured fact: an implementation plan in this repo was written by an agent that explicitly cited *"a check that cannot fail is not evidence"*, was revised twice while actively hunting that exact class, and still shipped **six vacuous checks** — found only by two independent reviewers. The class survives attention. It does not survive arithmetic.
+
+Declare the claims while sizing (steps 2–3), then run the gates; `validate` refuses a plan whose declared claims are ungrounded:
+
+```bash
+node ~/.claude/skills/prep-for-work/prep-runner.mjs mutation-check <plan.json> --record
+node ~/.claude/skills/prep-for-work/prep-runner.mjs query-check    <plan.json> --repo-root <repo> --record
+node ~/.claude/skills/prep-for-work/prep-runner.mjs symbol-check   <plan.json> --repo-root <repo> --record
+node ~/.claude/skills/prep-for-work/prep-runner.mjs priorart-check <plan.json> --repo-root <repo> --record
+```
+
+1. **mutation-check** (refuses in validate): every check/test/guard a plan entry proposes (`checks: [{name, mutation, observedFailure}]`) must name the exact edit that makes it FAIL. `--record` folds an observe-the-failure AC into `notes` (the brief carries it verbatim): the implementer must APPLY the mutation, SEE the failure, and record the message in `observedFailure` — a described failure is not an observed one. Post-implementation, `mutation-check --require-observed` verifies the record.
+2. **query-check** (refuses): any query used as evidence — a kill criterion, a recurrence count, a "returns zero so we're clean" — must carry a `window` and `expectAtLeast` naming a known-positive history, and the tool RUNS it: fewer non-empty output lines than the floor fails, and a query that errors counts 0 (fail-closed). Motivating case: a kill criterion's grep matched **2 of the 6 commits its own plan cited** — it would have returned zero and auto-selected "delete the tool" while the problem recurred.
+3. **symbol-check** (refuses): every named call/test target (`symbols: [{name, from, use?}]`) must exist and be exported from where the plan implies. A **private** target is a **re-scope** — test through the public entry that reaches it; exporting a private function solely so a test can import it is the shape AGENTS.md's test-binds-symbol rule rejects. `use: "edit"` permits private for modify-in-place plans. Motivating case: a brief demanded a behavioral test of `assertConfirmationScopeAuthority` — a non-exported function with only internal call sites; unimplementable as written, one full lead round to discover.
+4. **priorart-check** (warns — the only gate whose outcome can DELETE work, which is exactly why the tool never does the deleting): sweeps tests + guards (rg, grep fallback) for prior art already asserting what each issue proposes to add, and reports candidates for HUMAN judgement; record your call in `priorArt.disposition`. Two of one wave's planned deliverables already existed in full (`cli-adapter.test.ts:1148`; `scripts/db-next-migration.mjs`).
+
+The declared-claims contract cuts both ways: gates 1–3 only hold what the plan declares, so a plan that declares nothing passes them trivially. That gap is 7b's job — the codex review flags the *missing* must-fail control or sibling surface — and its watch-outs should become declared `checks`/`symbols`/`evidenceQueries` entries these gates can then hold.
+
+**When you extend these gates, mutation-audit their own suite before trusting it**: neuter each new gate function (`return []` / constant-true) and confirm tests actually go red. The first version of this very tooling shipped with one shape guard (`symbolShapeProblems`) that could be deleted with the whole suite green — found exactly that way, by a reviewer applying the gates' own standard to the gates. The class needs arithmetic, not attention, including from the people building the arithmetic.
+
 ### 8. Emit and validate the run plan
 
 ```bash
@@ -205,7 +227,11 @@ Plan shape (the validator is the source of truth):
     "versionAxes": ["migration:0139"],
     "dependsOn": ["DER-1233"],
     "splitFrom": "DER-2161",
-    "notes": "build ON DER-1233's merged registry shape; class members: a.ts, b.ts, c.ts"
+    "notes": "build ON DER-1233's merged registry shape; class members: a.ts, b.ts, c.ts",
+    // grounding gates (7c) — declared claims; validate refuses them ungrounded
+    "checks": [{ "name": "entropy floor", "mutation": "the exact edit that makes it FAIL", "observedFailure": null }],
+    "evidenceQueries": [{ "name": "recurrence", "query": "git log …", "window": "known-positive history", "expectAtLeast": 6 }],
+    "symbols": [{ "name": "evaluateCommandAuthorization", "from": "packages/…/file.ts", "use": "test" }]
   }],
   "serialization": [["DER-1240", "DER-1241"]],
   "heldOut": [{ "id": "DER-1250", "why": "ceiling-raise gate unresolved" }],

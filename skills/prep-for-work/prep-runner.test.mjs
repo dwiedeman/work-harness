@@ -13,6 +13,10 @@ import {
   planReviewPrompt, planReviewAccepted, applyPlanReview, PLAN_REVIEW_SCHEMA,
   CALIBRATION, applyCalibration,
   LINEAR_ID_RE, SPEC_UNIT_RE,
+  checkMutations, MUTATION_AC_MARKER, checkEntryProblems,
+  evaluateQueryOutput, evidenceQueryProblems,
+  classifySymbol, symbolShapeProblems,
+  deriveSearchTerms,
 } from "./prep-runner.mjs";
 
 // ---- sizing ----
@@ -112,6 +116,9 @@ const goodIssue = (over = {}) => ({
   // shared fixture on purpose: every existing test then runs with the gate ON, rather than opting out.
   planReview: { verdict: "plan is sound", commands: 14, reviewedAt: "2026-07-29T00:00:00.000Z", model: "codex" },
   watchOuts: [],
+  // Grounding gate 4 (2026-07-29): a clean recorded sweep, for the same reason planReview is here —
+  // every existing test then runs with the gates ON rather than opting out.
+  priorArt: { terms: [], candidates: [], checkedAt: "2026-07-29T00:00:00.000Z", disposition: null },
   ...over,
 });
 const goodPlan = (issues, over = {}) => ({
@@ -638,4 +645,261 @@ test("scaffoldPlan: --spec-ref/--tracking/--units scaffolds SPEC units with the 
   assert.deepEqual(Object.keys(plan.issues[0]).sort(), Object.keys(scaffoldPlan({ issues: ["DER-1"] }).issues[0]).sort());
   // Control: without a specRef it stays issue mode.
   assert.equal(scaffoldPlan({ issues: ["DER-1"] }).specRef, undefined);
+});
+
+// ---- Grounding gates (2026-07-29) ----
+// Why: a plan written by an agent that explicitly cited "a check that cannot fail is not evidence" —
+// and was revised twice while actively hunting that class — still shipped six vacuous checks, found only
+// by two independent reviewers. The class survives attention; these gates catch it mechanically. Every
+// test below proves the gate FAILS on the bad input first — a vacuous gate against vacuous checks would
+// be the worst possible outcome of this work.
+
+test("validatePlan: a declared check with no mutation is refused — the vacuous-check class", () => {
+  // FAILING answer — the check asserts a property but cannot name the edit that breaks it.
+  const bad = validatePlan(goodPlan([goodIssue({ checks: [{ name: "entropy floor" }] })]));
+  assert.equal(bad.ok, false);
+  assert.match(bad.errors.join("\n"), /declares no mutation/);
+  // CONTROL — the same check naming its mutation passes.
+  const ok = validatePlan(goodPlan([goodIssue({ checks: [{ name: "entropy floor", mutation: "shrink the generator to 9 bytes" }] })]));
+  assert.equal(ok.ok, true, ok.errors.join("; "));
+  // Malformed shapes are refused, never silently skipped.
+  assert.equal(validatePlan(goodPlan([goodIssue({ checks: {} })])).ok, false);
+  assert.match(validatePlan(goodPlan([goodIssue({ checks: [null] })])).errors.join("\n"), /not an object/);
+});
+
+test("checkMutations: --require-observed demands the failure was SEEN, not described", () => {
+  const plan = goodPlan([goodIssue({ checks: [{ name: "guard", mutation: "delete the tenant filter" }] })]);
+  // Plan time: naming the mutation is enough — the check does not exist yet to observe.
+  assert.equal(checkMutations(plan).ok, true);
+  // FAILING answer — post-implementation, no observed failure on record.
+  const post = checkMutations(plan, null, { requireObserved: true });
+  assert.equal(post.ok, false);
+  assert.match(post.failures[0].problems.join(" "), /described failure is not an observed one/);
+  // CONTROL — with the observed message recorded it passes.
+  const seen = goodPlan([goodIssue({ checks: [{ name: "guard", mutation: "delete the tenant filter", observedFailure: "expected 403, got 200" }] })]);
+  assert.equal(checkMutations(seen, null, { requireObserved: true }).ok, true);
+});
+
+test("CLI mutation-check: exit 1 on an ungrounded check; --record folds the AC into notes exactly once", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "prep-mut-"));
+  try {
+    const planPath = join(dir, "plan.json");
+    await writeFile(planPath, JSON.stringify(goodPlan([goodIssue({ checks: [{ name: "floor" }] })])), "utf8");
+    const bad = await runSubcommand(["mutation-check", planPath]);
+    assert.equal(bad.exitCode, 1);
+    assert.match(bad.stdout, /declares no mutation/);
+
+    await writeFile(planPath, JSON.stringify(goodPlan([goodIssue({ checks: [{ name: "floor", mutation: "shrink the generator to 9 bytes" }] })])), "utf8");
+    const rec = await runSubcommand(["mutation-check", planPath, "--record"]);
+    assert.equal(rec.exitCode, 0, rec.stdout);
+    await runSubcommand(["mutation-check", planPath, "--record"]); // idempotent — no second block
+    const { readFile } = await import("node:fs/promises");
+    const notes = JSON.parse(await readFile(planPath, "utf8")).issues[0].notes ?? "";
+    assert.equal(notes.split(MUTATION_AC_MARKER).length, 2, "the AC block must land exactly once across repeated --record runs");
+    assert.match(notes, /OBSERVE it fail/, "the AC requires observing the failure, not describing it");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("validatePlan: an evidence query must name a floor and a window, and must have RUN", () => {
+  const q = { name: "recurrence", query: "git log --oneline --since=2026-07-20 -- scripts/bump-versions.mjs", window: "2026-07-20..26, the 6 cited axis-collision commits", expectAtLeast: 6 };
+  // FAILING answers: no floor / no window / never run / ran and missed its own cited history.
+  assert.match(validatePlan(goodPlan([goodIssue({ evidenceQueries: [{ ...q, expectAtLeast: undefined }] })])).errors.join("\n"), /known-positive floor/);
+  assert.match(validatePlan(goodPlan([goodIssue({ evidenceQueries: [{ ...q, window: undefined }] })])).errors.join("\n"), /names no historical window/);
+  assert.match(validatePlan(goodPlan([goodIssue({ evidenceQueries: [q] })])).errors.join("\n"), /never validated against its known-positive window/);
+  // THE motivating case: the kill criterion's grep matched 2 of the 6 commits its own plan cited.
+  const blind = validatePlan(goodPlan([goodIssue({ evidenceQueries: [{ ...q, observed: { count: 2 } }] })]));
+  assert.equal(blind.ok, false);
+  assert.match(blind.errors.join("\n"), /returned 2 < 6/);
+  assert.match(blind.errors.join("\n"), /fix the QUERY, not the floor/);
+  // CONTROL — a query that reproduces its window passes; plan-level queries gate identically.
+  assert.equal(validatePlan(goodPlan([goodIssue({ evidenceQueries: [{ ...q, observed: { count: 6 } }] })])).ok, true);
+  const planLevel = validatePlan(goodPlan([goodIssue()], { evidenceQueries: [q] }));
+  assert.equal(planLevel.ok, false);
+  assert.match(planLevel.errors.join("\n"), /never validated/);
+});
+
+test("evaluateQueryOutput: empty output is 0 matches, not a pass", () => {
+  assert.deepEqual(evaluateQueryOutput("", 1), { count: 0, ok: false });
+  assert.deepEqual(evaluateQueryOutput("\n \n", 1), { count: 0, ok: false });
+  assert.deepEqual(evaluateQueryOutput("a\nb\nc\n", 3), { count: 3, ok: true });
+  assert.equal(evaluateQueryOutput(null, 1).ok, false, "a dead query reads as 0 — fail-closed");
+});
+
+test("CLI query-check: FAILS a query blind to its own cited history; --record makes validate agree", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "prep-query-"));
+  try {
+    const planPath = join(dir, "plan.json");
+    const mk = (expectAtLeast) => goodPlan([goodIssue({ evidenceQueries: [{ name: "cited commits", query: "printf 'commit-a\\ncommit-b\\n'", window: "the 6 commits the plan cites", expectAtLeast }] })]);
+    // FAILING answer — the query returns 2 where its own evidence says 6 exist (the 07-28 shape).
+    await writeFile(planPath, JSON.stringify(mk(6)), "utf8");
+    const blind = await runSubcommand(["query-check", planPath, "--repo-root", dir]);
+    assert.equal(blind.exitCode, 1);
+    assert.match(blind.stdout, /returned 2 < 6/);
+    // CONTROL — a floor the query actually clears passes, --record stamps it, and validate accepts.
+    await writeFile(planPath, JSON.stringify(mk(2)), "utf8");
+    const ok = await runSubcommand(["query-check", planPath, "--repo-root", dir, "--record"]);
+    assert.equal(ok.exitCode, 0, ok.stdout);
+    const validated = await runSubcommand(["validate", planPath]);
+    assert.equal(validated.exitCode, 0, validated.stdout);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("classifySymbol: exported, renamed, private and absent symbols", () => {
+  const src = [
+    "export async function pub() {}",
+    "export const cfg = 1;",
+    "async function assertConfirmationScopeAuthority(ctx) {}", // the motivating shape: non-exported, internal call sites only
+    "function helper() {}",
+    "export { helper as helperApi };",
+    "export class Gate {}",
+  ].join("\n");
+  assert.equal(classifySymbol(src, "pub"), "exported");
+  assert.equal(classifySymbol(src, "cfg"), "exported");
+  assert.equal(classifySymbol(src, "Gate"), "exported");
+  assert.equal(classifySymbol(src, "helperApi"), "exported", "a rename exports the RIGHT-hand name");
+  assert.equal(classifySymbol(src, "helper"), "private", "the left side of `as` is NOT importable by its own name");
+  assert.equal(classifySymbol(src, "assertConfirmationScopeAuthority"), "private");
+  assert.equal(classifySymbol(src, "nope"), "not-found");
+});
+
+test("validatePlan: a private call/test target is refused with re-scope (NOT export) guidance", () => {
+  const sym = { name: "assertConfirmationScopeAuthority", from: "packages/commands/src/commands/onboarding.ts" };
+  // FAILING answers: unresolved / not-found / private-as-test-target.
+  assert.match(validatePlan(goodPlan([goodIssue({ symbols: [sym] })])).errors.join("\n"), /never resolved against the repo/);
+  assert.match(validatePlan(goodPlan([goodIssue({ symbols: [{ ...sym, resolved: { status: "not-found" } }] })])).errors.join("\n"), /NOT FOUND/);
+  const priv = validatePlan(goodPlan([goodIssue({ symbols: [{ ...sym, resolved: { status: "private" } }] })]));
+  assert.equal(priv.ok, false);
+  assert.match(priv.errors.join("\n"), /Re-scope to the public entry/);
+  assert.match(priv.errors.join("\n"), /test-binds-symbol/, "the fix must never be 'export it' — that is the shape AGENTS.md rejects");
+  // CONTROLS — an exported target passes; a private EDIT-in-place target is implementable and passes.
+  assert.equal(validatePlan(goodPlan([goodIssue({ symbols: [{ ...sym, resolved: { status: "exported" } }] })])).ok, true);
+  assert.equal(validatePlan(goodPlan([goodIssue({ symbols: [{ ...sym, use: "edit", resolved: { status: "private" } }] })])).ok, true);
+});
+
+test("CLI symbol-check: resolves against real files; the unimplementable brief fails BEFORE a lead burns a round", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "prep-sym-"));
+  try {
+    await mkdir(join(dir, "src"), { recursive: true });
+    await writeFile(join(dir, "src", "onboarding.ts"), "export function evaluateCommandAuthorization() {}\nasync function assertConfirmationScopeAuthority() {}\n", "utf8");
+    const planPath = join(dir, "plan.json");
+    await writeFile(planPath, JSON.stringify(goodPlan([goodIssue({ symbols: [
+      { name: "assertConfirmationScopeAuthority", from: "src/onboarding.ts" },
+      { name: "evaluateCommandAuthorization", from: "src/onboarding.ts" },
+    ] })])), "utf8");
+    // FAILING answer — the plan demands a behavioral test of a non-exported function.
+    const res = await runSubcommand(["symbol-check", planPath, "--repo-root", dir, "--record"]);
+    assert.equal(res.exitCode, 1);
+    assert.match(res.stdout, /PRIVATE in src\/onboarding\.ts/);
+    assert.match(res.stdout, /do NOT export it just so a test can import it/);
+    assert.match(res.stdout, /"evaluateCommandAuthorization": exported from/);
+    // The recorded resolution propagates: validate now refuses the same plan.
+    const validated = await runSubcommand(["validate", planPath]);
+    assert.equal(validated.exitCode, 1);
+    assert.match(validated.stdout, /PRIVATE/);
+    // A missing file is a failure, not a silent pass.
+    await writeFile(planPath, JSON.stringify(goodPlan([goodIssue({ symbols: [{ name: "x", from: "src/gone.ts" }] })])), "utf8");
+    const gone = await runSubcommand(["symbol-check", planPath, "--repo-root", dir]);
+    assert.equal(gone.exitCode, 1);
+    assert.match(gone.stdout, /does not exist/);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("deriveSearchTerms: declared terms win; else identifiers from prose, never unit ids", () => {
+  assert.deepEqual(deriveSearchTerms({ priorArt: { terms: ["migration collision"] }, notes: "ignored" }), ["migration collision"]);
+  const terms = deriveSearchTerms({ title: "DER-2647 guard migration-prefix collisions", notes: "wire `db-next-migration` next to checkJsonbBind" });
+  assert.ok(terms.includes("db-next-migration"), terms.join(","));
+  assert.ok(terms.includes("checkJsonbBind"));
+  assert.ok(terms.includes("migration-prefix"));
+  assert.ok(!terms.includes("DER-2647"), "unit ids are noise, not search terms");
+  assert.deepEqual(deriveSearchTerms({}), []);
+});
+
+test("CLI priorart-check: surfaces the already-built deliverable but NEVER cuts — exit 0 either way", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "prep-prior-"));
+  try {
+    await mkdir(join(dir, "scripts"), { recursive: true });
+    // The motivating shape: the planned collision detector already exists as a guard script.
+    await writeFile(join(dir, "scripts", "db-next-migration.mjs"), "// prevents migration-prefix collisions preventively\n", "utf8");
+    const planPath = join(dir, "plan.json");
+    await writeFile(planPath, JSON.stringify(goodPlan([goodIssue({ priorArt: undefined, notes: "add a `migration-prefix` collision detector" })])), "utf8");
+    const res = await runSubcommand(["priorart-check", planPath, "--repo-root", dir, "--record"]);
+    // Candidates found, and the gate still exits 0: deleting work is a HUMAN call, never the tool's.
+    assert.equal(res.exitCode, 0, res.stdout);
+    assert.match(res.stdout, /db-next-migration\.mjs/);
+    assert.match(res.stdout, /never cuts an issue/);
+    const { readFile } = await import("node:fs/promises");
+    const saved = JSON.parse(await readFile(planPath, "utf8"));
+    assert.ok(saved.issues[0].priorArt.candidates.length >= 1);
+    // Undispositioned candidates surface as a validate WARNING (not an error) …
+    const warned = validatePlan(saved);
+    assert.equal(warned.ok, true);
+    assert.match(warned.warnings.join("\n"), /no disposition/);
+    // … and a recorded human judgement silences it.
+    saved.issues[0].priorArt.disposition = "no overlap — the existing guard is same-branch only; this issue is cross-PR";
+    assert.equal(validatePlan(saved).warnings.filter((w) => /no disposition/.test(w)).length, 0);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+// Direct branch coverage for the three shape guards. Before these existed, checkEntryProblems and
+// evidenceQueryProblems survived only because OTHER tests happened to feed inputs that trip them, and
+// symbolShapeProblems could be replaced with `return []` with the whole suite green (found by a
+// mutation audit, 2026-07-29). Incidental coverage rots the moment a fixture changes — so each guard
+// gets its own must-fail assertions, per branch, on the specific problem string.
+
+test("checkEntryProblems: non-object, missing name, missing/blank mutation each fail directly", () => {
+  assert.match(checkEntryProblems(null).join(" "), /not an object/);
+  assert.match(checkEntryProblems({ mutation: "m" }).join(" "), /needs a name/);
+  assert.match(checkEntryProblems({ name: "guard" }).join(" "), /declares no mutation/);
+  assert.match(checkEntryProblems({ name: "guard", mutation: "   " }).join(" "), /declares no mutation/, "a blank mutation is no mutation");
+  assert.equal(checkEntryProblems({}).length, 2, "problems accumulate; the guard must not short-circuit");
+  // CONTROL — a grounded check returns no problems.
+  assert.deepEqual(checkEntryProblems({ name: "guard", mutation: "delete the tenant filter" }), []);
+});
+
+test("evidenceQueryProblems: non-object, missing query, bad floor, missing window each fail directly", () => {
+  assert.match(evidenceQueryProblems(null).join(" "), /not an object/);
+  assert.match(evidenceQueryProblems({ window: "w", expectAtLeast: 1 }).join(" "), /has no query/);
+  assert.match(evidenceQueryProblems({ query: "q", window: "w" }).join(" "), /known-positive floor/);
+  assert.match(evidenceQueryProblems({ query: "q", window: "w", expectAtLeast: 0 }).join(" "), /known-positive floor/, "a floor of 0 is a check that cannot fail");
+  assert.match(evidenceQueryProblems({ query: "q", expectAtLeast: 2 }).join(" "), /names no historical window/);
+  // CONTROL — a grounded query returns no problems.
+  assert.deepEqual(evidenceQueryProblems({ query: "q", window: "w", expectAtLeast: 2 }), []);
+});
+
+test("symbolShapeProblems: non-object, missing name, missing from, bogus use each fail directly", () => {
+  assert.match(symbolShapeProblems(null).join(" "), /not an object/);
+  assert.match(symbolShapeProblems({ from: "a.ts" }).join(" "), /needs a name/);
+  assert.match(symbolShapeProblems({ name: "  ", from: "a.ts" }).join(" "), /needs a name/, "a blank name is no name");
+  assert.match(symbolShapeProblems({ name: "x" }).join(" "), /needs `from`/);
+  assert.match(symbolShapeProblems({ name: "x", from: "a.ts", use: "bogus" }).join(" "), /use must be one of test\|call\|edit \(got "bogus"\)/);
+  assert.equal(symbolShapeProblems({}).length, 2, "problems accumulate; the guard must not short-circuit");
+  // CONTROLS — well-formed entries return no problems, with and without an explicit use.
+  assert.deepEqual(symbolShapeProblems({ name: "x", from: "a.ts" }), []);
+  assert.deepEqual(symbolShapeProblems({ name: "x", from: "a.ts", use: "edit" }), []);
+});
+
+test("CLI validate: a malformed symbols entry is REFUSED with a usable message — not a crash, not a skip", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "prep-valsym-"));
+  try {
+    const planPath = join(dir, "plan.json");
+    await writeFile(planPath, JSON.stringify(goodPlan([
+      goodIssue({ symbols: [null, { name: "x", from: "a.ts", use: "bogus" }] }),
+      goodIssue({ id: "DER-1001", symbols: {} }),
+    ])), "utf8");
+    const res = await runSubcommand(["validate", planPath]);
+    assert.equal(res.exitCode, 1);
+    assert.match(res.stdout, /NOT dispatchable/);
+    assert.match(res.stdout, /DER-1000: symbols\[0\]: not an object/);
+    assert.match(res.stdout, /use must be one of test\|call\|edit/);
+    assert.match(res.stdout, /DER-1001: symbols must be an array/);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("validatePlan: unswept issues draw ONE aggregate prior-art warning — advisory, never an error", () => {
+  const res = validatePlan(goodPlan([goodIssue({ priorArt: undefined }), goodIssue({ id: "DER-1001", priorArt: undefined })]));
+  assert.equal(res.ok, true, "gate 4 must never block dispatch — the sweep is heuristic and the judgement is human");
+  assert.equal(res.warnings.filter((w) => /prior-art sweep/.test(w)).length, 1);
+  assert.match(res.warnings.join("\n"), /DER-1000, DER-1001/);
+  // The fixture's recorded sweep keeps every other test running with the gate satisfied.
+  assert.equal(validatePlan(goodPlan([goodIssue()])).warnings.filter((w) => /prior-art sweep/.test(w)).length, 0);
 });
