@@ -38,10 +38,19 @@ run_suite() {
   fi
   rm -f "$log"
 }
-run_suite "skills/work — work-runner.test.mjs + work-metrics.test.mjs" \
-  "$DEST/skills/work/work-runner.test.mjs" "$DEST/skills/work/work-metrics.test.mjs"
+# Every suite listed here must be one this script actually COPIED — and every suite it copies must be
+# listed. `repo-contract.test.mjs` enforces the second half: the installer shipped session-end-telemetry
+# and the context-wrap-nudge suites into ~/.claude for a while without ever running them, so a broken
+# hook would have installed "clean". An unverified shipped file is the same silent-success shape as the
+# `|| true` this function replaced.
+run_suite "skills/work — work-runner + work-metrics + session-end-telemetry" \
+  "$DEST/skills/work/work-runner.test.mjs" \
+  "$DEST/skills/work/work-metrics.test.mjs" \
+  "$DEST/skills/work/session-end-telemetry.test.mjs"
 run_suite "skills/prep-for-work — prep-runner.test.mjs" \
   "$DEST/skills/prep-for-work/prep-runner.test.mjs"
+run_suite "hooks — context-wrap-nudge.test.mjs" \
+  "$DEST/hooks/context-wrap-nudge.test.mjs"
 
 if [ "$verify_failed" -ne 0 ]; then
   echo >&2
