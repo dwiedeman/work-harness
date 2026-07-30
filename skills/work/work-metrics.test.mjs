@@ -15,6 +15,7 @@ import {
   foldTokenUsage,
   percentile,
   readEvents,
+  renderRunMarkdown,
   runSortKey,
   statsFor,
 } from "./work-metrics.mjs";
@@ -502,5 +503,101 @@ test("DER-2748: work-metrics' dedup rule AGREES with work-runner's, ledger for l
       wmDedupe(ledger), runnerDedupe(ledger),
       `ledger ${i}: work-metrics and work-runner must fold identically`,
     );
+  }
+});
+
+// ---- DER-2738: the two readers must also agree about what a BAD LINE is --------------------------
+// The runner no longer throws on a line it cannot parse — it skips and QUARANTINES it. That makes "which
+// lines are bad" a shared rule, and this reader's copy of it (`classifyLedgerLine`, duplicated because
+// this module is standalone by contract) has to match line for line. If they drifted, one instrument would
+// report a run's history over a different set of lines than the other — the DER-2581 defect class.
+import { classifyLedgerLine as wmClassify, lastReadSkipped } from "./work-metrics.mjs";
+import { classifyLedgerLine as runnerClassify, readEvents as runnerReadEvents } from "./work-runner.mjs";
+
+const LINE_TABLE = [
+  JSON.stringify({ type: "run_started", ts: "2026-01-01T00:00:00.000Z" }), // healthy
+  JSON.stringify(stamped()),                                              // healthy, stamped
+  "",                                                                     // blank
+  "   ",                                                                  // whitespace
+  "{not valid json",                                                      // malformed, complete
+  '{"type":"kickback",,,}',                                               // malformed, complete
+  '{"type":"pr_opened","issue":"DER-1","pr":',                            // TRUNCATED mid-JSON (the crash shape)
+  '{"actor":"noop","ts":"2026-01-01T00:01:00.000Z"}',                     // valid JSON, no `type`
+  "42",                                                                   // valid JSON, not an object
+  '"a string"',                                                           // valid JSON, not an object
+  "null",                                                                 // valid JSON, not an object
+  '[{"type":"run_started"}]',                                             // an ARRAY is not an event
+  JSON.stringify({ type: "reaped", issue: "DER-3" }),                     // legacy (no protocol fields)
+];
+
+test("DER-2738: work-metrics and work-runner agree, line for line, on what a bad ledger line is", () => {
+  for (const line of LINE_TABLE) {
+    assert.deepEqual(
+      wmClassify(line), runnerClassify(line),
+      `line ${JSON.stringify(line)}: the two readers must classify it identically`,
+    );
+  }
+  // ANTI-VACUITY: the table must actually exercise BOTH verdicts and every reason, or this agrees about
+  // nothing. (A table that had become all-healthy would still pass the loop above.)
+  const reasons = new Set(LINE_TABLE.map((l) => wmClassify(l).reason ?? "ok"));
+  assert.deepEqual(
+    [...reasons].sort(),
+    ["blank", "malformed_json", "no_type", "not_an_object", "ok"],
+    "the agreement table must cover every classification, healthy included",
+  );
+});
+
+test("DER-2738: both readers fold the SAME events out of one DAMAGED ledger (torn tail + malformed record)", async () => {
+  // Byte-exact ledger, deliberately NOT newline-terminated: the last line is a writer killed mid-append.
+  const good1 = JSON.stringify({ type: "run_started", ts: "2026-01-01T00:00:00.000Z" });
+  const good2 = JSON.stringify({ type: "lead_spawned", issue: "DER-1", ts: "2026-01-01T00:01:00.000Z" });
+  const good3 = JSON.stringify({ type: "pr_merged", issue: "DER-1", pr: 5, ts: "2026-01-01T02:00:00.000Z" });
+  const bodies = [
+    `${good1}\n{"type":"kickback",,,}\n${good2}\n${good3}\n{"type":"pr_opened","pr":`, // malformed + torn tail
+    `${good1}\n\n   \n${good2}\n`,                                                      // blanks only (healthy)
+    `${good1}\n42\n{"actor":"noop"}\n${good3}\n`,                                       // non-object + no type
+    `${good1}\n${good2}\n${good3}`,                                                     // unterminated but VALID last line
+  ];
+  for (const [i, body] of bodies.entries()) {
+    const dir = mkdtempSync(join(tmpdir(), "wm-agree-damaged-"));
+    try {
+      writeFileSync(join(dir, "events.jsonl"), body, "utf8");
+      const norm = (evs) => evs.map((e) => JSON.stringify(e)).sort();
+      const mine = wmReadEvents(dir);
+      const theirs = await runnerReadEvents(dir);
+      assert.deepEqual(norm(mine), norm(theirs), `ledger ${i}: the two readers accepted different lines`);
+      // Neither reader may throw, and both must keep the intact events.
+      assert.ok(mine.some((e) => e.type === "run_started"), `ledger ${i}: the valid prefix must survive`);
+      // The skip count is this reader's visibility channel — it must match what it actually dropped.
+      const lineCount = body.split("\n").filter((l) => l.trim()).length;
+      assert.equal(lastReadSkipped(dir), lineCount - mine.length, `ledger ${i}: skipped lines must be counted, not swallowed`);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("DER-2738: a damaged ledger's metrics report SAYS it had holes (a lower bound, not a total)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "wm-damaged-report-"));
+  try {
+    const lines = [
+      JSON.stringify(ev({ type: "run_started", ts: "2026-01-01T00:00:00.000Z" })),
+      JSON.stringify(ev({ type: "handed_off", pr: 1, issue: "DER-1", ts: "2026-01-01T01:00:00.000Z" })),
+      '{"type":"pr_merged","pr":1,"issue":"DER-1","ts":', // torn mid-append: a MERGE we cannot count
+    ];
+    writeFileSync(join(dir, "events.jsonl"), lines.join("\n"), "utf8");
+    const m = computeRunMetrics(dir);
+    assert.equal(m.prsMerged, 0, "the torn line's merge genuinely cannot be counted");
+    assert.equal(m.ledgerSkipped, 1, "…so the report must carry the fact that a line was skipped");
+    assert.match(renderRunMarkdown(m), /LEDGER DAMAGE: 1 line\(s\)/, "and an operator reading the report must SEE it");
+    // CONTROL: the same report over an INTACT ledger carries no damage note (an always-on warning is not
+    // a warning) and counts the merge.
+    writeFileSync(join(dir, "events.jsonl"), `${lines[0]}\n${lines[1]}\n${JSON.stringify(ev({ type: "pr_merged", pr: 1, issue: "DER-1", ts: "2026-01-01T01:30:00.000Z" }))}\n`, "utf8");
+    const clean = computeRunMetrics(dir);
+    assert.equal(clean.prsMerged, 1);
+    assert.equal(clean.ledgerSkipped, 0);
+    assert.ok(!/LEDGER DAMAGE/.test(renderRunMarkdown(clean)));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });
