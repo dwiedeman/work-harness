@@ -4200,6 +4200,13 @@ export function materializeState(rawEvents, meta = {}) {
       case "lead_online":
         // Cloud lead's draft PR appeared: alive + working. Record the pr + monitor handle; stay
         // in_progress (draft ≠ handed off). The ABSENCE of this past a deadline = failed-to-start.
+        // DER-2778 — a TERMINAL unit's PR pointer is final. `it.pr` was repointed unconditionally, and
+        // `lead_online` is the one event type that is DERIVED from open-PR state on a 45s loop, so any
+        // PR naming this issue could retarget it. On a merged/reaped unit that is never right: the work
+        // is done and its PR number is what `ready`, the shepherd's worklist and every gate aim at.
+        // The status guard below already refused the status TRANSITION; the pointer writes above it did
+        // not, which left the guard describing a protection it only half had.
+        if (it.status === "merged" || it.status === "reaped") break;
         if (e.pr != null) it.pr = e.pr;
         if (e.handle) it.handle = e.handle;
         // 2026-07-18 incident (run 20260718T122639Z, PR 907/DER-1957): a liveness ping — ESPECIALLY
@@ -5310,6 +5317,7 @@ async function reconcileMergedInto(runDir, runId, repoRoot) {
 // surfaces on this exact login).
 const TRUSTED_COMMENT_BOTS = ["chatgpt-codex-connector[bot]"];
 let TRUSTED_COMMENT_AUTHORS_EXTRA = [];
+let TRUSTED_PR_AUTHORS_EXTRA = [];
 
 // The logins whose PR comments may become ledger events. Config-driven because the harness ships
 // without naming anyone's account — and therefore DENY-BY-DEFAULT: an unconfigured repo trusts no human
@@ -5321,6 +5329,66 @@ export function getTrustedCommentAuthors() {
   if (REPO_IDENTITY.ownerLogin) set.add(REPO_IDENTITY.ownerLogin);
   for (const a of TRUSTED_COMMENT_AUTHORS_EXTRA) set.add(a);
   return set;
+}
+
+// ---------------------------------------------------------------------------
+// Untrusted-input boundary: PR *state* (DER-2778) — a SECOND, DELIBERATELY DIFFERENT list
+// ---------------------------------------------------------------------------
+// DO NOT UNIFY THESE TWO SETS. They answer different questions, and the comment set is the wrong
+// answer to this one:
+//   getTrustedCommentAuthors() — "may THIS LOGIN'S COMMENT be read as a report?" It includes
+//     TRUSTED_COMMENT_BOTS (`chatgpt-codex-connector[bot]`) because a Codex review comment IS
+//     authoritative input the harness already acts on.
+//   getTrustedPrAuthors()     — "is a PR OPENED BY this login one of THIS RUN'S cloud leads?" A review
+//     bot is not a lead. It opens PRs of its own, and any PR whose branch or title happens to name an
+//     in-flight issue id would then derive `lead_online`/`handed_off` for that unit. So the bot list is
+//     excluded here: owner + explicitly configured extras only.
+// Same DENY-BY-DEFAULT posture as the comment set: an unconfigured repo has no way to authenticate a
+// PR, so it trusts none. The cloud lane this protects already requires `repo.repoSlug` +
+// `repo.ownerLogin` to function, so it cannot be running unconfigured.
+//
+// Why this exists: `reconcilePrEventsInto` discovers PRs with `gh pr list --state open --limit 100` —
+// ANY open PR in the repo — and `deriveCloudPrEvents` decided relevance from a branch/title SUBSTRING
+// alone. On a PUBLIC repo whose PR titles announce issue ids, a fork PR titled with an in-flight id
+// derived `lead_online` + `handed_off` on the next ~45s cycle with no operator present: the pointer
+// update retargeted the unit's tracked PR, and the hand-off's unfetchable fork SHA made the ancestry
+// guard fail OPEN, silently dropping a pending kickback out of `kickbacks_pending`. DER-2737 hardened
+// the comment path and its own header names `gh pr list` as the vector; the PR-STATE path was the half
+// left behind.
+export function getTrustedPrAuthors() {
+  const set = new Set();
+  if (REPO_IDENTITY.ownerLogin) set.add(REPO_IDENTITY.ownerLogin);
+  for (const a of TRUSTED_PR_AUTHORS_EXTRA) set.add(a);
+  return set;
+}
+
+// The account/org that OWNS the repo being polled — the owner segment of `repo.repoSlug`.
+// Deliberately NOT `repo.ownerLogin`, which is a PERSON (the login commits must be authored by). On an
+// org-owned repo the two differ, and comparing a head-repository owner against the person would reject
+// every same-repo PR — turning the identity gate into a blanket refusal that quietly disables the cloud
+// lane. Returns null when unconfigured, which the gate treats as "cannot authenticate" ⇒ deny.
+export function getRepoOwnerLogin() {
+  const slug = REPO_IDENTITY.repoSlug;
+  if (typeof slug !== "string" || !slug) return null;
+  const owner = slug.split("/")[0].trim();
+  return owner || null;
+}
+
+// gh spells these `author.login` and `headRepositoryOwner.login` on `pr list --json` (verified against
+// gh 2.x). Both are REQUIRED: the author check answers "is this one of ours", the head-repository check
+// answers "is the branch on OUR repo" — a fork PR from a compromised-but-listed login still fails the
+// second. Anything missing (an older payload, a deleted fork, a hand-built test object) carries no
+// identity and is not authenticated. Pure; the module-config fallbacks mirror `toAuthorSet`.
+export function prIdentityTrusted(pr, { trustedPrAuthors, repoOwner } = {}) {
+  const trusted = trustedPrAuthors instanceof Set ? trustedPrAuthors
+    : Array.isArray(trustedPrAuthors) ? new Set(trustedPrAuthors)
+      : getTrustedPrAuthors();
+  const owner = repoOwner === undefined ? getRepoOwnerLogin() : repoOwner;
+  const author = pr?.author?.login;
+  const head = pr?.headRepositoryOwner?.login;
+  if (typeof author !== "string" || !author || !trusted.has(author)) return false;
+  if (typeof owner !== "string" || !owner) return false;
+  return typeof head === "string" && head === owner;
 }
 
 // gh spells the author two ways: `pr view --json comments` gives `author.login`; the REST
@@ -5436,15 +5504,22 @@ export function parsePrEventComments({ comments = [], runIssues = null, pr = nul
 // carries the `session_01…` teleport/monitor handle, its existence = liveness, and draft→ready = the
 // hand-off. Pure: given `{number,isDraft,body,headRefName,title}` + the run's issue ids, emit a
 // `lead_online` (with handle + draft flag) and, once it's no longer draft, a `handed_off`. Returns []
-// if the PR isn't part of this run (branch/title doesn't name a run issue).
+// if the PR's identity cannot be authenticated (DER-2778, below) or it isn't part of this run
+// (branch/title doesn't name a run issue).
 // Kickback flap guard (2026-07-16 run): pass `status` (the issue's folded status) + `kickbackSha` (the
 // SHA the shepherd recorded on the latest kickback) + `pr.headRefOid`. While the issue sits in
 // `kickback` and the head is STILL at the kickback SHA, a non-draft PR is a phantom ready state — the
 // reconcile raced the shepherd's re-draft, or a lead re-marked ready without pushing anything. Deriving
 // `handed_off` then poisons the ledger (empties kickbacks_pending, and its `${type}:${pr}` seen-key
 // suppresses the REAL re-hand-off later). Suppress it until the head advances.
-export function deriveCloudPrEvents({ pr, runIssues = null, bundles = {}, status = null, kickbackSha = null } = {}) {
+// IDENTITY BEFORE RELEVANCE (DER-2778): the trusted-PR-author + same-repo-head check runs before the
+// branch/title match, so an untrusted PR is never input at all — the same ordering `parsePrEventComments`
+// uses for comments ("an unauthenticated comment is not untrusted input to be sanitized, it is not input").
+// `trustedPrAuthors`/`repoOwner` default to module config; there is deliberately NO "no filter" escape
+// hatch of the kind `runIssues: null` provides, because that would be a bypass rather than a convenience.
+export function deriveCloudPrEvents({ pr, runIssues = null, bundles = {}, status = null, kickbackSha = null, trustedPrAuthors, repoOwner } = {}) {
   if (!pr || pr.number == null) return [];
+  if (!prIdentityTrusted(pr, { trustedPrAuthors, repoOwner })) return [];
   const hay = `${pr.headRefName || ""} ${pr.title || ""}`.toLowerCase();
   let issue;
   // When runIssues is PROVIDED (an array, even empty), the PR MUST name one of them — otherwise it's
@@ -5607,13 +5682,29 @@ export async function shaDescendsFrom({ repoRoot, ancestor, sha, run = runComman
 }
 
 // Stamp `sha_descends` onto derived hand-off events so the PURE fold can tell a forward head-move from a
-// backwards one. Only meaningful while the issue sits in `kickback` and we know the kickback's sha.
+// backwards one. Only meaningful while the issue sits in `kickback` and we know the kickback's sha — with
+// no kickback context there is nothing to clear, and stamping anyway would make every ordinary hand-off
+// read as a flap.
+//
+// FAIL-CLOSED on an unresolvable sha (DER-2778). `shaDescendsFrom` returns null when git cannot answer —
+// an unknown object (the shape a fork's head has on a clone that only ever fetched origin), no repo, a
+// broken git. This used to DECLINE TO STAMP, leaving the field `undefined`, and the fold's fallback then
+// read "the sha merely DIFFERS from the kickback sha" as proven new work: `provenNewSha` true, kickback
+// cleared, the round silently dropped out of `kickbacks_pending`. That is a check that cannot fail,
+// pointed at the exact outcome three rounds of flap-guard work exist to prevent. Unverified is now
+// recorded as NOT-PROVEN-FORWARD (`sha_descends:false`, the value the fold already refuses to clear on),
+// with `sha_unresolved` distinguishing "git said backwards" from "git could not say" for the operator —
+// without it a stalled unit reads as a proven backwards move, which is a different diagnosis.
+// The conservative failure is a kickback that stays pending until a real delivery marker
+// (`lead_spawned` re-spawn / `kickback_relayed`); the alternative failure is a finding that stops being
+// tracked, which is how this class shipped twice.
 export async function annotateShaAncestry(events, { repoRoot, kickbackSha, run = runCommand } = {}) {
   if (!kickbackSha || !repoRoot) return events;
   for (const e of events) {
     if (e?.type !== "handed_off" || !e.sha) continue;
     const descends = await shaDescendsFrom({ repoRoot, ancestor: kickbackSha, sha: e.sha, run });
-    if (descends !== null) e.sha_descends = descends;
+    e.sha_descends = descends === true;
+    if (descends === null) e.sha_unresolved = true;
   }
   return events;
 }
@@ -5629,10 +5720,16 @@ async function reconcilePrEventsInto(runDir, runId, repoRoot) {
   //
   // The fix is deliberately NOT to narrow the list to the run's known PRs, which was the obvious-looking
   // move and would have broken cloud-lead discovery: a cloud lead ANNOUNCES itself by opening a draft PR the
-  // ledger does not know about yet, and `deriveCloudPrEvents` decides relevance from branch/title. The waste
+  // ledger does not know about yet, and `deriveCloudPrEvents` decides relevance from branch/title (and,
+  // since DER-2778, only after the PR's identity is authenticated — the breadth is still the LIST, not the
+  // trust). The waste
   // was the per-PR fan-out, not the breadth — and `gh pr list --json` accepts every field the loop fetched,
   // including `comments`, so the fan-out collapses into the call that was already being made.
-  const listRes = await runCommand({ command: "gh", args: ["pr", "list", "--state", "open", "--json", "number,isDraft,body,headRefName,title,headRefOid,comments", "--limit", "100"], cwd: repoRoot });
+  //
+  // DER-2778: `author,headRepositoryOwner` ride along on the SAME call — measured free (the GraphQL
+  // cost stays 1 point at the 100×100 ceiling), and without them `deriveCloudPrEvents` had nothing but a
+  // branch/title substring to decide that a PR belongs to this run. A second call is not the answer here.
+  const listRes = await runCommand({ command: "gh", args: ["pr", "list", "--state", "open", "--json", "number,isDraft,body,headRefName,title,headRefOid,comments,author,headRepositoryOwner", "--limit", "100"], cwd: repoRoot });
   if (listRes.exitCode !== 0) return { folded: 0 };
   let prRows;
   try { prRows = JSON.parse(listRes.stdout || "[]"); } catch { return { folded: 0 }; }
@@ -5662,6 +5759,12 @@ async function reconcilePrEventsInto(runDir, runId, repoRoot) {
   // longer suppresses a fresh derivation (the draft→ready re-hand-off after a fix).
   const seen = derivedEventSeen(existing);
   let folded = 0;
+  // Every event THIS cycle appended, in append order (DER-2778 rider). links.md below is rendered from
+  // `existing` + these instead of re-reading the whole ledger: `existing` alone would regress it, because
+  // it was read BEFORE the folds and the freshly-derived `lead_online` handles are the entire point of
+  // refreshing the file here.
+  const appended = [];
+  const append = async (e) => { appended.push(await appendEvent(runDir, e)); folded += 1; };
   const emit = async (e) => {
     // pr-less events dedup on their content key too (DER-2519) — the old `pr != null` guard is the
     // exact hole that let one comment re-append every scan. Idempotence control: running reconcile
@@ -5669,12 +5772,23 @@ async function reconcilePrEventsInto(runDir, runId, repoRoot) {
     const key = eventSeenKey(e);
     if (seen.has(key)) return;
     seen.add(key);
-    await appendEvent(runDir, e);
-    folded += 1;
+    await append(e);
   };
   for (const data of prRows) {
     const pr = data?.number;
     if (pr == null) continue;
+    // IDENTITY FIRST (DER-2778) — an unauthenticated PR row is not untrusted input to be filtered
+    // downstream, it is not input at all, so nothing below reads it. `deriveCloudPrEvents` re-checks
+    // this internally (it is an exported pure seam and must stand alone for any future caller); the two
+    // call the SAME predicate, so they cannot drift apart.
+    //
+    // The COMMENTS are gated here too, deliberately. DER-2737 authenticates a comment by its AUTHOR,
+    // which is the right control for "did this actor say it" — but the reader also stamps `pr` from the
+    // PR the comment sits on and treats that as authoritative. Folding a comment off an unauthenticated
+    // PR therefore injects that PR's number into the run's state, which is the retargeting attack this
+    // issue closes, reached through a different door: the Codex review bot is a TRUSTED comment author
+    // and comments on whatever PR it is asked to review, including a fork's.
+    if (!prIdentityTrusted({ author: data.author, headRepositoryOwner: data.headRepositoryOwner })) continue;
     // Belt-and-braces fix_pushed (item 1): SHA-keyed, so it bypasses the `${type}:${pr}` seen set (which
     // would block a 2nd fix on a different SHA). deriveKickbackFixEvents does the SHA-based idempotency.
     // MUST append BEFORE the derived handed_off for the same scan (2026-07-16 flap guard): the fold only
@@ -5685,12 +5799,19 @@ async function reconcilePrEventsInto(runDir, runId, repoRoot) {
     for (const e of deriveKickbackFixEvents({
       issue, pr, status: issueStatus,
       headSha: data.headRefOid, kickbackSha: kickbackShaByPr.get(pr), seenShas: fixShasByPr.get(pr) || [],
-    })) { await appendEvent(runDir, e); folded += 1; }
+    })) await append(e);
     // DER-2559 (ancestor variant): resolve ancestry HERE, where a repo is in hand, and stamp it on the
     // derived hand-off. The fold is pure and cannot ask git whether the head moved forwards or backwards.
     const derived = await annotateShaAncestry(
       deriveCloudPrEvents({
-        pr: { number: pr, isDraft: data.isDraft, body: data.body, headRefName: data.headRefName, title: data.title, headRefOid: data.headRefOid },
+        // The projection stays explicit (not `...data`) so every field the derivation may read is a
+        // deliberate one. `author`/`headRepositoryOwner` are what `deriveCloudPrEvents` authenticates on
+        // (DER-2778); dropping them here would silently restore deny-everything, not the old trust-all.
+        pr: {
+          number: pr, isDraft: data.isDraft, body: data.body, headRefName: data.headRefName,
+          title: data.title, headRefOid: data.headRefOid,
+          author: data.author, headRepositoryOwner: data.headRepositoryOwner,
+        },
         runIssues: scope, bundles, status: issueStatus, kickbackSha: kickbackShaByPr.get(pr),
       }),
       { repoRoot, kickbackSha: issueStatus === "kickback" ? kickbackShaByPr.get(pr) : null },
@@ -5698,12 +5819,24 @@ async function reconcilePrEventsInto(runDir, runId, repoRoot) {
     for (const e of derived) await emit(e);
     // `pr` is passed so the reader stamps the PR the comment was actually posted on rather than trusting
     // the body's claim; the author allowlist comes from config (DER-2737).
-    for (const e of parsePrEventComments({ comments: data.comments || [], runIssues: scope, pr })) await emit(e);
+    // Ancestry is stamped on these too (DER-2778): `COMMENT_FIELDS_COMMON` lets a comment carry `sha`, so
+    // a comment-reported `handed_off` reached the fold with NO `sha_descends` and cleared a pending
+    // kickback on nothing but "the sha differs" — the same fail-open the derived path had, one call site
+    // over. Same guard, same place, so the two ingestion paths cannot answer differently.
+    const fromComments = await annotateShaAncestry(
+      parsePrEventComments({ comments: data.comments || [], runIssues: scope, pr }),
+      { repoRoot, kickbackSha: issueStatus === "kickback" ? kickbackShaByPr.get(pr) : null },
+    );
+    for (const e of fromComments) await emit(e);
   }
   // Publish the operator monitor links (item 7) from the freshly-folded state — cheap, and this is where
   // cloud leads' `lead_online` handles land, so links.md refreshes on each new cloud lead.
+  // Folded from the events ALREADY IN HAND (`existing`, read at the top) plus everything this cycle
+  // appended — not a second full `readEvents` of the same file (DER-2778 rider). `appended` is what makes
+  // the two equivalent: without it this would publish a links.md missing exactly the handles the cycle
+  // just discovered, which is the one thing the refresh is here to do.
   try {
-    await writeFile(join(runDir, "links.md"), renderLinksMd(materializeState(await readEvents(runDir), { run_id: runId })), "utf8");
+    await writeFile(join(runDir, "links.md"), renderLinksMd(materializeState([...existing, ...appended], { run_id: runId })), "utf8");
   } catch { /* links.md is best-effort operator sugar */ }
   return { folded };
 }
@@ -5730,6 +5863,7 @@ export async function applyRepoConfig(repoRoot) {
   LEGACY_EVENT_MARKER = null;
   LEGACY_HANDOFF_MARKER = null;
   TRUSTED_COMMENT_AUTHORS_EXTRA = [];
+  TRUSTED_PR_AUTHORS_EXTRA = [];
   COMMIT_AUTHOR = null;
   COMMIT_AUTHOR_ERROR = null;
   let cfg;
@@ -5782,6 +5916,12 @@ export async function applyRepoConfig(repoRoot) {
   // or a bot that posts on the harness's behalf. `repo.ownerLogin` is trusted automatically.
   if (Array.isArray(cfg.trustedCommentAuthors)) {
     TRUSTED_COMMENT_AUTHORS_EXTRA = cfg.trustedCommentAuthors.filter((a) => typeof a === "string" && a);
+  }
+  // Extra logins whose OPEN PRs may be read as this run's cloud-lead lifecycle (DER-2778) — the account
+  // a cloud env's `GH_TOKEN` authors PRs as, when that is not `repo.ownerLogin`. A SEPARATE key from
+  // `trustedCommentAuthors` on purpose: see getTrustedPrAuthors for why the two lists must not merge.
+  if (Array.isArray(cfg.trustedPrAuthors)) {
+    TRUSTED_PR_AUTHORS_EXTRA = cfg.trustedPrAuthors.filter((a) => typeof a === "string" && a);
   }
 }
 

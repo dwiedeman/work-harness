@@ -35,7 +35,9 @@ fi
 ## Cloud-specific conventions (differ from local `/work-lead`)
 - **No worktree, no cmux** — you're a fresh clone in an isolated VM. Work directly in the checkout.
 - **GitHub writes:** PR creation → prefer the **GitHub MCP tools** (they author as `<repo.ownerLogin>`, so Codex
-  engages). `gh` REST (`gh api repos/.../...`) works but authors comments as `claude[bot]`. **`gh pr
+  engages **and the orchestrator can authenticate the PR as yours** — since DER-2778 it derives your
+  `lead_online`/`handed_off` only from PRs authored by a trusted login on a branch in this repo, so a PR
+  opened as anyone else reads as "lead never started"). `gh` REST (`gh api repos/.../...`) works but authors comments as `claude[bot]`. **`gh pr
   comment` / any GraphQL is DISABLED** in cloud sessions — use `gh api` REST for issue/PR comments.
 - **DB tests:** run on the default `postgresql://postgres:postgres@127.0.0.1:54322/postgres`, but the
   **reset connects as `supabase_admin`** — `pnpm db:local:reset` uses that image-only role; do not
