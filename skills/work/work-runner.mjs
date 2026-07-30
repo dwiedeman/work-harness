@@ -3434,7 +3434,7 @@ export function materializeState(rawEvents, meta = {}) {
       // `spawn_failed*` (DER-2739) and `transcripts_forced` (DER-2744) are both TRI-STATE-ish on purpose:
       // `transcripts_forced: null` means UNKNOWN — a spawn event that carried no attestation — and unknown
       // is never the same as ok. See the transcripts_unverified banner.
-      issues[id] = { status: "queued", pr: null, worktree: null, branch: null, workspace_ref: null, kickback_count: 0, kickback_unactioned: false, kickback_sha: null, fileScope: [], host: null, bundle: null, tokens: 0, plan_scope_seen: false, budget: "ok", leadType: null, rotations: 0, rotate_pending: false, rotate_pct: null, rotate_disposition: null, spawn_failed: false, spawn_failed_count: 0, spawn_failed_note: null, spawn_failed_exit_code: null, transcripts_forced: null, _reports: {}, _kb_uncounted: false };
+      issues[id] = { status: "queued", pr: null, worktree: null, branch: null, workspace_ref: null, kickback_count: 0, kickback_unactioned: false, kickback_sha: null, fileScope: [], host: null, bundle: null, tokens: 0, plan_scope_seen: false, budget: "ok", leadType: null, rotations: 0, rotate_pending: false, rotate_pct: null, rotate_disposition: null, spawn_failed: false, spawn_failed_count: 0, spawn_failed_note: null, spawn_failed_exit_code: null, transcripts_forced: null, reap_cleanup_ok: null, reap_failed: false, reap_leaks: [], reap_failed_note: null, _reports: {}, _kb_uncounted: false };
     }
     return issues[id];
   };
@@ -3699,6 +3699,18 @@ export function materializeState(rawEvents, meta = {}) {
         break;
       case "reaped":
         it.status = "reaped";
+        // DER-2740: a reap that could not finish its REQUIRED cleanup still reaches terminal status (the
+        // run has to be able to end, and panes are swept off the back of this event) — but it records that
+        // it was not clean, so `state.reap_failures` can survive the issue going terminal.
+        if (e.cleanup_ok === false) it.reap_cleanup_ok = false;
+        else if (e.cleanup_ok === true) it.reap_cleanup_ok = true;
+        break;
+      case "reap_failed":
+        // Separate from `reaped` on purpose: `reaped` is deduped per issue (first wins), so the failure
+        // record must be its own event or a re-reap could never report a new leak.
+        it.reap_failed = true;
+        it.reap_leaks = Array.isArray(e.leaks) ? e.leaks : [];
+        it.reap_failed_note = e.reason ?? null;
         break;
       default:
         break;
@@ -3835,6 +3847,16 @@ export function materializeState(rawEvents, meta = {}) {
     // kickbacks_pending (a re-spawn is the sole delivery evidence for a kickback round) and cleared
     // lead_process_dead. Surfaced top-level, and on every wake, for the same reason as kickbacks_pending:
     // the ONLY thing that clears it is a spawn that actually worked.
+    // Leaked-teardown banner (DER-2740). Deliberately NOT filtered on DONE_STATUSES the way spawn_failures
+    // is: the whole point is that the issue IS terminal (`reaped`) while something it owned is still
+    // running or registered. Filtering terminal issues out here would hide exactly the case this exists for.
+    reap_failures: Object.entries(issues)
+      .filter(([, v]) => v.reap_failed)
+      .map(([k, v]) => ({
+        issue: k, host: v.host, worktree: v.worktree, leaks: v.reap_leaks,
+        reason: v.reap_failed_note,
+        act: (v.reap_leaks ?? []).map((step) => REAP_LEAK_NOTES[step] ?? step),
+      })),
     spawn_failures: [
       ...Object.entries(issues)
         .filter(([, v]) => v.spawn_failed && !DONE_STATUSES.has(v.status))
@@ -4083,6 +4105,7 @@ export function mergedReconcileEvents({ issues = {}, mergedPrNumbers = [] } = {}
 export const ACTIONABLE_EVENT_TYPES = [
   "pr_opened", "handed_off", "pr_merged", "kickback", "reaped", "lead_failed",
   "lead_spawn_failed", "shepherd_spawn_failed", "orch_spawn_failed",
+  "reap_failed",
 ];
 export function parseWakeOn(spec) {
   if (!spec) return null; // null ⇒ wake on any new event (unchanged default)
@@ -4095,6 +4118,47 @@ export function parseWakeOn(spec) {
 // (no MERGE_HEAD; the commit still landed) and usually swept by the worktree removal, but delete it
 // explicitly first so nothing lingers. The AUTO_MERGE step is `optional` (a missing ref makes
 // `update-ref -d` exit non-zero — the caller ignores it). Pure; empty when there's no worktree.
+// DER-2740. `reap` discarded all four cleanup results and appended the TERMINAL `reaped` regardless, so a
+// failure became unreachable: `dedupeTerminalEvents` keeps the FIRST `reaped` per issue, which means a
+// premature one can never be corrected by appending a better one later.
+//
+// Not every nonzero exit is a leak, and treating one as such would be the inverse defect. The AUTO_MERGE
+// `update-ref -d` is marked `optional` because a MISSING ref is the normal case, and the commonest local
+// `worktree remove` failure is "already gone" — the desired end state. Two steps are REQUIRED, because
+// their failure leaves something running or registered that nothing else reclaims:
+//   remote_pkill            the mini's claude survives `close-workspace` (that only drops the ssh), so a
+//                           failed pkill leaves a lead ALIVE burning tokens while the ledger says reaped
+//   remote_worktree_remove  nothing re-derives worktrees from the ledger, and since DER-2742 a later run
+//                           REFUSES the leaked path instead of silently deleting it — visible, but stuck
+// Panes are deliberately NOT required: appending `reaped` is exactly what enqueues an issue's refs into
+// `sweepPlan`, and `sweep-workspaces` re-closes them at every orchestrator boot AND checks exit codes, so
+// a pane close that fails here really is retried. (The issue's original framing had this backwards.)
+export const REAP_REQUIRED_STEPS = ["remote_pkill", "remote_worktree_remove"];
+
+export function reapCleanupOutcome(steps = []) {
+  const attempted = steps.filter((x) => x && x.step);
+  // `optional` is finally READ. It has been set on the AUTO_MERGE command since that helper was written
+  // and no caller ever looked at it — a marker that meant nothing is indistinguishable from no marker.
+  const failed = attempted.filter((x) => Number(x.exit_code) !== 0 && !x.optional);
+  const leaks = failed.filter((x) => REAP_REQUIRED_STEPS.includes(x.step)).map((x) => x.step);
+  return {
+    ok: leaks.length === 0,
+    leaks,
+    failed_steps: failed.map((x) => x.step),
+    steps: attempted.map((x) => ({
+      step: x.step, exit_code: Number(x.exit_code) || 0, optional: Boolean(x.optional),
+      ...(x.stderr ? { stderr: String(x.stderr).slice(0, 400) } : {}),
+    })),
+  };
+}
+
+// What each leaked step obliges the operator to do. A banner that names a step without saying what it
+// costs gets skimmed; the live-remote-lead case is the one that spends money while unattended.
+export const REAP_LEAK_NOTES = {
+  remote_pkill: "the remote claude may still be ALIVE and burning tokens — ssh to the host and pkill it by its brief path",
+  remote_worktree_remove: "the remote worktree is still registered — `git -C <repo> worktree remove --force <path>` on that host (a later run will REFUSE the path, not reclaim it)",
+};
+
 export function reapCleanupCommands({ worktree, gitCwd } = {}) {
   if (!worktree) return [];
   return [
@@ -5917,24 +5981,34 @@ export async function runSubcommand(argv) {
       const state = materializeState(await readEvents(runDir), { run_id: o.runId });
       const it = state.issues[o.issueId] ?? {};
       const remoteHost = it.host && it.host !== "local" ? getHosts()[it.host] : null;
+      // DER-2740: every cleanup result is CAPTURED rather than discarded. Cleanup stays best-effort — the
+      // run must still be able to end — but "best-effort" was silently doing double duty as "unrecorded".
+      const cleanupSteps = [];
       if (!o.dryRun) {
         if (remoteHost) {
           // cmux close-workspace only drops the ssh connection — the remote claude survives (it
           // self-exits eventually, but non-deterministically). Kill it explicitly by its brief path
           // in the process args BEFORE removing the worktree it's cwd'd in, so a mini reap is clean.
           const briefMatch = `${remoteHost.ledgerRoot}/${o.runId}/briefs/${o.issueId}`;
-          await runCommand({ command: "ssh", args: [remoteHost.ssh, `pkill -f ${shellQuote(briefMatch)}; true`] });
+          const r = await runCommand({ command: "ssh", args: [remoteHost.ssh, `pkill -f ${shellQuote(briefMatch)}; true`] });
+          // REQUIRED: a failure here leaves the remote lead alive, spending, with nothing watching it.
+          cleanupSteps.push({ step: "remote_pkill", optional: false, exit_code: r.exitCode, stderr: r.stderr });
         }
         if (it.worktree) {
           if (remoteHost) {
             // Chain the stale-AUTO_MERGE cleanup (B5) into the same ssh as the worktree remove — no
             // extra round-trip; the `2>/dev/null` swallows a missing-ref error (best-effort, as before).
-            await runCommand({ command: "ssh", args: [remoteHost.ssh, reapRemoteCleanupCommand({ worktree: it.worktree, repo: remoteHost.repo })] });
+            const r = await runCommand({ command: "ssh", args: [remoteHost.ssh, reapRemoteCleanupCommand({ worktree: it.worktree, repo: remoteHost.repo })] });
+            cleanupSteps.push({ step: "remote_worktree_remove", optional: false, exit_code: r.exitCode, stderr: r.stderr });
           } else {
-            // Best-effort, matching prior reap behavior (worktree-remove failures are not fatal); the
-            // AUTO_MERGE step is `optional` so a missing ref doesn't abort the removal.
+            // Local cleanup stays OPTIONAL, and now says so through the flag rather than by discarding the
+            // result: the commonest nonzero here is "worktree already gone", which is the desired end state.
             for (const c of reapCleanupCommands({ worktree: it.worktree, gitCwd: o.repoRoot ?? process.cwd() })) {
-              await runCommand({ command: c.command, args: c.args });
+              const r = await runCommand({ command: c.command, args: c.args });
+              cleanupSteps.push({
+                step: c.args?.includes("update-ref") ? "local_auto_merge" : "local_worktree_remove",
+                optional: true, exit_code: r.exitCode, stderr: r.stderr,
+              });
             }
           }
         }
@@ -5947,8 +6021,25 @@ export async function runSubcommand(argv) {
         }
       }
       // Dry-run purity (DER-2514): a preview reap must not record a terminal `reaped`.
-      if (!o.dryRun) await appendEvent(runDir, { actor: "orch", type: "reaped", issue: o.issueId });
-      return { stdout: `reaped ${o.issueId}${o.dryRun ? " (dry-run: nothing closed, nothing recorded)" : ""}` };
+      const cleanup = reapCleanupOutcome(cleanupSteps);
+      if (!o.dryRun) {
+        await appendEvent(runDir, {
+          actor: "orch", type: "reaped", issue: o.issueId,
+          cleanup_ok: cleanup.ok, cleanup: cleanup.steps,
+        });
+        // A SEPARATE event, not a field on `reaped` alone: `dedupeTerminalEvents` keeps the first `reaped`
+        // per issue, so a leak recorded only there could never be reported by a later re-reap. Appended
+        // AFTER `reaped` so the terminal transition is never lost if this write fails.
+        if (!cleanup.ok) {
+          await appendEvent(runDir, {
+            actor: "orch", type: "reap_failed", issue: o.issueId, host: it.host ?? null,
+            leaks: cleanup.leaks, failed_steps: cleanup.failed_steps, cleanup: cleanup.steps,
+            reason: `required cleanup failed: ${cleanup.leaks.join(", ")}`,
+          });
+        }
+      }
+      const leakNote = cleanup.ok ? "" : `\n  ⚠ NOT a clean teardown — ${cleanup.leaks.map((l) => REAP_LEAK_NOTES[l] ?? l).join("\n  ⚠ ")}`;
+      return { stdout: `reaped ${o.issueId}${o.dryRun ? " (dry-run: nothing closed, nothing recorded)" : ""}${leakNote}` };
     }
     case "ready": {
       // PER-PR ENQUEUE GATE (H5) — the run-dir ready.sh promoted to a harness primitive so it stops
@@ -6331,6 +6422,7 @@ export async function runSubcommand(argv) {
               // because the alternative — the old behaviour — was that it never surfaced at all and read
               // as healthy in-flight work. Role failures (no issue) appear as "shepherd"/"orch".
               spawn_failures: (st.spawn_failures ?? []).map((f) => f.issue ?? f.role),
+              reap_failures: (st.reap_failures ?? []).map((f) => f.issue),
               // DER-2744: in-flight lanes whose transcript persistence was never proven. Every
               // transcript-reading instrument is blind for these, and a blind lane looks exactly like a
               // dead one — so it belongs next to leads_dead, not in a report nobody runs.

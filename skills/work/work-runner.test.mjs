@@ -18,7 +18,7 @@ import {
   getHosts, pickHost, buildRemoteLeadBootCommand, mergeRemoteEvents,
   requiresDocker, parseIssueList, bundleList,
   hostsToPull, mergedReconcileEvents, parseWakeOn, ACTIONABLE_EVENT_TYPES,
-  reapCleanupCommands, renderCloudBrief, parsePrEventComments, deriveCloudPrEvents,
+  reapCleanupCommands, reapCleanupOutcome, renderCloudBrief, parsePrEventComments, deriveCloudPrEvents,
   codexReviewCommand, codexTokensFromLog, parseCodexReview, reviewFindingsEvent, scoreReviewFidelity, codexRunCompleted,
   dedupeTerminalEvents, escalateKickbackModel, getShepherdModel, getDefaultPreferHosts,
   getLeadTypes, proxyEnvPairs, modelFamily, hasExternalReviewer, reviewUsageEvent, reviewShellCommand,
@@ -5759,4 +5759,154 @@ test("DER-2739/DER-2744 fields are NOT reachable from a PR comment", () => {
   assert.equal("transcripts_forced" in forged[0], false);
   const st = materializeState([{ type: "lead_spawned", issue: "DER-1", workspace_ref: "workspace:1" }, ...forged], {});
   assert.deepEqual(st.transcripts_unverified.map((r) => r.issue), ["DER-1"], "the banner survives a forged attestation");
+});
+
+// ---- DER-2740: reap must not claim a teardown it did not achieve ------------------------------------
+// `reaped` is TERMINAL and `dedupeTerminalEvents` keeps the FIRST one per issue, so a premature `reaped`
+// can never be corrected by appending a better one later. The sharpest harm is a failed remote `pkill`:
+// `close-workspace` only drops the ssh, so the mini's claude stays ALIVE burning tokens while the ledger
+// says the issue is reaped and nothing will ever look at it again.
+async function withReapStubs(failPattern, body) {
+  const dir = await mkdtemp(join(tmpdir(), "wr-d2740-"));
+  const bin = join(dir, "bin");
+  await mkdir(bin, { recursive: true });
+  const log = join(dir, "ssh.log");
+  await writeFile(join(bin, "ssh"), [
+    "#!/bin/sh",
+    `printf '%s\\n' "$*" >> ${JSON.stringify(log)}`,
+    ...(failPattern ? [`case "$*" in *${failPattern}*) printf 'ssh: boom\\n' >&2; exit 9 ;; esac`] : []),
+    "exit 0",
+  ].join("\n") + "\n", "utf8");
+  await chmod(join(bin, "ssh"), 0o755);
+  const cmux = join(bin, "cmux");
+  await writeStubBin(cmux, { exit: 0, out: "closed" });
+  const prevPath = process.env.PATH;
+  process.env.PATH = `${bin}:${prevPath}`;
+  try {
+    return await body({ cmux, sshCalls: async () => (await readFile(log, "utf8").catch(() => "")).trim().split("\n").filter(Boolean) });
+  } finally {
+    process.env.PATH = prevPath;
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+async function d2740Ledger() {
+  const runsRoot = await mkdtemp(join(tmpdir(), "wr-d2740-runs-"));
+  const runDir = join(runsRoot, "r1");
+  await mkdir(runDir, { recursive: true });
+  const evs = [
+    { actor: "orch", type: "run_started", run_id: "r1" },
+    { actor: "orch", type: "worktree_created", issue: "DER-1", worktree: "/Users/example/agent-work/r1/DER-1", host: "mini" },
+    { actor: "orch", type: "lead_spawned", issue: "DER-1", host: "mini", workspace_ref: "workspace:7" },
+  ];
+  await writeFile(join(runDir, "events.jsonl"),
+    `${evs.map((e) => JSON.stringify({ ...e, ts: "2026-07-29T01:00:00.000Z" })).join("\n")}\n`, "utf8");
+  return { runsRoot, runDir };
+}
+const d2740Read = async (runDir) => (await readEvents(runDir));
+
+test("DER-2740: a failed remote pkill is recorded — the reap does not claim a clean teardown", async () => {
+  const repoRoot = await mkRepoWithHosts();
+  const { runsRoot, runDir } = await d2740Ledger();
+  try {
+    await withReapStubs("pkill", async ({ cmux }) => {
+      await withEnv({ WORK_CMUX_BIN: cmux }, () =>
+        runSubcommand(["reap", "--run", "r1", "DER-1", "--runs-root", runsRoot, "--repo-root", repoRoot]));
+      const evs = await d2740Read(runDir);
+      const reaped = evs.find((e) => e.type === "reaped");
+      assert.ok(reaped, "the run must still be able to finish — reaped is still appended");
+      assert.equal(reaped.cleanup_ok, false, "a reap whose required cleanup failed must not read as clean");
+      const failed = evs.find((e) => e.type === "reap_failed");
+      assert.ok(failed, "the leak must be recorded, not discarded — a live remote lead burns tokens silently");
+      assert.ok((failed.leaks ?? []).includes("remote_pkill"), `leaks must name the step: ${JSON.stringify(failed.leaks)}`);
+      const st = materializeState(evs, { run_id: "r1" });
+      const banner = st.reap_failures ?? [];
+      assert.equal(banner.length, 1, "state must surface the leak even though the issue is terminal");
+      assert.match(JSON.stringify(banner[0]), /alive|running|pkill/i, "the banner must say what leaked");
+    });
+  } finally {
+    await rm(runsRoot, { recursive: true, force: true });
+    await rm(repoRoot, { recursive: true, force: true });
+    await applyRepoConfig("/nonexistent-reset");
+  }
+});
+
+test("DER-2740: a failed remote worktree remove is recorded too (nothing re-derives worktrees)", async () => {
+  const repoRoot = await mkRepoWithHosts();
+  const { runsRoot, runDir } = await d2740Ledger();
+  try {
+    await withReapStubs("worktree", async ({ cmux }) => {
+      await withEnv({ WORK_CMUX_BIN: cmux }, () =>
+        runSubcommand(["reap", "--run", "r1", "DER-1", "--runs-root", runsRoot, "--repo-root", repoRoot]));
+      const evs = await d2740Read(runDir);
+      const failed = evs.find((e) => e.type === "reap_failed");
+      assert.ok(failed, "a leaked registered worktree must be recorded");
+      assert.ok((failed.leaks ?? []).includes("remote_worktree_remove"), JSON.stringify(failed.leaks));
+      assert.equal(evs.find((e) => e.type === "reaped").cleanup_ok, false);
+    });
+  } finally {
+    await rm(runsRoot, { recursive: true, force: true });
+    await rm(repoRoot, { recursive: true, force: true });
+    await applyRepoConfig("/nonexistent-reset");
+  }
+});
+
+test("DER-2740 CONTROL: an all-green reap records a CLEAN reaped and no failure (the gate does not over-block)", async () => {
+  const repoRoot = await mkRepoWithHosts();
+  const { runsRoot, runDir } = await d2740Ledger();
+  try {
+    await withReapStubs(null, async ({ cmux }) => {
+      await withEnv({ WORK_CMUX_BIN: cmux }, () =>
+        runSubcommand(["reap", "--run", "r1", "DER-1", "--runs-root", runsRoot, "--repo-root", repoRoot]));
+      const evs = await d2740Read(runDir);
+      assert.equal(evs.find((e) => e.type === "reaped").cleanup_ok, true, "a clean teardown must read as clean");
+      assert.equal(evs.some((e) => e.type === "reap_failed"), false, "no failure event on a healthy reap");
+      assert.deepEqual(materializeState(evs, { run_id: "r1" }).reap_failures ?? [], []);
+    });
+  } finally {
+    await rm(runsRoot, { recursive: true, force: true });
+    await rm(repoRoot, { recursive: true, force: true });
+    await applyRepoConfig("/nonexistent-reset");
+  }
+});
+
+test("DER-2740: a BENIGN optional no-op is not a leak, and `optional` is finally read", async () => {
+  // `reapCleanupCommands` has marked the AUTO_MERGE delete `optional:true` since it was written, and the
+  // caller never looked at the flag — a dead marker. A missing AUTO_MERGE ref is the NORMAL case, and the
+  // commonest local nonzero is "worktree already gone", which is the desired end state. Turning either
+  // into a blocking failure would be the inverse defect.
+  assert.equal(typeof reapCleanupOutcome, "function", "the classification must be a pure, testable seam");
+  const benign = reapCleanupOutcome([
+    { step: "local_auto_merge", optional: true, exit_code: 1, stderr: "no such ref" },
+    { step: "local_worktree_remove", optional: true, exit_code: 1, stderr: "is not a working tree" },
+  ]);
+  assert.equal(benign.ok, true, "optional steps failing must not manufacture a leak");
+  assert.deepEqual(benign.leaks, []);
+  const real = reapCleanupOutcome([
+    { step: "remote_pkill", optional: false, exit_code: 9, stderr: "boom" },
+    { step: "remote_worktree_remove", optional: false, exit_code: 0 },
+  ]);
+  assert.equal(real.ok, false);
+  assert.deepEqual(real.leaks, ["remote_pkill"]);
+  assert.ok(reapCleanupCommands({ worktree: "/wt", gitCwd: "/repo" })[0].optional, "the marker still exists to be read");
+});
+
+test("DER-2740: reap_failed is actionable, and --dry-run still records nothing", async () => {
+  assert.ok(ACTIONABLE_EVENT_TYPES.includes("reap_failed"),
+    "a leaked live remote lead must wake a --wake-on actionable loop");
+  const repoRoot = await mkRepoWithHosts();
+  const { runsRoot, runDir } = await d2740Ledger();
+  try {
+    await withReapStubs("pkill", async ({ cmux, sshCalls }) => {
+      await withEnv({ WORK_CMUX_BIN: cmux }, () =>
+        runSubcommand(["reap", "--run", "r1", "DER-1", "--runs-root", runsRoot, "--repo-root", repoRoot, "--dry-run"]));
+      const types = (await d2740Read(runDir)).map((e) => e.type);
+      assert.deepEqual(types, ["run_started", "worktree_created", "lead_spawned"], "dry-run purity (DER-2514)");
+      assert.deepEqual(await sshCalls(), [], "a preview must not ssh anywhere either");
+    });
+  } finally {
+    await rm(runsRoot, { recursive: true, force: true });
+    await rm(repoRoot, { recursive: true, force: true });
+    await applyRepoConfig("/nonexistent-reset");
+  }
 });
