@@ -784,7 +784,51 @@ function roleEnvArgs(role, runDir) {
 // The session's own status line says it plainly ("Transcript saving is off — inherited
 // CLAUDE_CODE_CHILD_SESSION marker"), which is the only place it surfaces.
 const FORCE_TRANSCRIPTS = "CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1";
-const CLAUDE_LAUNCH = `env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN ${FORCE_TRANSCRIPTS} claude --dangerously-skip-permissions`;
+
+// DER-2744 — the persistence var was OMITTABLE, and it was omitted. Both lead boot builders branched on
+// `proxyEnv` and only the direct-Claude branch carried it, so every kimi/gpt (CLIProxyAPI) and deepseek
+// (OpenRouter) lead ran with transcript persistence off. Nothing errored: those lanes simply produced no
+// transcript, and a lane with no transcript is INDISTINGUISHABLE from a lane whose lead died — `usage`
+// under-reports it, `lead-context` can't read it, the rotation bands never fire for it, and there is no
+// crash-recovery evidence. Exactly the alt-model lanes that are hardest to observe by eye.
+//
+// The fix is structural, mirroring REMOTE_PATH_PRELUDE: ONE function builds the env prefix for EVERY
+// claude launch, so a branch cannot forget the var — the only thing a caller varies is the key clause
+// (which differs per provider) and whatever provider env follows. `assertForcesTranscripts` is the belt
+// to that braces: every builder runs its FINISHED launch string through it, so a future builder (or a
+// future branch) that side-steps this helper fails loudly at build time instead of quietly at telemetry
+// time. See launchForcesTranscripts for why position matters.
+function claudeEnvPrefix({ keyClause = "-u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN", extra = [] } = {}) {
+  return ["env", keyClause, FORCE_TRANSCRIPTS, ...extra].filter((p) => p !== null && p !== undefined && p !== "").join(" ");
+}
+
+// Does this launch string actually force session persistence? POSITION IS THE WHOLE POINT: `env` applies
+// assignments that PRECEDE the binary, so `claude … CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1` is not an
+// env assignment at all — it is an argv word claude ignores. A substring check alone would pass that and
+// be a check that cannot fail. Pure and exported so the guarantee is a unit test, not a live spawn.
+export function launchForcesTranscripts(launch) {
+  const s = String(launch ?? "");
+  const at = s.indexOf(FORCE_TRANSCRIPTS);
+  if (at < 0) return false;
+  const bin = s.search(/\bclaude\s+--/);
+  return bin < 0 ? true : at < bin;
+}
+
+// The gate itself. Returns the launch so it can wrap an expression; throws otherwise. `label` names the
+// builder, because "some launch is missing a var" is not a debuggable message.
+export function assertForcesTranscripts(launch, label = "launch") {
+  if (launchForcesTranscripts(launch)) return launch;
+  throw new Error(
+    `${label}: REFUSING to build a launch without ${FORCE_TRANSCRIPTS} in its env prefix (DER-2744).\n` +
+      "  A session launched by CMUX inherits a CLAUDE_CODE_CHILD_SESSION marker and writes NO transcript,\n" +
+      "  so session-token-report, lead-context, the rotation bands and crash-recovery evidence all go\n" +
+      "  silently blank for this lane — which then looks identical to a lane whose lead died.\n" +
+      "  Build the env prefix with claudeEnvPrefix() instead of assembling `env …` by hand.\n" +
+      `  launch was: ${String(launch ?? "").slice(0, 300)}`,
+  );
+}
+
+const CLAUDE_LAUNCH = `${claudeEnvPrefix()} claude --dangerously-skip-permissions`;
 
 // --dangerously-skip-permissions is refused by Claude Code under root/sudo, so a root spawn would
 // create a CMUX workspace + ledger event while the claude process exits immediately (a phantom
@@ -2161,11 +2205,20 @@ export function buildLeadBootCommand({ name, worktree, briefPath, runDir, model 
   // Chrome system-prompt section + MCP instructions (~1,300 tok) on EVERY turn. UI verification is the
   // `e2e-pr` CI gate, not local Chrome. The orchestrator opts back in explicitly (buildOrchBootCommand
   // passes --chrome); the shepherd is left at the default deliberately (unmeasured, review-only role).
-  const launch = proxyEnv && proxyEnv.length
-    ? `env ${keyClause} ${SECURITY_GUIDANCE_LEAD_GATE} ${proxyEnv.join(" ")} claude --dangerously-skip-permissions --no-chrome --model ${model}${effortArg}`
-    : `env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN ${FORCE_TRANSCRIPTS} ${SECURITY_GUIDANCE_LEAD_GATE} claude --dangerously-skip-permissions --no-chrome --model ${model}${effortArg}`;
+  // Both branches build their env prefix through claudeEnvPrefix, so neither can drop the transcript
+  // persistence var (DER-2744 — the proxy branch used to, which is why every alt-model lane wrote no
+  // transcript). `keyClause` and the provider env are the ONLY things that differ between them.
+  const launch = assertForcesTranscripts(
+    proxyEnv && proxyEnv.length
+      ? `${claudeEnvPrefix({ keyClause, extra: [SECURITY_GUIDANCE_LEAD_GATE, ...proxyEnv] })} claude --dangerously-skip-permissions --no-chrome --model ${model}${effortArg}`
+      : `${claudeEnvPrefix({ extra: [SECURITY_GUIDANCE_LEAD_GATE] })} claude --dangerously-skip-permissions --no-chrome --model ${model}${effortArg}`,
+    "buildLeadBootCommand",
+  );
   return {
     command: "cmux",
+    // `launch` is returned so the SPAWN PATH can MEASURE the persistence guarantee off the real command
+    // and stamp it on the ledger event, rather than asserting it from memory (DER-2744).
+    launch,
     args: [
       "new-workspace",
       "--name", name,
@@ -2204,9 +2257,16 @@ export function buildRemoteLeadBootCommand({ name, worktree, briefPath, ssh, ghT
   const effortArg = effort ? ` --effort ${effort}` : "";
   // --no-chrome and the security-guidance gate: same rationale as buildLeadBootCommand. A remote lead
   // has no browser to drive, and its review coverage is identical to a local lead's.
-  const launch = proxyEnv && proxyEnv.length
-    ? `env ${keyClause} ${SECURITY_GUIDANCE_LEAD_GATE} ${proxyEnv.join(" ")} claude --dangerously-skip-permissions --no-chrome --model ${model}${effortArg}`
-    : `env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN ${FORCE_TRANSCRIPTS} ${SECURITY_GUIDANCE_LEAD_GATE} claude --dangerously-skip-permissions --no-chrome --model ${model}${effortArg}`;
+  // Same shared prefix as the local builder — which is what makes the comment above ("the same guarantee
+  // as a local lead") true rather than aspirational. It used to MIRROR the local builder's bug instead:
+  // the proxy branch omitted the persistence var here too, so a mini kimi/gpt/dsv4 lead — the least
+  // observable lane in the whole harness — wrote no transcript at all (DER-2744).
+  const launch = assertForcesTranscripts(
+    proxyEnv && proxyEnv.length
+      ? `${claudeEnvPrefix({ keyClause, extra: [SECURITY_GUIDANCE_LEAD_GATE, ...proxyEnv] })} claude --dangerously-skip-permissions --no-chrome --model ${model}${effortArg}`
+      : `${claudeEnvPrefix({ extra: [SECURITY_GUIDANCE_LEAD_GATE] })} claude --dangerously-skip-permissions --no-chrome --model ${model}${effortArg}`,
+    "buildRemoteLeadBootCommand",
+  );
   const remote =
     `set -a; . ${tokenFile}; set +a; export GH_TOKEN="\${WORK_MINI_GITHUB_PAT}"; ${roleEnv} ` +
     `cd ${worktree}; ` +
@@ -2216,21 +2276,27 @@ export function buildRemoteLeadBootCommand({ name, worktree, briefPath, ssh, ghT
   // the `/work-lead` slash command doesn't execute as an interactive command. Force a pty
   // (RequestTTY=force ≡ `ssh -tt`) so the remote lead is a real interactive session that STREAMS into
   // this cockpit pane — verified: the mini allocates `/dev/ttysNNN` under force.
-  return { command: "cmux", args: ["ssh", ssh, "--name", name, "--ssh-option", "RequestTTY=force", "--", remote] };
+  return { command: "cmux", launch, args: ["ssh", ssh, "--name", name, "--ssh-option", "RequestTTY=force", "--", remote] };
 }
 
 // Shepherd defaults to Opus (operator decision 2026-07-15): its inline fixes are sometimes deeply
 // technical and merge with no second reviewer — asymmetric blast radius vs. a lead's mistakes. The
 // kickback discipline (substantial/security-lane fixes still kick back to a lead) is unchanged.
 export function buildShepherdBootCommand({ name, cwd, runId, runDir, model = "opus" }) {
+  // Already correct (CLAUDE_LAUNCH carries the persistence var, and this builder has no provider branch
+  // that could drop it) — gated anyway, because "this one happens to be right today" is exactly how the
+  // lead builders' proxy branches came to be wrong (DER-2744). Fixing the CLASS means every builder
+  // proves it, not just the two that were broken.
+  const launch = assertForcesTranscripts(`${CLAUDE_LAUNCH} --model ${model}`, "buildShepherdBootCommand");
   return {
     command: "cmux",
+    launch,
     args: [
       "new-workspace",
       "--name", name,
       "--cwd", cwd,
       ...roleEnvArgs("shepherd", runDir),
-      "--command", `${CLAUDE_LAUNCH} --model ${model} "/work-shepherd ${runId}"`,
+      "--command", `${launch} "/work-shepherd ${runId}"`,
     ],
   };
 }
@@ -2244,14 +2310,17 @@ export function buildShepherdBootCommand({ name, cwd, runId, runDir, model = "op
 // orchestrator's model is whatever the operator launched, unlike the shepherd's pinned Opus).
 export function buildOrchBootCommand({ name, cwd, runId, runDir, model = null }) {
   const modelArg = model ? ` --model ${model}` : "";
+  // Gated for the same reason as the shepherd builder: the class, not the call site (DER-2744).
+  const launch = assertForcesTranscripts(`${CLAUDE_LAUNCH} --chrome${modelArg}`, "buildOrchBootCommand");
   return {
     command: "cmux",
+    launch,
     args: [
       "new-workspace",
       "--name", name,
       "--cwd", cwd,
       ...roleEnvArgs("orch", runDir),
-      "--command", `${CLAUDE_LAUNCH} --chrome${modelArg} "/work resume ${runId}"`,
+      "--command", `${launch} "/work resume ${runId}"`,
     ],
   };
 }
@@ -3362,11 +3431,17 @@ export function materializeState(rawEvents, meta = {}) {
   let runStarted = null;
   const ensure = (id) => {
     if (!issues[id]) {
-      issues[id] = { status: "queued", pr: null, worktree: null, branch: null, workspace_ref: null, kickback_count: 0, kickback_unactioned: false, kickback_sha: null, fileScope: [], host: null, bundle: null, tokens: 0, plan_scope_seen: false, budget: "ok", leadType: null, rotations: 0, rotate_pending: false, rotate_pct: null, rotate_disposition: null, _reports: {}, _kb_uncounted: false };
+      // `spawn_failed*` (DER-2739) and `transcripts_forced` (DER-2744) are both TRI-STATE-ish on purpose:
+      // `transcripts_forced: null` means UNKNOWN — a spawn event that carried no attestation — and unknown
+      // is never the same as ok. See the transcripts_unverified banner.
+      issues[id] = { status: "queued", pr: null, worktree: null, branch: null, workspace_ref: null, kickback_count: 0, kickback_unactioned: false, kickback_sha: null, fileScope: [], host: null, bundle: null, tokens: 0, plan_scope_seen: false, budget: "ok", leadType: null, rotations: 0, rotate_pending: false, rotate_pct: null, rotate_disposition: null, spawn_failed: false, spawn_failed_count: 0, spawn_failed_note: null, spawn_failed_exit_code: null, transcripts_forced: null, _reports: {}, _kb_uncounted: false };
     }
     return issues[id];
   };
   let shepherdRotatePending = false;
+  // DER-2739 — the latest UN-SUPERSEDED spawn failure per non-issue role. Cleared by that role's next
+  // successful `*_spawned`, so the banner reflects the CURRENT dispatch state, not the run's history.
+  const roleSpawnFailed = { shepherd: null, orch: null };
   for (const e of events) {
     if (e.type === "run_started" && !runStarted) runStarted = e;
     // Shepherd rotation request (respawn-over-compact, 2026-07-23): the shepherd appends
@@ -3375,6 +3450,14 @@ export function materializeState(rawEvents, meta = {}) {
     // kickbacks_pending so a request can't rot unseen in the event stream.
     if (e.type === "rotate_requested" && (e.actor === "shepherd" || e.role === "shepherd")) shepherdRotatePending = true;
     if (e.type === "shepherd_spawned") shepherdRotatePending = false;
+    // DER-2739, run-scoped half. A shepherd/orch launch has no issue, so it has to be folded ABOVE the
+    // issue gate. Note what a FAILED shepherd launch must NOT do: clear shepherdRotatePending. A rotation
+    // that didn't happen is not a rotation, and dropping the request is how a rotation rots unseen —
+    // the same failure mode the request flag was built to prevent.
+    if (e.type === "shepherd_spawn_failed") roleSpawnFailed.shepherd = e;
+    if (e.type === "orch_spawn_failed") roleSpawnFailed.orch = e;
+    if (e.type === "orch_spawned") roleSpawnFailed.orch = null;
+    if (e.type === "shepherd_spawned") roleSpawnFailed.shepherd = null;
     if (!e.issue) continue;
     const it = ensure(e.issue);
     // A bundle rides on worktree_created/lead_spawned/pr_opened events; latest wins. The bundled
@@ -3404,6 +3487,16 @@ export function materializeState(rawEvents, meta = {}) {
         it.kickback_unactioned = false; // a (re-)spawn IS the kickback action
         it.process_dead = false; // a fresh spawn replaces the dead process (DER-2516)
         it.process_dead_note = null;
+        // A spawn that SUCCEEDED supersedes the failure that preceded it (DER-2739) — the banner tracks
+        // the current dispatch state, so a retry that works must clear it.
+        it.spawn_failed = false;
+        it.spawn_failed_note = null;
+        it.spawn_failed_exit_code = null;
+        // DER-2744 — did this launch PROVE it forces transcript persistence? The spawn path measures it
+        // off the real command string; anything else (an older harness on another host, a hand-appended
+        // recovery event, every pre-fix ledger line) carries no attestation and folds to `null` = UNKNOWN.
+        // Deliberately not defaulted to `true`: assuming the guarantee is what made the defect invisible.
+        it.transcripts_forced = e.transcripts_forced === true ? true : e.transcripts_forced === false ? false : null;
         if (e.worktree) it.worktree = e.worktree;
         if (e.workspace_ref) it.workspace_ref = e.workspace_ref;
         if (e.host) it.host = e.host;
@@ -3418,6 +3511,25 @@ export function materializeState(rawEvents, meta = {}) {
           it.rotate_pct = null;
           it.rotate_disposition = null;
         }
+        break;
+      case "lead_spawn_failed":
+        // DER-2739. Note everything this case does NOT do, because each omission is the actual fix:
+        //   - it does not touch `status`. A failed first dispatch stays `queued` (so it stays in `queue`
+        //     and out of `inflight`); a failed kickback re-spawn stays `kickback` with
+        //     `kickback_unactioned` intact, so kickbacks_pending still lists it. `lead_spawned` was the
+        //     ONE unguarded entrance to in_progress, and a launch nobody proved must not use it.
+        //   - it does not clear `process_dead`. A respawn that failed did not replace the dead process.
+        //   - it does not count a kickback round. The round counts when its findings are DELIVERED.
+        // What it DOES do is drop `workspace_ref`: every spawn path closes the issue's prior refs BEFORE
+        // launching, so after a failed launch there is no live workspace at all. Keeping the predecessor's
+        // ref (which the old `if (e.workspace_ref)` guard did, silently, on a null ref) reads as a live
+        // workspace and is what `cmux close-workspace`/reap would then chase.
+        it.spawn_failed = true;
+        it.spawn_failed_count += 1;
+        it.spawn_failed_note = e.reason ?? e.note ?? "the launch could not be proven";
+        it.spawn_failed_exit_code = e.exit_code ?? null;
+        it.workspace_ref = null;
+        if (e.host) it.host = e.host;
         break;
       case "rotate_requested":
         // Issue-scoped ⇒ a LEAD asked (or the detector asked on its behalf, source:"detector").
@@ -3717,6 +3829,49 @@ export function materializeState(rawEvents, meta = {}) {
         issue: k, host: v.host, pr: v.pr, note: v.process_dead_note,
         confirm: "SUSPECTED dead — confirm with ps + lsof on the worktree before respawning; a false death puts a second writer on live uncommitted work",
       })),
+    // Failed-dispatch banner (DER-2739). A launch the harness could not PROVE — nonzero exit, or exit 0
+    // with no `workspace:<n>` on stdout. Before this existed the same event appended a `lead_spawned`, so
+    // the failure did not merely go unreported: it read as a healthy in-flight lead, emptied
+    // kickbacks_pending (a re-spawn is the sole delivery evidence for a kickback round) and cleared
+    // lead_process_dead. Surfaced top-level, and on every wake, for the same reason as kickbacks_pending:
+    // the ONLY thing that clears it is a spawn that actually worked.
+    spawn_failures: [
+      ...Object.entries(issues)
+        .filter(([, v]) => v.spawn_failed && !DONE_STATUSES.has(v.status))
+        .map(([k, v]) => ({
+          role: "lead", issue: k, host: v.host, status: v.status, attempts: v.spawn_failed_count,
+          exit_code: v.spawn_failed_exit_code, reason: v.spawn_failed_note,
+          retry: `no lead exists for ${k} — re-run spawn-lead (the worktree is still registered)`,
+        })),
+      ...Object.entries(roleSpawnFailed)
+        .filter(([, e]) => e)
+        .map(([role, e]) => ({
+          role, issue: null, host: e.host ?? null, status: null, attempts: 1,
+          exit_code: e.exit_code ?? null, reason: e.reason ?? e.note ?? "the launch could not be proven",
+          retry: `no ${role} was launched — re-run spawn-${role === "orch" ? "orch" : role}`,
+        })),
+    ],
+    // Transcript-persistence blind spot (DER-2744). An in-flight lead whose launch did NOT attest that it
+    // forced session persistence. This is not a claim that the lane is broken — it is a claim that we
+    // CANNOT PROVE it writes a transcript, and a lane with no transcript is indistinguishable from a lane
+    // whose lead died: `usage` under-reports it, `lead-context` reads nothing, and the rotation bands
+    // never fire. `null` (no attestation) is listed alongside an explicit `false`, because the defect this
+    // came from was invisible precisely because absence was read as fine.
+    //
+    // CLOUD leads are excluded: they are launched by RemoteTrigger, not by a boot builder, and have no
+    // locally readable transcript AT ALL — the skill says so ("cloud leads are not pollable"). Their
+    // blind spot is already modelled (they report by PR comment, and lead_context_unreadable covers the
+    // probe), so listing them here would put a permanently-red entry in a banner whose whole value is
+    // that a non-empty list means act. A banner that is always non-empty is a banner nobody reads.
+    transcripts_unverified: Object.entries(issues)
+      .filter(([, v]) => v.transcripts_forced !== true && ACTIVE_STATUSES.has(v.status) && v.host !== "cloud")
+      .map(([k, v]) => ({
+        issue: k, host: v.host, leadType: v.leadType, pr: v.pr,
+        attested: v.transcripts_forced,
+        note: v.transcripts_forced === false
+          ? "the launch string did NOT force session persistence — this lane writes no transcript"
+          : "the spawn event carries no persistence attestation (older harness on this host, or a hand-appended event) — unknown, not ok",
+      })),
     // Circuit-breaker banner (2026-07-25). Issues at/over the per-issue token or round ceiling, worst
     // first. Surfaced top-level for the same reason as kickbacks_pending: the orchestrator must see an
     // overrunning issue at its NEXT wake, not at the post-mortem. `tripped` = stop dispatching more
@@ -3922,7 +4077,13 @@ export function mergedReconcileEvents({ issues = {}, mergedPrNumbers = [] } = {}
 // that died. `plan_scope`/`worktree_created`/`lead_spawned` are orchestration noise the loop shouldn't
 // re-decompose on. `watch --wake-on actionable` filters to this set; `--wake-on a,b` names types
 // explicitly; omitting --wake-on wakes on ANY new event (the original, back-compatible default).
-export const ACTIONABLE_EVENT_TYPES = ["pr_opened", "handed_off", "pr_merged", "kickback", "reaped", "lead_failed"];
+// DER-2739 adds the three `*_spawn_failed` types. A SUCCESSFUL spawn stays noise (it is the loop's own
+// action), but a dispatch that DIDN'T happen is the one thing the loop must re-decide, and it is invisible
+// to a watcher that only wakes on progress.
+export const ACTIONABLE_EVENT_TYPES = [
+  "pr_opened", "handed_off", "pr_merged", "kickback", "reaped", "lead_failed",
+  "lead_spawn_failed", "shepherd_spawn_failed", "orch_spawn_failed",
+];
 export function parseWakeOn(spec) {
   if (!spec) return null; // null ⇒ wake on any new event (unchanged default)
   if (spec === "actionable") return new Set(ACTIONABLE_EVENT_TYPES);
@@ -3985,6 +4146,77 @@ function runCommand({ command, args, cwd, env = process.env, timeoutMs = 120000 
 
 export function parseWorkspaceRef(stdout) {
   return String(stdout || "").match(/\bworkspace:\d+\b/)?.[0] ?? null;
+}
+
+// DER-2739 — what can a launch actually be PROVEN by?
+//
+// Two facts, and both are required:
+//   exitCode  `runCommand` NEVER throws. A missing/erroring binary resolves as `{exitCode:127}` and a
+//             nonzero close resolves as the code, so the exit status is the only place a failed launcher
+//             surfaces at all. All four spawn paths used to ignore it entirely.
+//   ref       cmux prints `workspace:<n>` on success and `parseWorkspaceRef` returns null on anything
+//             else, so `exit 0` with a usage message, a partial start, or an empty pipe proves nothing.
+//             A null ref is not a workspace; it is the absence of one.
+//
+// Pure and exported so the proof lives in a unit test rather than in a live spawn.
+export function spawnOutcome({ exitCode, stdout = "", stderr = "" } = {}) {
+  const ref = parseWorkspaceRef(stdout);
+  const said = String(stderr || "").trim() || String(stdout || "").trim();
+  const note = said ? said.split("\n").slice(-3).join(" ").slice(0, 400) : null;
+  if (exitCode !== 0) {
+    return { ok: false, ref: null, exit_code: exitCode ?? null, reason: `the launcher exited ${exitCode}`, note };
+  }
+  if (!ref) {
+    return { ok: false, ref: null, exit_code: 0, reason: "the launcher exited 0 but printed no workspace:<n> ref", note };
+  }
+  return { ok: true, ref, exit_code: 0, reason: null, note: null };
+}
+
+// One failure type per role, mirroring the `*_spawned` siblings so a reader of either the ledger or state
+// never has to ask which role a failure belongs to. All three are in ACTIONABLE_EVENT_TYPES: a dispatch
+// that failed is precisely the kind of thing a `--wake-on actionable` loop must hear about, and the
+// 2026-07-16 incident (7 kickbacks rotting 40m–1.3h) is what silence here costs.
+export const SPAWN_FAILED_TYPES = { lead: "lead_spawn_failed", shepherd: "shepherd_spawn_failed", orch: "orch_spawn_failed" };
+
+// The event a failed launch records. Deliberately NARROW: no `worktree` (DER-2737's forged-payload
+// surface, and worktree_created already recorded it), and `workspace_ref` is pinned to null because the
+// whole point is that no workspace exists. `retryable:true` says the run is not wedged — re-running the
+// same command is the recovery, since nothing was created and nothing was cleaned up.
+export function spawnFailedEvent({ role = "lead", issue = null, host = null, kickback = 0, rotation = null, leadType = null, outcome = {} } = {}) {
+  const ev = {
+    actor: "orch",
+    type: SPAWN_FAILED_TYPES[role] ?? SPAWN_FAILED_TYPES.lead,
+    role,
+    exit_code: outcome.exit_code ?? null,
+    reason: outcome.reason ?? "the launch could not be proven",
+    workspace_ref: null,
+    retryable: true,
+  };
+  if (issue) ev.issue = issue;
+  if (host) ev.host = host;
+  if (kickback) ev.kickback = kickback;
+  if (rotation) ev.rotation = rotation;
+  if (leadType && leadType !== "claude") ev.leadType = leadType;
+  if (outcome.note) ev.note = outcome.note;
+  return ev;
+}
+
+// Record the failure, THEN refuse. Order matters: the throw only reaches whoever typed the command, while
+// the ledger is what the next wake — and a successor orchestrator that never saw this stderr — reads.
+// The `record the gap` precedent is DER-2745's telemetry_gap: an instrument that cannot measure says so
+// in the ledger instead of exiting quietly.
+async function refuseUnprovenSpawn({ runDir, role, label, outcome, ...rest }) {
+  const ev = spawnFailedEvent({ role, outcome, ...rest });
+  if (runDir) await appendEvent(runDir, ev);
+  throw new Error(
+    `${label}: the cmux launch did not succeed — ${outcome.reason}.\n` +
+      `  NO ${role}_spawned was recorded; a ${ev.type} was. So state shows this as un-dispatched rather\n` +
+      "  than in flight, any pending kickback stays pending, and a lead_process_dead claim is not cleared.\n" +
+      (outcome.note ? `  the launcher said: ${outcome.note}\n` : "") +
+      "  Retry the same command: nothing was created and nothing was cleaned up (the worktree stays\n" +
+      "  registered — create-worktree RESUMES it, DER-2742). If it keeps failing, the launcher is the\n" +
+      "  problem, not the ledger — check `cmux` on the target host.",
+  );
 }
 
 function shellQuote(value) {
@@ -5024,9 +5256,18 @@ export async function runSubcommand(argv) {
           const cp = await runCommand({ command: "scp", args: [localBrief, `${remoteHost.ssh}:${remoteBrief}`] });
           if (cp.exitCode !== 0) throw new Error(`scp brief to ${o.host} failed: ${cp.stderr || cp.stdout}`);
           const res = await runCommand({ command: cmuxBin(), args: boot.args });
-          ref = parseWorkspaceRef(res.stdout);
+          // DER-2739 — the scp two lines up was ALREADY checked; the launch itself was not, which is how a
+          // remote lead that never started still folded as in-flight work on this host's ledger.
+          const outcome = spawnOutcome(res);
+          if (!outcome.ok) {
+            await refuseUnprovenSpawn({
+              runDir, role: "lead", label: `spawn-lead ${o.issueId} on ${o.host}`, outcome,
+              issue: o.issueId, host: o.host, kickback: o.kickback ?? 0, rotation: o.rotation ?? null, leadType,
+            });
+          }
+          ref = outcome.ref;
         }
-        const ev = { actor: "orch", type: "lead_spawned", issue: o.issueId, worktree: o.worktree, workspace_ref: ref, kickback: o.kickback ?? 0, host: o.host };
+        const ev = { actor: "orch", type: "lead_spawned", issue: o.issueId, worktree: o.worktree, workspace_ref: ref, kickback: o.kickback ?? 0, host: o.host, transcripts_forced: launchForcesTranscripts(boot.launch) };
         // Record leadType on the REMOTE path too (2026-07-25): `lead-context` resolves a mini lead's
         // context window from its lead type, and this event is the only place that survives to state.
         if (leadType !== "claude") ev.leadType = leadType;
@@ -5037,14 +5278,21 @@ export async function runSubcommand(argv) {
         if (!o.dryRun) await appendEvent(runDir, ev);
         return { stdout: line, workspace_ref: ref, host: o.host, event: ev, dryRun: !!o.dryRun };
       }
-      const { command, args } = buildLeadBootCommand({ name, worktree: o.worktree, briefPath: localBrief, runDir, model: leadModel, proxyEnv, provider: ltCfg.provider ?? null, effort: ltCfg.effort ?? null });
+      const { command, args, launch } = buildLeadBootCommand({ name, worktree: o.worktree, briefPath: localBrief, runDir, model: leadModel, proxyEnv, provider: ltCfg.provider ?? null, effort: ltCfg.effort ?? null });
       const line = `${command} ${args.map(shellQuote).join(" ")}`;
       let ref = null;
       if (!o.dryRun) {
         const res = await runCommand({ command: cmuxBin(), args });
-        ref = parseWorkspaceRef(res.stdout);
+        const outcome = spawnOutcome(res);
+        if (!outcome.ok) {
+          await refuseUnprovenSpawn({
+            runDir, role: "lead", label: `spawn-lead ${o.issueId}`, outcome,
+            issue: o.issueId, host: o.host ?? "local", kickback: o.kickback ?? 0, rotation: o.rotation ?? null, leadType,
+          });
+        }
+        ref = outcome.ref;
       }
-      const ev = { actor: "orch", type: "lead_spawned", issue: o.issueId, worktree: o.worktree, workspace_ref: ref, kickback: o.kickback ?? 0 };
+      const ev = { actor: "orch", type: "lead_spawned", issue: o.issueId, worktree: o.worktree, workspace_ref: ref, kickback: o.kickback ?? 0, transcripts_forced: launchForcesTranscripts(launch) };
       if (leadType !== "claude") ev.leadType = leadType;
       if (o.rotation) ev.rotation = o.rotation;
       if (bundle) ev.bundle = bundle;
@@ -5206,13 +5454,18 @@ export async function runSubcommand(argv) {
         }
       }
       // Model precedence: explicit --model > config shepherdModel > "opus" default.
-      const { command, args } = buildShepherdBootCommand({ name, cwd, runId: o.runId, runDir, model: o.model ?? getShepherdModel() ?? "opus" });
+      const { command, args, launch } = buildShepherdBootCommand({ name, cwd, runId: o.runId, runDir, model: o.model ?? getShepherdModel() ?? "opus" });
       const line = `${command} ${args.map(shellQuote).join(" ")}`;
       let ref = null;
       if (!o.dryRun) {
         const res = await runCommand({ command: cmuxBin(), args });
-        ref = parseWorkspaceRef(res.stdout);
-        await appendEvent(runDir, { actor: "orch", type: "shepherd_spawned", workspace_ref: ref });
+        // DER-2739. A phantom shepherd_spawned is not harmless: it clears shepherd_rotate_pending, so a
+        // rotation the shepherd asked for would be marked done while the incumbent — whose workspace this
+        // path just CLOSED — is gone. The run then has no shepherd and nothing says so.
+        const outcome = spawnOutcome(res);
+        if (!outcome.ok) await refuseUnprovenSpawn({ runDir, role: "shepherd", label: "spawn-shepherd", outcome });
+        ref = outcome.ref;
+        await appendEvent(runDir, { actor: "orch", type: "shepherd_spawned", workspace_ref: ref, transcripts_forced: launchForcesTranscripts(launch) });
       }
       return { stdout: line, workspace_ref: ref, dryRun: !!o.dryRun };
     }
@@ -5220,13 +5473,18 @@ export async function runSubcommand(argv) {
       assertNotRoot("spawn a successor orchestrator");
       const name = workspaceName("orch", { project: o.project ?? "work" });
       const cwd = o.worktree ?? o.repoRoot ?? process.cwd();
-      const { command, args } = buildOrchBootCommand({ name, cwd, runId: o.runId, runDir, model: o.model ?? null });
+      const { command, args, launch } = buildOrchBootCommand({ name, cwd, runId: o.runId, runDir, model: o.model ?? null });
       const line = `${command} ${args.map(shellQuote).join(" ")}`;
       let ref = null;
       if (!o.dryRun) {
         const res = await runCommand({ command: cmuxBin(), args });
-        ref = parseWorkspaceRef(res.stdout);
-        await appendEvent(runDir, { actor: "orch", type: "orch_spawned", workspace_ref: ref });
+        // DER-2739. This is the worst of the four to get wrong: the OUTGOING orchestrator boots its
+        // successor and then stands down. A recorded-but-failed launch means the run has no brain, and the
+        // ledger says it does.
+        const outcome = spawnOutcome(res);
+        if (!outcome.ok) await refuseUnprovenSpawn({ runDir, role: "orch", label: "spawn-orch", outcome });
+        ref = outcome.ref;
+        await appendEvent(runDir, { actor: "orch", type: "orch_spawned", workspace_ref: ref, transcripts_forced: launchForcesTranscripts(launch) });
       }
       return { stdout: line, workspace_ref: ref, dryRun: !!o.dryRun };
     }
@@ -6069,6 +6327,14 @@ export async function runSubcommand(argv) {
               shepherd_rotate: !!st.shepherd_rotate_pending,
               leads_dead: (st.leads_dead ?? []).map((r) => r.issue),
               context_unreadable: (st.lead_context_unreadable ?? []).map((r) => r.issue),
+              // DER-2739: a dispatch that FAILED. It re-surfaces every wake until a spawn actually works,
+              // because the alternative — the old behaviour — was that it never surfaced at all and read
+              // as healthy in-flight work. Role failures (no issue) appear as "shepherd"/"orch".
+              spawn_failures: (st.spawn_failures ?? []).map((f) => f.issue ?? f.role),
+              // DER-2744: in-flight lanes whose transcript persistence was never proven. Every
+              // transcript-reading instrument is blind for these, and a blind lane looks exactly like a
+              // dead one — so it belongs next to leads_dead, not in a report nobody runs.
+              transcripts_unverified: (st.transcripts_unverified ?? []).map((r) => r.issue),
               budget_tripped: (st.budget_trips ?? []).filter((t) => t.level === "tripped").map((t) => t.issue),
               // DER-2748: a version-skewed ledger surfaces on EVERY wake, not only when the orchestrator
               // happens to run `state`. It already blocks dispatch; this is how the operator learns why
