@@ -287,12 +287,22 @@ Also fixed: `lead-context` no longer 5×-over-reads an Opus lead on a 1M window 
 - **On a repo WITH a merge queue, merges go through the queue ONLY — `gh pr merge <n> --auto`, never a plain `gh pr merge` (operator rule 2026-07-24).** The shared bot identity is often a repo admin, and `enforce_admins` is commonly off to keep other git operations unaffected — so a direct merge silently bypasses `required_conversation_resolution`: PR #1002 was direct-merged with 5 unresolved threads open, 62 seconds after a round-7 kickback. No urgency justifies bypassing a queue that exists; if the queue rejects a PR, that rejection is information.
   **On a queue-less repo, `repo.mergeMode: "direct"` (DER-2753) is the supported path** and `ready`'s `*** MERGEABLE (direct) ***` is the sole authorization to merge — never merge on your own read of the PR. Distinguish the two situations carefully: #1002 was a *bypass of a gate that existed*, which is still forbidden. Direct mode is the client-side *replacement* for the protections a queue-less repo doesn't have, which is why `ready` re-checks unresolved threads, checks, draft state and reviewer-on-head before it prints that word, and holds when the mode is unresolved rather than guessing. Two DER-2774 consequences the shepherd must not paper over: the printed command carries `--match-head-commit <sha>` and must be run **verbatim** (it binds the merge to the head those gates were evaluated against, so a push landing between the print and the paste is refused by GitHub instead of merged); and `allowMergeWithoutChecks` waives **only** `checks=ABSENT` — gh ran and reported no checks on the branch. `fail`, `pending`, and `UNKNOWN` (the probe could not be read at all) block with the flag on. Before that fix the probe returned one indistinguishable answer for a dead probe, a check-free repo, and a **red** tree on any repo without a job literally named `checks`, and the waiver let all three merge.
 - **Re-verify at the point of action:** immediately before arming ANY merge (`--auto`) or resolving a final thread, re-read `state.kickbacks_pending` + the ledger tail + the PR's unresolved-thread count. A merge-ready read from earlier in the same wake is STALE — #1002's orchestrator acted on a 9-minute-old read while a kickback landed in between. Any kickback event newer than your read invalidates the read.
-- **Run `heartbeat --host <name>` once per host at dispatch (DER-2748).** Every ledger line now carries
-  `schema_version` + `event_id` + `(source_id, seq)`, and `run_started`/`host_heartbeat` additionally carry
-  `harness_version`. Mixed harness versions across hosts REFUSE a dispatch (override with
-  `--allow-version-skew` only when you know why), and a foreign `schema_version` fails closed. But a host
-  that never attests contributes no version, so **skew detection stays dormant for every host except the
-  one that ran `init-run`** — the heartbeat is what makes it live. Check `state.protocol` before dispatch.
+- **Version skew is checked against the process you are running, too (DER-2748 + DER-2779).** Every ledger
+  line carries `schema_version` + `event_id` + `(source_id, seq)`, and `run_started`/`host_heartbeat`
+  additionally carry `harness_version`. Mixed harness versions across hosts REFUSE a dispatch (override
+  with `--allow-version-skew` only when you know why), and a foreign `schema_version` fails closed. Skew
+  detection is no longer dormant for a host that never ran `init-run`: **the version of the process running
+  the command is one of the versions compared**, so a wrong-version checkout is refused at
+  `spawn-*`/`rotate-*` before it writes anything, and **any process's FIRST write to a run auto-appends a
+  `host_heartbeat` carrying its own version**, so a host that folds and extends a run cannot do it
+  anonymously. `heartbeat --host <name>` is therefore only needed to declare a host that will never write
+  (a pure reader/puller) and to re-declare one after a mid-run upgrade. Two things to know before you meet
+  the refusal: the ledger is append-only with no supersession, so ONE write from a wrong-version host skews
+  that run **permanently** — every later dispatch on it needs `--allow-version-skew`, which is conservative
+  by design and NOT corruption, so never delete or rewrite `events.jsonl` to "fix" it; and a **pre-stamp
+  (legacy) ledger claims no version, so it is exempt from all of this and still dispatches from any build.**
+  Check `state.protocol` before dispatch — it reports what the LEDGER records, and a refusal additionally
+  names the version of the process you ran.
 - You own worktrees; leads are files-only. Never `git add -A` — stage explicit paths.
 - No secrets in the ledger, briefs, logs, or panes.
 - Inject `~/.claude/skills/work/known-non-issues.md` into every dispatched subagent prompt and brief; when an audit re-flags an accepted convention, add it to that file in the same session (DER-1992).

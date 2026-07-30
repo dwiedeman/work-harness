@@ -3273,8 +3273,96 @@ export function stampEvent(event, { now = new Date() } = {}) {
   return e;
 }
 
+// DER-2779 — ledgers this process has already attested to (or found already attested), keyed by run dir.
+// Per-PROCESS, so at most one ledger read per run dir no matter how many events an invocation appends.
+const ATTESTED_LEDGERS = new Set();
+
+// The host that WROTE an event: the `source_id` prefix (`host:pid:nonce`), never the `host` field. `host`
+// is an operator-supplied LABEL — `heartbeat --host mini` run locally records the LOCAL version under the
+// mini's name (see the `heartbeat` case), so deduping on it would let a mislabel suppress a real
+// attestation. Legacy lines carry no source_id and are attributable to nobody.
+function attestingHost(event) {
+  const src = typeof event?.source_id === "string" ? event.source_id : "";
+  const host = src.split(":")[0];
+  return host || null;
+}
+
+// The two things the write path needs to know about a ledger's existing version claims, from ONE scan:
+//   anyStamped   does any version-bearing event carry a REAL version? A legacy pre-stamp `run_started`
+//                carries none, and an explicit "unknown" is not a claim either — same rule
+//                ledgerProtocolVerdict applies to an attestation, for the same reason (below).
+//   alreadyOurs  is this exact (host, version) already on record? Then there is nothing to add.
+// Scanned as text with a cheap pre-filter rather than parsed in full: only version-bearing lines carry
+// the field, and this runs on the write path of a file that reaches five figures of lines on a long run.
+async function scanLedgerVersionClaims(runDir, host, version) {
+  const out = { anyStamped: false, alreadyOurs: false };
+  let raw;
+  try { raw = await readFile(join(runDir, "events.jsonl"), "utf8"); }
+  catch { return out; } // no ledger yet — this process's write is about to create it
+  for (const line of raw.split("\n")) {
+    if (!line.includes('"harness_version"')) continue;
+    let e;
+    try { e = JSON.parse(line); } catch { continue; } // a torn tail is not an attestation
+    if (!VERSION_BEARING_EVENT_TYPES.has(e?.type)) continue;
+    const claimed = typeof e.harness_version === "string" && e.harness_version ? e.harness_version : UNKNOWN_HARNESS_VERSION;
+    if (claimed !== UNKNOWN_HARNESS_VERSION) out.anyStamped = true;
+    // `alreadyOurs` is checked on EVERY version-bearing line, "unknown" included — a host that cannot read
+    // its own VERSION still attests (against a ledger that names one it is the host we can least identify),
+    // and if its own prior attestation did not count as "already ours" it would append a fresh
+    // `unknown` heartbeat on every CLI invocation, forever. Returning early is safe: `alreadyOurs`
+    // suppresses the write regardless of what `anyStamped` would have become further down the file.
+    if (claimed === version && attestingHost(e) === host) {
+      out.alreadyOurs = true;
+      return out;
+    }
+  }
+  return out;
+}
+
+// DER-2779 — a process that WRITES to a ledger says, in that ledger, which harness code it is running.
+// The dispatch gate can attest synthetically (see currentVersionAttestation), but only for the process
+// that happens to be dispatching; every other writer — a `watch` loop, an `append`, a `pull-host` relay —
+// used to fold and extend a run while leaving no version claim at all, which is what made skew detectable
+// only by luck. Attesting on the first write means the ledger records the fact at the moment it becomes
+// true, and `state`/`watch`/`work-metrics` see it without anyone remembering to run `heartbeat`.
+//
+// Deduped per (run, HOST, VERSION), not per source_id. Per source_id is one extra line per CLI
+// invocation, and this runner is invoked on every poll cycle — the ledger would roughly double in size to
+// re-state a fact that had not changed. The fact being attested is "host H is running version V against
+// this run"; a second process on the same host at the same version adds nothing to it.
+//
+// It is an APPEND, never a precondition: nothing here can refuse a write, so no path loses the ability to
+// record. Three cases are deliberately silent:
+//   - a version-bearing ORIGIN event ALREADY carries this process's own reading of VERSION, so it IS the
+//     attestation — and prepending another would put a host_heartbeat ahead of a brand-new run's own
+//     `run_started`. (A RELAYED event vouches for whoever wrote it, not for us, so a relay still attests.)
+//   - a ledger with NO stamped version claim — the LEGACY pre-stamp shape. Writing "0.2.0" next to a
+//     `run_started` that claims nothing does not DISCOVER skew, it MANUFACTURES it: nobody knows what the
+//     opening host was running, and the pair would read as mixed and block every later dispatch on a run
+//     DER-2748 tolerates by design ("ABSENT is the legacy pre-0.2.0 shape — KNOWN, tolerated, and must
+//     never block"). This is the exact rule ledgerProtocolVerdict applies to an attestation, applied to
+//     the write side so the two cannot drift: attest only where the claim is comparable.
+//   - this (host, version) already on record — a second process on the same host adds no fact.
+// The SessionEnd telemetry hook and the context report append raw legacy lines without coming through
+// here at all, so they are untouched either way.
+async function attestHarnessVersion(runDir, event) {
+  if (ATTESTED_LEDGERS.has(runDir)) return null;
+  ATTESTED_LEDGERS.add(runDir); // BEFORE the recursive append below, or the heartbeat re-enters forever
+  const relayed = typeof event?.event_id === "string" && event.event_id.length > 0;
+  if (!relayed && VERSION_BEARING_EVENT_TYPES.has(event?.type)) return null;
+  const host = attestingHost({ source_id: getSourceId() }) ?? "host";
+  const version = getHarnessVersion();
+  const { anyStamped, alreadyOurs } = await scanLedgerVersionClaims(runDir, host, version);
+  if (!anyStamped || alreadyOurs) return null;
+  return appendEvent(runDir, {
+    actor: "harness", type: "host_heartbeat", host,
+    note: "auto-attestation on this process's first write to this run (DER-2779)",
+  });
+}
+
 export async function appendEvent(runDir, event) {
   await mkdir(runDir, { recursive: true });
+  await attestHarnessVersion(runDir, event);
   const e = stampEvent(event);
   await appendFile(join(runDir, "events.jsonl"), `${JSON.stringify(e)}\n`, "utf8");
   return e;
@@ -3312,7 +3400,34 @@ export function dedupeLedgerEvents(events = []) {
 //     means two hosts are running different harness code against ONE ledger. "unknown" is a distinct
 //     value on purpose.
 // `legacy_events` and `out_of_order` are reported but never fatal.
-export function ledgerProtocolVerdict(events = []) {
+//
+// DER-2779 — `attestedVersion` folds THE CALLING PROCESS's own version in as one more version source.
+// Without it the comparison only ever ran between versions ALREADY WRITTEN to the ledger, so the one host
+// whose code is about to act was the one host the gate never looked at: a 9.9.9 checkout dispatching into
+// a run whose ledger only records 0.1.0 was NOT refused, while the identical skew with one extra
+// heartbeat in the file WAS. The comparator was right; nothing put the current process into it.
+//
+// The attestation cannot manufacture skew out of a ledger that makes no version claim of its own: it is
+// compared only against RECORDED, STAMPED versions, never against the pseudo-version "unknown". A
+// pre-stamp (legacy) ledger records "unknown" for its `run_started`, and letting an attestation refuse
+// those would delete exactly the tolerance DER-2748 shipped ("ABSENT is the legacy pre-0.2.0 shape —
+// KNOWN, tolerated, and must never block"). The carve-out has a stated cost, in ONE direction only: a
+// host that cannot read its own VERSION also records "unknown", so it is indistinguishable from a legacy
+// line and does not by itself block a later dispatch (`install.sh` refusing to install without a VERSION
+// file is what keeps that rare). The reverse — THIS process reporting "unknown" against a ledger that
+// carries a real version — is NOT carved out and still refuses, because that is the case where the host
+// about to write is the one we cannot identify.
+export const UNKNOWN_HARNESS_VERSION = "unknown";
+
+// How the current process names itself among a ledger's version sources. Exported so the dispatch gate
+// and its tests agree on one shape; the label leads with `source_id` because THAT is the writer identity
+// (`host:pid:nonce`), while an event's `host` field is only an operator-supplied label.
+export function currentVersionAttestation() {
+  const sourceId = getSourceId();
+  return { attestedVersion: getHarnessVersion(), attestedBy: `THIS PROCESS (${sourceId})` };
+}
+
+export function ledgerProtocolVerdict(events = [], { attestedVersion = null, attestedBy = "THIS PROCESS" } = {}) {
   const schemaVersions = new Set();
   const foreign = new Set();
   let legacy = 0;
@@ -3335,6 +3450,15 @@ export function ledgerProtocolVerdict(events = []) {
       else maxSeq.set(e.source_id, e.seq);
     }
   }
+  // DER-2779 — recorded FIRST (what the ledger says), then the attestation folded in on top, so the two
+  // stay separable: `recorded_harness_versions` is what has actually been written, and only that decides
+  // whether the run is already poisoned (below).
+  const recordedVersions = [...versionSources.keys()].sort();
+  const attested = typeof attestedVersion === "string" && attestedVersion ? attestedVersion : null;
+  if (attested && recordedVersions.some((v) => v !== UNKNOWN_HARNESS_VERSION)) {
+    if (!versionSources.has(attested)) versionSources.set(attested, new Set());
+    versionSources.get(attested).add(attestedBy);
+  }
   const harnessVersions = [...versionSources.keys()].sort();
   const reasons = [];
   if (foreign.size) {
@@ -3344,9 +3468,21 @@ export function ledgerProtocolVerdict(events = []) {
     );
   }
   if (harnessVersions.length > 1) {
+    // POISON SEMANTICS, stated where the operator meets the refusal. The distinction is load-bearing and
+    // is drawn on RECORDED versions only: >1 recorded means the divergent claim is already in an
+    // append-only file with no supersession, so it can never be withdrawn and the flag is permanent. One
+    // recorded + a divergent attestation is the repairable case — nothing has been written yet, and
+    // saying "permanent" there would send an operator hunting for damage that does not exist.
     reasons.push(
       `mixed harness version on ONE ledger: ${harnessVersions.map((v) => `${v} [${[...versionSources.get(v)].join(", ")}]`).join(" vs ")}. ` +
       `Different harness code folding one ledger is how two hosts silently disagree about a run's state. ` +
+      (recordedVersions.length > 1
+        ? `Those claims are already IN the ledger, which is append-only and has no supersession — they cannot be withdrawn, ` +
+          `so this run stays skewed and EVERY later dispatch on it needs --allow-version-skew. ` +
+          `That is the intended conservative behaviour, NOT a corrupt ledger: do not delete, truncate or rewrite events.jsonl. `
+        : `This process has not written its version into the ledger yet, so the skew is still repairable: put this host on the ` +
+          `run's version and it is gone. Dispatching with --allow-version-skew instead WRITES this version into the append-only ` +
+          `ledger, and from that point every later dispatch on this run needs the flag too. `) +
       `Re-install the lagging host (install.sh) so every host reports the same VERSION, or pass --allow-version-skew to proceed DELIBERATELY.`,
     );
   }
@@ -3357,6 +3493,8 @@ export function ledgerProtocolVerdict(events = []) {
     foreign_schema_versions: [...foreign].sort(),
     legacy_events: legacy,
     harness_versions: harnessVersions,
+    recorded_harness_versions: recordedVersions,
+    attested_harness_version: attested,
     harness_version_sources: Object.fromEntries([...versionSources].map(([v, s]) => [v, [...s].sort()])),
     out_of_order: outOfOrder,
     reasons,
@@ -3378,10 +3516,15 @@ export function assertLedgerProtocolCompatible(verdict, subcommand, { allowSkew 
   const foreign = verdict.foreign_schema_versions?.length ? verdict.reasons.filter((r) => r.startsWith("foreign schema_version")) : [];
   const blocking = allowSkew ? foreign : verdict.reasons;
   if (!blocking.length) return;
+  // The trailing pointer must not overstate what `state` shows. `state` reports the LEDGER's verdict, so
+  // when the divergence is this process's own attestation (DER-2779) it will NOT appear there — naming
+  // this process's version here is the only way the operator gets the whole comparison from the refusal.
   throw new Error(
     `refusing to run "${subcommand}" against this ledger:\n` +
       blocking.map((r) => `  - ${r}`).join("\n") +
-      `\n  (this is DER-2748 — see \`state\`'s "protocol" block for the full picture)`,
+      (verdict.attested_harness_version
+        ? `\n  (this is DER-2748/DER-2779 — THIS process reports harness ${verdict.attested_harness_version}; \`state\`'s "protocol" block shows what the LEDGER records)`
+        : `\n  (this is DER-2748 — see \`state\`'s "protocol" block for the full picture)`),
   );
 }
 
@@ -6261,8 +6404,15 @@ export async function runSubcommand(argv) {
   assertExistingRunDir(runDir, runsRoot, o.subcommand, { dryRun: o.dryRun });
   // DER-2748 — before committing MORE work to this ledger, check that we can read it: no foreign wire
   // version, and not two harness versions folding one run. Reads the ledger once; dispatch is rare.
+  // DER-2779 — and the version THIS process is running is one of the versions compared. The gate is the
+  // only place that attests: `state`/`watch`/`heartbeat` describe the RUN and must keep reporting what the
+  // ledger records, not what its reader happens to be running.
   if (runDir && VERSION_GATED_SUBCOMMANDS.has(o.subcommand)) {
-    assertLedgerProtocolCompatible(ledgerProtocolVerdict(await readEvents(runDir)), o.subcommand, { allowSkew: !!o.allowVersionSkew });
+    assertLedgerProtocolCompatible(
+      ledgerProtocolVerdict(await readEvents(runDir), currentVersionAttestation()),
+      o.subcommand,
+      { allowSkew: !!o.allowVersionSkew },
+    );
   }
 
   switch (o.subcommand) {
