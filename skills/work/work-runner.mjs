@@ -9,9 +9,9 @@
 import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
-import { appendFile, mkdir, open, readdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
-import { homedir, hostname } from "node:os";
-import { join, resolve as resolvePath } from "node:path";
+import { appendFile, lstat, mkdir, mkdtemp, open, readdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { homedir, hostname, tmpdir } from "node:os";
+import { basename, dirname, join, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
 
 // ---------------------------------------------------------------------------
@@ -1731,6 +1731,209 @@ export function renderContextBanner(readings = []) {
 export function wipCommitCommand({ worktree, issueId, rotation }) {
   const wt = shellQuote(worktree);
   return `git -C ${wt} add -A && git -C ${wt} commit --no-verify -m ${shellQuote(`wip(${issueId}): rotation ${rotation} checkpoint`)}`;
+}
+
+// ---------------------------------------------------------------------------
+// Worktree creation: LOOK BEFORE YOU DELETE (DER-2742)
+// ---------------------------------------------------------------------------
+//
+// `create-worktree` used to run `rm -rf <wt>` UNCONDITIONALLY before `git worktree add -b`. The path is
+// deterministic (`<worktreeRoot>/<runId>/<issueId>`), so any retry — and a re-create IS a normal recovery
+// action here — recursively deleted whatever was at that path, INCLUDING a dispatched lead's uncommitted
+// work, and then failed anyway because the branch already existed. It destroyed work and did not succeed.
+//
+// The replacement is one pure decision function over three facts (`git worktree list --porcelain`, what
+// is physically at the path, whether the branch exists) and FOUR outcomes: resume, create, prune-then-
+// create, or REFUSE. There is no delete outcome at all — this code path cannot remove a byte. Anything it
+// cannot positively identify as "the worktree this run already made" is refused with recovery
+// instructions, which is the fail-closed direction: a refusal costs the operator one command, a wrong
+// delete costs a lead's whole session.
+
+// `git worktree list --porcelain` → entries. Attribute lines belong to the preceding `worktree` line.
+// `locked`/`prunable` may appear bare or with a reason; `branch` is normalized to a short name.
+export function parseWorktreeList(stdout) {
+  const out = [];
+  let cur = null;
+  for (const raw of String(stdout ?? "").split("\n")) {
+    const line = raw.replace(/\r$/, "");
+    if (line.startsWith("worktree ")) {
+      cur = { path: line.slice("worktree ".length).trim(), head: null, branch: null, detached: false, bare: false, locked: false, lockedReason: null, prunable: false, prunableReason: null };
+      out.push(cur);
+      continue;
+    }
+    if (!cur) continue;
+    if (line.startsWith("HEAD ")) cur.head = line.slice("HEAD ".length).trim();
+    else if (line.startsWith("branch ")) cur.branch = line.slice("branch ".length).trim().replace(/^refs\/heads\//, "");
+    else if (line === "detached") cur.detached = true;
+    else if (line === "bare") cur.bare = true;
+    else if (line === "locked" || line.startsWith("locked ")) { cur.locked = true; cur.lockedReason = line.slice("locked".length).trim() || null; }
+    else if (line === "prunable" || line.startsWith("prunable ")) { cur.prunable = true; cur.prunableReason = line.slice("prunable".length).trim() || null; }
+  }
+  return out;
+}
+
+export const WORKTREE_PATH_STATES = new Set(["absent", "empty-dir", "occupied-dir", "file", "symlink"]);
+
+function worktreeRefusal({ path, branch, repo, why, extra = [] }) {
+  const q = shellQuote(path);
+  return [
+    `create-worktree REFUSED for ${q}: ${why}. Nothing was deleted.`,
+    `Recovery (pick one, then re-run create-worktree):`,
+    `  1. LOOK first:  ls -la ${q} && git -C ${shellQuote(repo)} worktree list`,
+    `  2. KEEP the work:  git -C ${q} status --porcelain && git -C ${q} add -A && git -C ${q} commit -m 'wip: rescued'`,
+    `     (or move it aside:  mv ${q} ${shellQuote(`${path}.rescued`)})`,
+    `  3. DISCARD it deliberately:  git -C ${shellQuote(repo)} worktree remove --force ${q}`,
+    `     (unregistered leftovers:  rm -rf ${q} && git -C ${shellQuote(repo)} worktree prune)`,
+    ...extra,
+  ].join("\n");
+}
+
+// The whole decision, pure. `pathState` is what is physically at `path` (see WORKTREE_PATH_STATES),
+// `realPath` its resolved form (git records resolved paths — /tmp vs /private/tmp on macOS is exactly the
+// mismatch that would make a healthy resume look unregistered and get refused).
+//
+// Returns { action: "resume" | "create" | "refuse", attach, prune, reason, message }.
+//   resume  — this IS the worktree we were asked to make, on the requested branch. Touch nothing.
+//   create  — the path is free (absent or an empty dir git will accept). `attach` when the branch already
+//             exists: `add -b` would abort on it, and the branch may carry a lead's committed work.
+//   prune   — the path is registered but its directory is GONE. Pruning removes a stale admin file for a
+//             directory that no longer exists; it cannot lose content. Then create.
+//   refuse  — anything else, including every case where content of unknown value sits at the path.
+export function planWorktreeAction({ path, branch, entries = [], pathState = "absent", branchExists = false, realPath = null, repo = "<repo>" } = {}) {
+  const repoLabel = repo ?? "<repo>";
+  const state = WORKTREE_PATH_STATES.has(pathState) ? pathState : null;
+  const refuse = (reason, why, extra) => ({ action: "refuse", reason, path, branch, message: worktreeRefusal({ path, branch, repo: repoLabel, why, extra }) });
+  if (!state) {
+    return refuse("unprobed", `could not determine what is at the path (probe returned ${JSON.stringify(pathState)}) — refusing to act blind`);
+  }
+  // `realPath` may be several spellings of the same place (the path resolved, and the path rebuilt from
+  // its resolved PARENT — the only form available when the directory itself is gone, which is exactly the
+  // prunable case). git records resolved paths, so without these a healthy /tmp worktree on macOS reads as
+  // unregistered and gets refused.
+  const wanted = new Set([path, ...(Array.isArray(realPath) ? realPath : [realPath])].filter(Boolean).map((p) => String(p).replace(/\/+$/, "")));
+  const isWanted = (p) => wanted.has(String(p ?? "").replace(/\/+$/, ""));
+  const at = entries.find((e) => isWanted(e.path)) ?? null;
+  const branchElsewhere = entries.find((e) => e.branch === branch && !isWanted(e.path)) ?? null;
+
+  if (at) {
+    if (at.locked) {
+      return refuse("locked", `the worktree at that path is LOCKED by git${at.lockedReason ? ` (${at.lockedReason})` : ""} — somebody protected it on purpose`, [
+        `  (unlock only if you know why it was locked:  git -C ${shellQuote(repoLabel)} worktree unlock ${shellQuote(path)})`,
+      ]);
+    }
+    // Registered, but the directory is gone (git reports it prunable; we also see it directly).
+    if (at.prunable || state === "absent") {
+      return { action: "create", prune: true, attach: branchExists, reason: "prunable", path, branch };
+    }
+    if (at.branch && at.branch === branch) {
+      return { action: "resume", path, branch, reason: "registered", head: at.head ?? null };
+    }
+    if (at.detached || !at.branch) {
+      return refuse("detached", `a registered worktree is there in DETACHED HEAD${at.head ? ` at ${at.head}` : ""}, not on ${branch} — its commits may be reachable from nothing else`);
+    }
+    return refuse("branch-mismatch", `a registered worktree is there on branch '${at.branch}', not the requested '${branch}'`);
+  }
+
+  if (branchElsewhere) {
+    return refuse("branch-checked-out-elsewhere", `branch '${branch}' is already checked out at ${branchElsewhere.path} — two worktrees cannot share one branch`, [
+      `  (that other worktree is where this unit's work already lives — reuse it, or remove it there first)`,
+    ]);
+  }
+  if (state === "absent" || state === "empty-dir") {
+    return { action: "create", prune: false, attach: branchExists, reason: state, path, branch };
+  }
+  if (state === "symlink") {
+    const target = (Array.isArray(realPath) ? realPath[0] : realPath) ?? null;
+    return refuse("symlink", `the path is a SYMLINK${target ? ` to ${target}` : ""} and no worktree is registered there — following it to make room would delete somebody else's directory`);
+  }
+  if (state === "file") return refuse("file", `a non-directory file is at that path`);
+  return refuse("occupied", `the directory is NOT EMPTY and git has no worktree registered there — it may be a lead's uncommitted work, or a worktree this repo no longer knows about`);
+}
+
+// The remote (ssh) half of the same three facts, as ONE read-only shell command. Read-only on purpose:
+// nothing here creates, moves or deletes, so it is safe to run before we have decided anything.
+export function remoteWorktreeProbeCommand({ repo, path, branch }) {
+  const R = shellQuote(repo);
+  const P = shellQuote(path);
+  return [
+    `git -C ${R} worktree list --porcelain`,
+    `printf 'WT-PROBE path-state '`,
+    `if [ -L ${P} ]; then echo symlink; elif [ ! -e ${P} ]; then echo absent; elif [ -d ${P} ]; then if [ -z "$(ls -A ${P} 2>/dev/null)" ]; then echo empty-dir; else echo occupied-dir; fi; else echo file; fi`,
+    `printf 'WT-PROBE real-path '`,
+    `(cd ${P} 2>/dev/null && pwd -P) || echo`,
+    // The path rebuilt from its resolved PARENT — the only resolvable spelling when the directory itself
+    // is gone (the prunable case), and what makes /tmp vs /private/tmp match on a macOS host.
+    `printf 'WT-PROBE real-parent '`,
+    `(cd "$(dirname ${P})" 2>/dev/null && echo "$(pwd -P)/$(basename ${P})") || echo`,
+    `printf 'WT-PROBE branch-exists '`,
+    `if git -C ${R} rev-parse --verify --quiet ${shellQuote(`refs/heads/${branch}`)} >/dev/null 2>&1; then echo yes; else echo no; fi`,
+  ].join("; ");
+}
+
+// Splits the probe's stdout back into the porcelain listing + the three facts. `pathState:null` means the
+// probe did not report one (ssh died, wrong shell, truncated output) — planWorktreeAction refuses on it
+// rather than guessing, which is the difference between "I looked" and "I assumed".
+export function parseRemoteWorktreeProbe(stdout) {
+  const listLines = [];
+  const facts = {};
+  for (const raw of String(stdout ?? "").split("\n")) {
+    const line = raw.replace(/\r$/, "");
+    const m = line.match(/^WT-PROBE (path-state|real-path|real-parent|branch-exists) ?(.*)$/);
+    if (m) { facts[m[1]] = m[2].trim(); continue; }
+    listLines.push(line);
+  }
+  return {
+    entries: parseWorktreeList(listLines.join("\n")),
+    pathState: WORKTREE_PATH_STATES.has(facts["path-state"]) ? facts["path-state"] : null,
+    realPath: [...new Set([facts["real-path"], facts["real-parent"]].filter(Boolean))],
+    branchExists: facts["branch-exists"] === "yes",
+  };
+}
+
+// `git worktree add` for a decided plan. `attach` reuses an existing branch (its commits are somebody's
+// work); otherwise a fresh branch off `origin/main`. `prune` clears the stale registration of a directory
+// that is already gone. Never `rm`, never `--force`.
+export function worktreeAddArgs({ repo, path, branch, attach = false }) {
+  return attach
+    ? ["-C", repo, "worktree", "add", path, branch]
+    : ["-C", repo, "worktree", "add", "-b", branch, path, "origin/main"];
+}
+
+export function remoteWorktreeAddCommand({ repo, path, branch, attach = false, prune = false }) {
+  const R = shellQuote(repo);
+  const parts = [`git -C ${R} fetch --quiet origin`];
+  if (prune) parts.push(`git -C ${R} worktree prune`);
+  parts.push(attach
+    ? `git -C ${R} worktree add ${shellQuote(path)} ${shellQuote(branch)}`
+    : `git -C ${R} worktree add -b ${shellQuote(branch)} ${shellQuote(path)} origin/main`);
+  return parts.join(" && ");
+}
+
+// Every resolvable spelling of a local path: the path itself when it exists, and the path rebuilt from its
+// resolved parent — which is the ONLY resolvable spelling once the directory is gone, and the one that
+// makes `/tmp/agent-work/...` match the `/private/tmp/agent-work/...` git actually recorded.
+async function realPathCandidates(p) {
+  const abs = resolvePath(p);
+  const out = [];
+  const self = await realpath(abs).catch(() => null);
+  if (self) out.push(self);
+  const parent = await realpath(dirname(abs)).catch(() => null);
+  if (parent) out.push(join(parent, basename(abs)));
+  return [...new Set(out)];
+}
+
+// What is physically at a local path, without following the symlink (`lstat`, not `stat`): the old code's
+// `rm -rf` on a symlinked path would have deleted the TARGET's contents.
+async function probeLocalWorktreePath(p) {
+  const realPath = await realPathCandidates(p);
+  let st;
+  try { st = await lstat(p); }
+  catch { return { pathState: "absent", realPath }; }
+  if (st.isSymbolicLink()) return { pathState: "symlink", realPath };
+  if (!st.isDirectory()) return { pathState: "file", realPath };
+  let names = [];
+  try { names = await readdir(p); } catch { return { pathState: "occupied-dir", realPath }; }
+  return { pathState: names.length ? "occupied-dir" : "empty-dir", realPath };
 }
 
 async function runLocalOrRemote(cmd, ssh) {
@@ -3998,6 +4201,143 @@ export async function applyRepoConfig(repoRoot) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Preflight: is the token reporter actually there, and does it actually work? (DER-2745 follow-up)
+// ---------------------------------------------------------------------------
+//
+// DER-2745 shipped `session-token-report.mjs` next to the SessionEnd hook, but preflight never looked at
+// it — so a stale ~/.claude (an operator who copied only work-runner.mjs) or a consumer repo carrying its
+// own `scripts/session-token-report.mjs` reported PREFLIGHT GREEN while every session's token spend became
+// a `telemetry_gap`: not a number, and indistinguishable at the fold from a cheap run.
+//
+// This check SMOKE-RUNS the reporter rather than asserting a file exists — this run has already found five
+// gates that could not fail (an installer self-test behind `|| true`, a CI job green on a zero-match
+// pattern, a vacuous test, a NUL scan whose pattern collapsed to empty, an installer that verified 3 of
+// the 5 suites it shipped). A file-exists assertion is that same shape of non-evidence.
+
+export const TOKEN_REPORTER_FILE = "session-token-report.mjs";
+
+// A transcript whose token sum is KNOWN. Deliberately includes the SAME `message.id` twice: one API
+// response is written to a transcript as several lines when it carries several content blocks, and each
+// repeats the whole `usage` object. A reporter that sums lines instead of responses reports 494 here
+// rather than 362 — so this fixture fails a plausible-but-inflating reporter instead of blessing it.
+export function tokenReporterSmokeFixture() {
+  const turn = (id, model, usage) => JSON.stringify({ type: "assistant", message: { id, model, usage } });
+  return {
+    text: `${[
+      turn("msg_1", "claude-opus-5", { input_tokens: 100, output_tokens: 20, cache_creation_input_tokens: 5, cache_read_input_tokens: 7 }),
+      turn("msg_1", "claude-opus-5", { input_tokens: 100, output_tokens: 20, cache_creation_input_tokens: 5, cache_read_input_tokens: 7 }),
+      turn("msg_2", "claude-haiku-4-5", { input_tokens: 200, output_tokens: 30 }),
+    ].join("\n")}\n`,
+    total: 100 + 20 + 5 + 7 + 200 + 30,
+  };
+}
+
+// Returns preflight `{ name, ok, detail }` legs — never throws, because a preflight that dies is a
+// preflight that reports nothing. Seams (`resolveReporter`, `run`, `tmpRoot`) exist so the RED and the
+// healthy-case CONTROL can both be driven in a unit test.
+export async function checkTokenReporter({
+  skillsDir,
+  cwd = process.cwd(),
+  resolveReporter: resolveReporterFn = null,
+  run = runCommand,
+  tmpRoot = tmpdir(),
+} = {}) {
+  const legs = [];
+  const shippedPath = join(skillsDir, TOKEN_REPORTER_FILE);
+  const GAP_WARNING = "every session's token spend will be recorded as a telemetry_gap, never as a number";
+
+  let resolveFn = resolveReporterFn;
+  if (!resolveFn) {
+    // DYNAMIC import on purpose: a static one would make work-runner ↔ session-end-telemetry circular
+    // (session-end-telemetry imports UNIT_ID_RE from here).
+    try { ({ resolveReporter: resolveFn } = await import("./session-end-telemetry.mjs")); }
+    catch (err) { resolveFn = null; legs.push({ name: "token-reporter", ok: false, detail: `cannot load session-end-telemetry.mjs (${err instanceof Error ? err.message : String(err)}) — ${GAP_WARNING}` }); }
+  }
+
+  if (resolveFn) {
+    let leg;
+    try {
+      // `hookDir: skillsDir` so the check reports on the install it was POINTED AT rather than on whichever
+      // copy of session-end-telemetry.mjs happened to be imported. In production these are the same
+      // directory; when they differ, silently answering for the wrong one is how a check starts lying.
+      const r = resolveFn({ cwd, hookDir: skillsDir }) ?? {};
+      const searched = Array.isArray(r.searched) ? r.searched : [];
+      if (!r.path) {
+        leg = { name: "token-reporter", ok: false, detail: `NO reporter resolved (${r.source ?? "unresolved"}). searched: ${searched.join(", ")} — ${GAP_WARNING}. Re-run install.sh.` };
+      } else if (r.source === "shipped") {
+        // The reporter WE ship: drive it on a known transcript and check the number it prints.
+        const fx = tokenReporterSmokeFixture();
+        const dir = await mkdtemp(join(tmpRoot, "work-token-smoke-"));
+        try {
+          const transcript = join(dir, "transcript.jsonl");
+          await writeFile(transcript, fx.text, "utf8");
+          const res = await run({ command: "node", args: [r.path, "--role", "preflight", "--transcript", transcript, "--format", "event"], timeoutMs: 30000 });
+          const line = String(res.stdout ?? "").split("\n").find((l) => l.startsWith(`${EVENT_MARKER} `)) ?? null;
+          let ev = null;
+          if (line) { try { ev = JSON.parse(line.slice(EVENT_MARKER.length + 1)); } catch { ev = null; } }
+          const why = res.exitCode !== 0 ? `exit ${res.exitCode}: ${String(res.stderr ?? "").trim().slice(0, 200)}`
+            : !line ? "no WORK-EVENT line on stdout"
+            : !ev ? "the WORK-EVENT line is not parseable JSON"
+            : ev.type !== "token_usage" ? `event type ${JSON.stringify(ev.type)}, expected token_usage`
+            : ev.total_tokens !== fx.total ? `total_tokens ${ev.total_tokens} on a fixture whose measured sum is ${fx.total}`
+            : null;
+          leg = { name: "token-reporter", ok: !why, detail: why ? `${r.path} is present but BROKEN — ${why} — re-run install.sh; until then ${GAP_WARNING}` : `${r.path} (shipped) measured the ${fx.total}-token fixture exactly` };
+        } finally {
+          await rm(dir, { recursive: true, force: true });
+        }
+      } else {
+        // A consumer repo's own reporter, or an operator override: FOREIGN CLI, so no `--transcript` (an
+        // unknown flag would turn a working reporter into a crashing one — the same reason the hook
+        // withholds it). What we can still test is the property that matters: asked about a session that
+        // cannot exist, it must refuse rather than print a zero. A confident zero is the whole defect.
+        const impossible = `preflight-no-such-session-${randomBytes(8).toString("hex")}`;
+        const res = await run({ command: "node", args: [r.path, "--role", "preflight", "--session-id", impossible, "--format", "event"], timeoutMs: 30000 });
+        const line = String(res.stdout ?? "").split("\n").find((l) => l.startsWith(`${EVENT_MARKER} `)) ?? null;
+        let ev = null;
+        if (line) { try { ev = JSON.parse(line.slice(EVENT_MARKER.length + 1)); } catch { ev = null; } }
+        const fabricates = res.exitCode === 0 && ev && ev.type === "token_usage";
+        leg = {
+          name: "token-reporter",
+          ok: !fabricates,
+          detail: fabricates
+            ? `${r.path} (${r.source}) FABRICATES ZEROS — it exited 0 with a token_usage (total_tokens ${ev.total_tokens}) for a session id that cannot exist. A measured-looking zero is worse than a telemetry_gap: replace or remove it (unset WORK_TOKEN_REPORT to fall back to the shipped reporter).`
+            : `${r.path} (${r.source}) refuses an unknown session (exit ${res.exitCode}${line ? ", but printed an event" : ", no event printed"}) — an unmeasured session cannot become a zero`,
+        };
+      }
+    } catch (err) {
+      leg = { name: "token-reporter", ok: false, detail: `check itself failed (${err instanceof Error ? err.message : String(err)}) — treat as RED; ${GAP_WARNING}` };
+    }
+    legs.push(leg);
+  }
+
+  // ALWAYS evaluated, independent of what resolved above: the upgrade case. An operator who copies only
+  // work-runner.mjs into ~/.claude/skills/work gets a reporter-less install, and the SessionEnd hook then
+  // gaps on every session while everything else looks fine.
+  let shipped = false;
+  try { await stat(shippedPath); shipped = true; } catch { /* absent */ }
+  legs.push({
+    name: "token-reporter-shipped",
+    ok: shipped,
+    detail: shipped ? `${shippedPath} present` : `MISSING ${shippedPath} — stale ~/.claude — re-run install.sh (DER-2745 added ${TOKEN_REPORTER_FILE})`,
+  });
+  return legs;
+}
+
+// The files whose skew between hosts silently loses telemetry or gates. `session-token-report.mjs` joined
+// the list because a remote skills dir without it makes EVERY mini lead gap its token spend while
+// `skills-sync` reported "in sync" on work-runner.mjs alone.
+export const SKILLS_SYNC_FILES = ["work-runner.mjs", TOKEN_REPORTER_FILE];
+
+// One md5 over the concatenation of `paths`, in the given order. A MISSING file exits 1 with no output
+// instead of hashing the remainder — otherwise a host missing session-token-report.mjs would hash the
+// same as any other host missing it, and two equally broken installs would read as "in sync".
+// `quote:false` is for remote paths that must keep their `~` expandable.
+export function skillsHashCommand(paths, { quote = true } = {}) {
+  const q = paths.map((p) => (quote ? shellQuote(p) : p)).join(" ");
+  return `for f in ${q}; do [ -f "$f" ] || exit 1; done; cat ${q} | md5 -q 2>/dev/null || cat ${q} | md5sum 2>/dev/null | cut -d' ' -f1`;
+}
+
 export async function runSubcommand(argv) {
   const o = parseArgs(argv);
   await applyRepoConfig(o.repoRoot ?? process.cwd());
@@ -4173,31 +4513,69 @@ export async function runSubcommand(argv) {
       return { briefPath, assignedBudget, stdout: briefPath };
     }
     case "create-worktree": {
+      // DER-2742. Both hosts run the SAME pure decision (planWorktreeAction) over the same three facts:
+      // the porcelain worktree registry, what is physically at the path, and whether the branch exists.
+      // Neither path deletes anything, ever — an unidentifiable occupant is refused with instructions.
+      // `--dry-run` stays a pure preview: it probes nothing (a preview must not depend on, or perturb,
+      // live state) and prints the command the healthy path would run (DER-2514).
+      const recordCreated = async (fields) => {
+        const ev = { actor: "orch", type: "worktree_created", ...fields };
+        if (o.bundle) ev.bundle = bundleList(o.issueId, o.bundle);
+        await appendEvent(runDir, ev);
+      };
       const remoteHost = o.host && o.host !== "local" ? getHosts()[o.host] : null;
       if (remoteHost) {
         const wt = join(remoteHost.worktreeRoot, o.runId, o.issueId);
         const branch = o.branch ?? `${o.issueId.toLowerCase()}-work`;
-        // fetch first so the mini clone has fresh origin/main, then add the worktree
-        const remote = `git -C ${remoteHost.repo} fetch --quiet origin && git -C ${remoteHost.repo} worktree add -b ${branch} ${wt} origin/main`;
-        if (o.dryRun) return { worktree: wt, branch, host: o.host, stdout: `ssh ${remoteHost.ssh} ${shellQuote(remote)}` };
+        if (o.dryRun) {
+          return { worktree: wt, branch, host: o.host, stdout: `ssh ${remoteHost.ssh} ${shellQuote(remoteWorktreeAddCommand({ repo: remoteHost.repo, path: wt, branch }))}` };
+        }
+        const probe = await runCommand({ command: "ssh", args: [remoteHost.ssh, remoteWorktreeProbeCommand({ repo: remoteHost.repo, path: wt, branch })], timeoutMs: 60000 });
+        // A failed probe is NOT a licence to proceed: without the registry we cannot tell a resume from
+        // an occupied path, and the old code's answer to that was `rm -rf`.
+        if (probe.exitCode !== 0) throw new Error(`create-worktree REFUSED on ${o.host}: could not probe ${wt} (ssh exit ${probe.exitCode}): ${(probe.stderr || probe.stdout || "").trim()}`);
+        const facts = parseRemoteWorktreeProbe(probe.stdout);
+        const plan = planWorktreeAction({ path: wt, branch, repo: remoteHost.repo, ...facts });
+        if (plan.action === "refuse") throw new Error(`[${o.host}] ${plan.message}`);
+        if (plan.action === "resume") {
+          await recordCreated({ issue: o.issueId, worktree: wt, branch, host: o.host, resumed: true });
+          return { worktree: wt, branch, host: o.host, resumed: true, stdout: wt };
+        }
+        // fetch first so the mini clone has fresh origin/main, then prune (only when the registration is
+        // stale) and add.
+        const remote = remoteWorktreeAddCommand({ repo: remoteHost.repo, path: wt, branch, attach: plan.attach, prune: plan.prune });
         const res = await runCommand({ command: "ssh", args: [remoteHost.ssh, remote] });
         if (res.exitCode !== 0) throw new Error(`remote worktree add failed on ${o.host}: ${res.stderr || res.stdout}`);
-        const ev = { actor: "orch", type: "worktree_created", issue: o.issueId, worktree: wt, branch, host: o.host };
-        if (o.bundle) ev.bundle = bundleList(o.issueId, o.bundle);
-        await appendEvent(runDir, ev);
-        return { worktree: wt, branch, host: o.host, stdout: wt };
+        await recordCreated({ issue: o.issueId, worktree: wt, branch, host: o.host, ...(plan.attach ? { attached: true } : {}), ...(plan.prune ? { pruned: true } : {}) });
+        return { worktree: wt, branch, host: o.host, ...(plan.attach ? { attached: true } : {}), ...(plan.prune ? { pruned: true } : {}), stdout: wt };
       }
       const worktreeRoot = o.worktreeRoot ?? DEFAULT_WORKTREE_ROOT;
       const wt = join(worktreeRoot, o.runId, o.issueId);
       const branch = o.branch ?? `${o.issueId.toLowerCase()}-work`;
       if (o.dryRun) return { worktree: wt, branch, stdout: `git worktree add -b ${branch} ${wt} origin/main` };
-      await rm(wt, { recursive: true, force: true });
-      const res = await runCommand({ command: "git", args: ["-C", o.repoRoot ?? process.cwd(), "worktree", "add", "-b", branch, wt, "origin/main"] });
+      const repoRoot = o.repoRoot ?? process.cwd();
+      const listed = await runCommand({ command: "git", args: ["-C", repoRoot, "worktree", "list", "--porcelain"] });
+      if (listed.exitCode !== 0) throw new Error(`create-worktree REFUSED: git worktree list failed in ${repoRoot} — without the registry a resume is indistinguishable from an occupied path: ${(listed.stderr || listed.stdout || "").trim()}`);
+      const branchProbe = await runCommand({ command: "git", args: ["-C", repoRoot, "rev-parse", "--verify", "--quiet", `refs/heads/${branch}`] });
+      const plan = planWorktreeAction({
+        path: wt, branch, repo: repoRoot,
+        entries: parseWorktreeList(listed.stdout),
+        branchExists: branchProbe.exitCode === 0,
+        ...(await probeLocalWorktreePath(wt)),
+      });
+      if (plan.action === "refuse") throw new Error(plan.message);
+      if (plan.action === "resume") {
+        await recordCreated({ issue: o.issueId, worktree: wt, branch, resumed: true });
+        return { worktree: wt, branch, resumed: true, stdout: wt };
+      }
+      if (plan.prune) {
+        const pruned = await runCommand({ command: "git", args: ["-C", repoRoot, "worktree", "prune"] });
+        if (pruned.exitCode !== 0) throw new Error(`create-worktree REFUSED: ${wt} is registered but its directory is gone, and \`git worktree prune\` failed: ${(pruned.stderr || pruned.stdout || "").trim()}`);
+      }
+      const res = await runCommand({ command: "git", args: worktreeAddArgs({ repo: repoRoot, path: wt, branch, attach: plan.attach }) });
       if (res.exitCode !== 0) throw new Error(`git worktree add failed: ${res.stderr || res.stdout}`);
-      const ev = { actor: "orch", type: "worktree_created", issue: o.issueId, worktree: wt, branch };
-      if (o.bundle) ev.bundle = bundleList(o.issueId, o.bundle);
-      await appendEvent(runDir, ev);
-      return { worktree: wt, branch, stdout: wt };
+      await recordCreated({ issue: o.issueId, worktree: wt, branch, ...(plan.attach ? { attached: true } : {}), ...(plan.prune ? { pruned: true } : {}) });
+      return { worktree: wt, branch, ...(plan.attach ? { attached: true } : {}), ...(plan.prune ? { pruned: true } : {}), stdout: wt };
     }
     case "spawn-lead": {
       assertNotRoot("spawn a lead");
@@ -5106,14 +5484,20 @@ export async function runSubcommand(argv) {
         } catch { /* absent */ }
         add("telemetry-hooks", hooksOk, hooksOk ? "SessionEnd + context-report hooks registered" : "hooks NOT registered — orch/shepherd spend will read as ZERO again");
       }
-      // 7. Skills skew vs remote hosts — a lead on the mini following a stale brief loses gates silently.
+      // 6b. The reporter those hooks shell out to (DER-2745 follow-up). Registered hooks are worthless if
+      // the script they call is absent, stale, or fabricates zeros — see checkTokenReporter, which SMOKE
+      // RUNS it rather than asserting a file exists.
+      for (const leg of await checkTokenReporter({ skillsDir, cwd: process.cwd() })) add(leg.name, leg.ok, leg.detail);
+      // 7. Skills skew vs remote hosts — a lead on the mini following a stale brief loses gates silently,
+      // and a remote skills dir without session-token-report.mjs makes every mini lead gap its spend, so
+      // BOTH files are hashed (a missing file yields no hash at all ⇒ SKEW, never a matching-broken pair).
       for (const [hostName, hostCfg] of Object.entries(getHosts())) {
         if (hostCfg.kind === "cloud" || !hostCfg.ssh) continue;
-        const localHash = await runCommand({ command: "sh", args: ["-c", `cat ${shellQuote(join(skillsDir, "work-runner.mjs"))} | md5 -q 2>/dev/null || md5sum ${shellQuote(join(skillsDir, "work-runner.mjs"))} | cut -d' ' -f1`] });
-        const remoteHash = await runCommand({ command: "ssh", args: [hostCfg.ssh, `cat ~/.claude/skills/work/work-runner.mjs 2>/dev/null | md5 -q 2>/dev/null || md5sum ~/.claude/skills/work/work-runner.mjs 2>/dev/null | cut -d' ' -f1`], timeoutMs: 20000 }).catch(() => ({ exitCode: 1, stdout: "" }));
+        const localHash = await runCommand({ command: "sh", args: ["-c", skillsHashCommand(SKILLS_SYNC_FILES.map((f) => join(skillsDir, f)))] });
+        const remoteHash = await runCommand({ command: "ssh", args: [hostCfg.ssh, skillsHashCommand(SKILLS_SYNC_FILES.map((f) => `~/.claude/skills/work/${f}`), { quote: false })], timeoutMs: 20000 }).catch(() => ({ exitCode: 1, stdout: "" }));
         const lh = String(localHash.stdout ?? "").trim();
         const rh = String(remoteHash.stdout ?? "").trim();
-        add(`skills-sync:${hostName}`, !!lh && lh === rh, lh === rh ? "in sync" : `SKEW — rsync -a ~/.claude/skills/work/ ${hostCfg.ssh}:.claude/skills/work/`);
+        add(`skills-sync:${hostName}`, !!lh && lh === rh, lh === rh ? `in sync (${SKILLS_SYNC_FILES.join(" + ")})` : `SKEW in ${SKILLS_SYNC_FILES.join(" + ")}${lh ? "" : " (a LOCAL file is missing — re-run install.sh)"} — rsync -a ~/.claude/skills/work/ ${hostCfg.ssh}:.claude/skills/work/`);
       }
       // 8. Stale side-copies of the runner (H6) — leads that find them misdiagnose the harness.
       {
@@ -5330,6 +5714,8 @@ Usage: node scripts/work-runner.mjs <subcommand> [flags]
 Subcommands:
   init-run --project <p> | --issues DER-1,DER-2 [--plan <run-plan.json>]  create run dir + ledger, print run-id (project | issue-list mode)
   create-worktree --run <r> <DER-id> [--bundle DER-x,DER-y]  git worktree add from fresh origin/main
+                     (idempotent: RESUMES the run's own registered worktree, REFUSES any other occupant
+                      with recovery steps, and never deletes anything — DER-2742)
   write-brief --run <r> <DER-id> [--bundle DER-x,DER-y] [--kickback n] [--worktree p] [--title t] [--acceptance a] [--findings f] [--lead-type claude|kimi|gpt|dsv4]
               [--plan <run-plan.json> | --budget-files N --budget-additions N]  stamp the ASSIGNED budget into the brief
   spawn-lead --run <r> <DER-id> --worktree <p> [--bundle DER-x,DER-y] [--kickback n] [--model opus] [--lead-type claude|kimi|gpt|dsv4] [--dry-run]
