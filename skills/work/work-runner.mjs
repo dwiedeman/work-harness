@@ -4023,7 +4023,24 @@ export function materializeState(rawEvents, meta = {}) {
   // DER-2739 — the latest UN-SUPERSEDED spawn failure per non-issue role. Cleared by that role's next
   // successful `*_spawned`, so the banner reflects the CURRENT dispatch state, not the run's history.
   const roleSpawnFailed = { shepherd: null, orch: null };
+  // DER-2781 — the run's own terminal state. `run_completed` is appended ONLY by `complete-run`, and only
+  // after every check in `runCompletionRefusals` passed. This is the fold half of that settled contract:
+  //   FIRST-WINS — a second marker never re-stamps the run (same rule as dedupeTerminalEvents).
+  //   A LATE EVENT NEVER REOPENS IT — a `pr_merged` that lands after completion (DER-2587's late-merge
+  //   shape) still folds onto its own unit, but the RUN stays `completed`. It is COUNTED rather than
+  //   silently absorbed, because "the ledger kept moving after the run was declared over" is a fact the
+  //   next reader has to be told; absence read as fine is how this harness's blind spots have all started.
+  let runCompleted = null;
+  const postCompletion = [];
   for (const e of events) {
+    // Strictly-after, in fold (event-time) order. A SECOND `run_completed` counts as a post-completion
+    // event on purpose: it is a real line in the ledger and swallowing it would hide a duplicate marker.
+    // Note this counts the DEDUPED stream: a late `pr_merged` that merely repeats one already folded is a
+    // duplicate DELIVERY, dropped upstream by dedupeTerminalEvents, and is deliberately not "news" here.
+    // What does count is the DER-2587 shape — a unit reaped off an out-of-band merge whose `pr_merged`
+    // reconciles later, i.e. the first delivery of that (issue, pr), arriving after the run ended.
+    if (runCompleted) postCompletion.push(e);
+    else if (e.type === "run_completed") runCompleted = e;
     if (e.type === "run_started" && !runStarted) runStarted = e;
     // Shepherd rotation request (respawn-over-compact, 2026-07-23): the shepherd appends
     // {actor:"shepherd",type:"rotate_requested"} when its context-wrap-nudge fires. The flag stays
@@ -4409,7 +4426,16 @@ export function materializeState(rawEvents, meta = {}) {
     // only `state` — knows where to post progress when there are no per-unit Linear issues to update.
     specRef: meta.specRef ?? runStarted?.specRef ?? null,
     tracking: meta.tracking ?? runStarted?.tracking ?? null,
-    status: meta.status ?? "running",
+    // DER-2781 — no longer a constant. `meta.status` still wins (the caller-override this field was
+    // declared with); absent it, the RUN's terminal state now comes from the ledger, exactly like every
+    // other fact in this fold. See runCompletionRefusals for what has to be true before that event exists.
+    status: meta.status ?? (runCompleted ? "completed" : "running"),
+    completed_at: runCompleted?.ts ?? null,
+    // Non-zero means the ledger kept moving AFTER the run was declared complete. Not an error and not a
+    // reopening — a visible count, so a late `pr_merged`/`reaped`/`token_usage` is something a successor
+    // reads rather than something it has to notice by diffing the ledger against `done`.
+    post_completion_events: postCompletion.length,
+    post_completion_event_types: [...new Set(postCompletion.map((e) => e?.type).filter(Boolean))].sort(),
     issues,
     inflight,
     queue,
@@ -4596,6 +4622,170 @@ export function materializeState(rawEvents, meta = {}) {
       return m;
     })(),
   };
+}
+
+// ---------------------------------------------------------------------------
+// Run completion (DER-2781) — the fail-closed terminal run state
+// ---------------------------------------------------------------------------
+// `status` was a CONSTANT: every run ever folded read `"running"`, because no event could set it, no call
+// site passed `meta.status`, and nothing read the field. A run therefore had no machine-checkable end —
+// closeout was prose in SKILL.md plus `/goal complete`, and "is this run actually finished?" was answered
+// by a human eyeballing the ledger. DER-1589 is the checklist; this is its machine half.
+//
+// ALL of the value is in the GATE, none of it in the flag. A `complete-run` that stamps `completed` on
+// command is a check that cannot fail — the precise defect class this wave exists to remove — so every
+// fact that would make "this run is finished" a LIE is enumerated here, as data, in one pure function
+// that the subcommand and its tests both call.
+//
+// There is deliberately NO `--force`. Every check's escape is a real act with a real receipt, never a
+// bypass flag: reap a stranded unit, deliver a pending kickback, repair or acknowledge quarantined lines
+// by deleting their sidecar, acknowledge a dead host's held fragment by deleting its `sync-held.<host>.json`
+// (DER-2776 shipped that path exactly so an abandoned host cannot make completion unsatisfiable), and
+// `--allow-version-skew` for a deliberate mid-run host upgrade. A foreign `schema_version` has no escape
+// at all, matching assertLedgerProtocolCompatible: there is no degraded mode for lines this build cannot
+// parse, so there is certainly no "complete anyway".
+//
+// Pure. `state` is a materializeState result; `ledger` is a readLedgerHealth result (or null).
+export function runCompletionRefusals({ state = {}, ledger = null, allowVersionSkew = false } = {}) {
+  const refusals = [];
+  const add = (check, reason, fix) => { refusals.push({ check, reason, fix }); };
+  const issues = state.issues ?? {};
+  const queue = state.queue ?? [];
+
+  // 1. A run tracking NOTHING is not a finished run, it is an empty one. Without this, `every([])` is
+  //    vacuously true and the gate passes a ledger holding only `run_started` — a gate answering a
+  //    question it was never asked. It is also the exact signature of DER-2570's phantom ledger (a `cd`
+  //    forks a second, empty events.jsonl for a live run id), which reads healthy from every angle.
+  const trackedIds = [...new Set([...Object.keys(issues), ...queue])].sort();
+  if (!trackedIds.length) {
+    add(
+      "units_tracked",
+      "this run tracks no units at all — no issue events folded and the queue is empty",
+      "check --run / --runs-root first: an empty ledger for a live run id is DER-2570's phantom ledger, which reads healthy from every angle. A run that genuinely dispatched nothing has nothing to complete.",
+    );
+  }
+
+  // 2. Every tracked unit terminal. `merged` (pr_merged) and `reaped` are the two terminal statuses;
+  //    a `queued` id that never got an event of its own is tracked via state.queue and counts here too.
+  const nonTerminal = trackedIds
+    .filter((id) => !DONE_STATUSES.has(issues[id]?.status ?? "queued"))
+    .map((id) => `${id} (${issues[id]?.status ?? "queued"})`);
+  if (nonTerminal.length) {
+    add(
+      "units_terminal",
+      `${nonTerminal.length} unit(s) are not terminal: ${nonTerminal.join(", ")}`,
+      "land or abandon each one — a unit is terminal at `merged` (a folded pr_merged) or `reaped`. `reap --run <r> <id>` closes a queued/merged unit; `reap --abandon` destroys an ACTIVE one out loud.",
+    );
+  }
+
+  // 3. Pending kickbacks. Structurally this cannot fire without (2) firing too — `kickbacks_pending`
+  //    filters on status `kickback`, which is not terminal — so it is not an independent gate. It is
+  //    kept because it names the ACTION (deliver the findings) that (2)'s generic "not terminal" does
+  //    not, and because a future terminal status must not quietly take a rotted kickback with it.
+  const kickbacks = state.kickbacks_pending ?? [];
+  if (kickbacks.length) {
+    add(
+      "kickbacks_pending",
+      `${kickbacks.length} kickback round(s) were composed but never DELIVERED: ${kickbacks.join(", ")}`,
+      "re-spawn the lead (a spawn IS the delivery) or append `kickback_relayed` once the findings actually reached someone — never clear it by hand.",
+    );
+  }
+
+  // 4. Unacknowledged quarantine: lines that NEVER folded into state. While any exist, every count in
+  //    this run — `done`, the token totals, the metrics — is a LOWER BOUND, so "complete" would be a
+  //    claim about a fold that is known to be missing input.
+  const quarantined = ledger ? (ledger.quarantined_unacknowledged ?? 0) : 0;
+  if (quarantined > 0) {
+    add(
+      "ledger_quarantine",
+      `${quarantined} ledger line(s) never folded into state — every count in this run is a LOWER BOUND until they do`,
+      `repair them from ${ledger?.quarantine_file ?? "the quarantine sidecar"}, or delete that file to acknowledge them.`,
+    );
+  }
+
+  // 5. DER-2776's held-fragment age signal. A FRESH hold is a live writer mid-append and is deliberately
+  //    silent; a STALE one means a remote writer died mid-line and the pull is re-reading a line nobody
+  //    will ever finish — events are still being WITHHELD, so the run is not over. Gated on
+  //    `held_fragment_stale` rather than on `ledger.ok`: `ok` is a compound whose composition can change,
+  //    and this check has to name the host and the exact file to delete, which only the field can supply.
+  const heldStale = (ledger?.held_fragments ?? []).filter((h) => h && h.stale);
+  const heldFired = !!ledger && (ledger.held_fragment_stale ?? 0) > 0;
+  if (heldFired) {
+    const hosts = heldStale.map((h) => `${h.host}${h.age_ms == null ? " (age unknown)" : ` (${h.age_ms}ms)`}`);
+    const files = heldStale.map((h) => h.file).filter(Boolean);
+    add(
+      "ledger_held_fragments",
+      `${ledger.held_fragment_stale} remote host(s) are holding an UNTERMINATED tail line${hosts.length ? `: ${hosts.join(", ")}` : ""} — that host's writer died mid-line and its events are still being withheld`,
+      `complete the line on the host (the hold clears itself), or acknowledge the dead writer by deleting ${files.length ? files.join(", ") : "its sync-held.<host>.json record"} (DER-2776).`,
+    );
+  }
+
+  // 6. The catch-all, and the reason it exists: `readLedgerHealth().ok` is the harness's own summary of
+  //    ledger damage, and checks 4 and 5 name only the two causes THIS gate knows about. Anything else
+  //    `ok` already covers (a torn tail mid-append right now) — and anything a later change folds into it
+  //    — must still refuse, rather than passing because this function was written before that signal
+  //    existed. A NULL ledger is a refusal for the same reason `state`'s own comment gives: "not measured
+  //    by this caller" is never "clean".
+  if (!ledger) {
+    add(
+      "ledger_health",
+      "ledger health was NOT MEASURED for this run — unmeasured is not clean",
+      "`complete-run` measures it itself; a null here means the gate was called with a hand-built state (tests), not a real run.",
+    );
+  } else if (ledger.ok !== true && quarantined === 0 && !heldFired) {
+    const why = [];
+    if ((ledger.torn_tail ?? 0) > 0) why.push(`${ledger.torn_tail} torn tail line(s) — a writer is mid-append RIGHT NOW`);
+    if ((ledger.quarantined ?? 0) > 0) why.push(`${ledger.quarantined} line(s) quarantined on this read`);
+    if (ledger.note) why.push(ledger.note);
+    add(
+      "ledger_health",
+      why.length
+        ? `readLedgerHealth reports the ledger is not ok: ${why.join("; ")}`
+        : "readLedgerHealth reports ok:false for a reason this gate does not recognize — treat an unexplained unhealthy ledger as unsafe to declare finished",
+      "a torn tail is transient (it clears the moment the writer finishes the line) — re-run. Anything else: read `state`'s `ledger` block, which names its own repair path.",
+    );
+  }
+
+  // 7. Wire-protocol verdict (DER-2748). Same split assertLedgerProtocolCompatible applies, deliberately
+  //    reused rather than re-invented stricter: harness-version SKEW is a mid-run host upgrade the
+  //    operator may acknowledge with --allow-version-skew, and a FOREIGN schema_version never is. Without
+  //    the skew escape a multi-host run whose mini was upgraded could never be completed at all.
+  const protocol = state.protocol ?? null;
+  if (!protocol) {
+    add(
+      "protocol",
+      "this fold carries no wire-protocol verdict",
+      "materializeState always sets `protocol`; a missing one means the gate was handed a hand-built state.",
+    );
+  } else if (protocol.ok !== true) {
+    const foreign = (protocol.foreign_schema_versions ?? []).length
+      ? (protocol.reasons ?? []).filter((r) => String(r).startsWith("foreign schema_version"))
+      : [];
+    const blocking = allowVersionSkew ? foreign : (protocol.reasons ?? []);
+    if (blocking.length) {
+      add(
+        "protocol",
+        blocking.join(" "),
+        allowVersionSkew
+          ? "a foreign schema_version is NOT overridable — there is no degraded mode for lines this build cannot parse."
+          : "re-install the lagging host (install.sh) so every host reports the same VERSION, or pass --allow-version-skew to acknowledge a deliberate mid-run upgrade. That flag never waives a foreign schema_version.",
+      );
+    }
+  }
+
+  return refusals;
+}
+
+// The refusal an operator actually reads. Every failing check, its reason, and the act that clears it —
+// never a single "not ready" line, because a gate that says only "no" sends the operator back to the
+// ledger to re-derive what this function already knows.
+export function renderRunCompletionRefusal({ runId = null, refusals = [] } = {}) {
+  return [
+    `refusing to complete run "${runId ?? "?"}": ${refusals.length} check(s) failed. NOTHING was appended.`,
+    ...refusals.map((r) => `  ✗ ${r.check}: ${r.reason}\n      fix: ${r.fix}`),
+    `  There is no --force: a run declared complete over a failing check is a receipt that lies about the`,
+    `  work. Clear the checks above (each names its own escape) and run \`complete-run\` again.`,
+  ].join("\n");
 }
 
 // Operator monitoring (item 7, 2026-07-15 turnover): the per-lead teleport/monitor link list the
@@ -7205,6 +7395,80 @@ export async function runSubcommand(argv) {
       const abandonNote = abandonedActive ? ` ⚠ ABANDONED from \`${it.status}\` — its uncommitted work is gone (recorded as abandoned:true)` : "";
       return { stdout: `reaped ${o.issueId}${o.dryRun ? " (dry-run: nothing closed, nothing recorded)" : ""}${abandonNote}${leakNote}` };
     }
+    case "complete-run": {
+      // DER-2781 — the RUN's terminal state, gated. See runCompletionRefusals for why every check is here
+      // and why there is no override flag.
+      //
+      // Deliberately NOT in VERSION_GATED_SUBCOMMANDS: that helper throws on a bad protocol verdict before
+      // the gate runs, so its message would replace the full refusal list with one line about versions.
+      // Check 7 applies the identical foreign-vs-skew split, inside the list, alongside everything else
+      // that is wrong — an operator closing a run should read ALL of it in one pass, not one round-trip
+      // per fault.
+      const events = await readEvents(runDir);
+      // readEvents FIRST, then health: the health record describes the read that just happened (same
+      // ordering, and the same reason, as `state`).
+      const ledger = await readLedgerHealth(runDir);
+      const state = materializeState(events, { run_id: o.runId, project: o.project, ledger });
+      // FIRST-WINS idempotency: a second `complete-run` is a no-op SUCCESS that appends nothing. Checked
+      // before the gate on purpose — re-running it on a finished run must not be able to fail, or a late
+      // post-completion event (which never reopens the run) would turn a settled run back into an error.
+      if (state.status === "completed") {
+        const late = state.post_completion_events ?? 0;
+        return {
+          alreadyCompleted: true, completed: true, completedAt: state.completed_at,
+          postCompletionEvents: late, refusals: [], state,
+          stdout: `run ${o.runId} was ALREADY completed at ${state.completed_at ?? "an unrecorded time"} — nothing appended (first-wins).`
+            + (late ? `\n  ${late} event(s) landed AFTER completion (${(state.post_completion_event_types ?? []).join(", ")}) — they folded onto their units; the run stays completed.` : ""),
+        };
+      }
+      const refusals = runCompletionRefusals({ state, ledger, allowVersionSkew: !!o.allowVersionSkew });
+      if (refusals.length) throw new Error(renderRunCompletionRefusal({ runId: o.runId, refusals }));
+      const units = Object.entries(state.issues)
+        .filter(([, v]) => DONE_STATUSES.has(v.status))
+        .map(([k]) => k)
+        .sort();
+      // Dry-run purity (DER-2514), applied to the one command whose whole job is a durable claim: a
+      // preview that appended `run_completed` would end the run it was only asked to test.
+      if (o.dryRun) {
+        return {
+          completed: false, dryRun: true, refusals: [], units,
+          stdout: `run ${o.runId} WOULD complete — every check passes over ${units.length} terminal unit(s): ${units.join(", ")}\n  (dry-run: no run_completed appended)`,
+        };
+      }
+      // Append-only, with no lock: two `complete-run`s racing past the idempotency check above would both
+      // append. That is survivable BY the fold rather than prevented here — first-wins means `status` and
+      // `completed_at` are stable, and the loser shows up as a post_completion_event. A lock file would be
+      // a new failure mode (a stale one makes the run uncompletable) for a race one operator cannot run.
+      const ev = await appendEvent(runDir, {
+        actor: o.actor ?? "orch", type: "run_completed", run_id: o.runId,
+        units, unit_count: units.length,
+      });
+      // Re-fold and persist, so a successor that reads only state.json learns the run is over without
+      // having to run anything. Re-READ rather than appending `ev` to the in-memory array: state.json
+      // must describe the ledger as it is on disk, sorted and deduped by the one choke point.
+      const finalState = materializeState(await readEvents(runDir), { run_id: o.runId, project: o.project, ledger: await readLedgerHealth(runDir) });
+      // Best-effort, and deliberately so: the LEDGER is the record of completion. Failing the command
+      // because a convenience file could not be rewritten would report "not completed" about a run that
+      // is — the next invocation would then correctly answer "already completed", contradicting this one.
+      let stateWritten = true;
+      try { await writeFile(join(runDir, "state.json"), `${JSON.stringify(finalState, null, 2)}\n`, "utf8"); }
+      catch { stateWritten = false; }
+      // NOT a gate — DER-2740's leaked-teardown banner survives terminal status on purpose, and the
+      // settled completion contract does not include it. But a run whose reap left a remote lead alive is
+      // still spending, so the success receipt says so out loud rather than reading unqualified-clean.
+      const leaks = finalState.reap_failures ?? [];
+      return {
+        completed: true, event: ev, units, state: finalState, stateWritten, reapFailures: leaks,
+        stdout: `run ${o.runId} COMPLETE — ${units.length} terminal unit(s): ${units.join(", ")}\n`
+          + `  state.status is now "completed"${stateWritten ? " (state.json refreshed)" : " (state.json could NOT be written — the ledger is still the record)"}.\n`
+          + `  A late event does NOT reopen the run: it folds onto its own unit and is counted in state.post_completion_events.`
+          + (leaks.length
+            ? `\n  ⚠ ${leaks.length} unit(s) did NOT tear down cleanly and are NOT part of this gate: `
+              + `${leaks.map((l) => `${l.issue} (${(l.leaks ?? []).join(", ") || "see state.reap_failures"})`).join("; ")}. `
+              + `Check whether anything they owned is still running before you walk away.`
+            : ""),
+      };
+    }
     case "ready": {
       // PER-PR ENQUEUE GATE (H5) — the run-dir ready.sh promoted to a harness primitive so it stops
       // being re-derived (and re-broken) every run. Reads BOTH Codex surfaces author-filtered,
@@ -7748,6 +8012,23 @@ Design: the README's context-rotation section.
                                               event for the PR's unit. gate=MISSING = the gate never ran (run it);
                                               gate=UNKNOWN = the evidence was UNREADABLE (no --run, PR not in the
                                               ledger, pre-stamp ledger) — both hold, and they are different jobs.
+  complete-run --run <r> [--dry-run] [--allow-version-skew]
+                                              END the run: append run_completed so state.status folds to
+                                              "completed". FAIL-CLOSED and there is no --force — it refuses,
+                                              listing EVERY failing check and appending nothing, unless all of:
+                                              at least one tracked unit and every one of them terminal
+                                              (merged/reaped); no un-delivered kickback; no unacknowledged
+                                              quarantined line; no STALE held remote fragment (DER-2776 — a
+                                              writer that died mid-line is still withholding events; ack it by
+                                              deleting its sync-held.<host>.json); ledger health ok; wire
+                                              protocol ok (--allow-version-skew acknowledges a mid-run host
+                                              upgrade, never a foreign schema_version).
+                                              PULL AND RECONCILE FIRST (pull-host per mini, reconcile-pr-events):
+                                              this reads the CANONICAL ledger, so events still sitting on a host
+                                              are invisible to every check above.
+                                              A second call is a no-op success ("already completed", first-wins).
+                                              A late event does NOT reopen the run — it folds onto its own unit
+                                              and is counted in state.post_completion_events.
   preflight [--skip-probes]                   test the DEPLOYED harness before a run: unit suite, cmux, gh identity,
                                               disk, transcript persistence, telemetry hooks, skills sync per host,
                                               stale runner copies, 1-token Claude probe per account, codex gate probe.
