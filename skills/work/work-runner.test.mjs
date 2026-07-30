@@ -6524,10 +6524,8 @@ test("DER-2775: the kill-probe chain escapes BOTH halves, and classifyKillProbe 
   assert.equal((cmd.match(/\[\/\]Users/g) ?? []).length, 2, "both pkill and pgrep take the escaped pattern");
   assert.match(cmd, /pkill -f .*; *sleep 1; *pgrep -f .*; *echo RC=\$\?/, "kill, settle, then ASK — one round trip");
   assert.equal(cmd.includes("; true"), false, "the mask that started all of this must be gone");
-  // `pkill -f ''` matches every process on the host, so an empty pattern must be a loud bug.
-  for (const empty of ["", "   ", null, undefined]) {
-    assert.throws(() => WR.remoteKillProbeCommand(empty), /EMPTY pattern/, `an empty pattern (${JSON.stringify(empty)}) must never become a kill command`);
-  }
+  // The probe half is the SAME string the liveness probe uses — one escape, not two that can drift.
+  assert.ok(cmd.endsWith(WR.presenceProbeCommand(pat)), "the chain must compose the shared presence probe");
 
   const c = WR.classifyKillProbe;
   assert.equal(c({ exitCode: 0, stdout: "RC=1\n" }), "killed", "pgrep matched nothing ⇒ proven gone");
@@ -6550,32 +6548,159 @@ test("DER-2775: the kill-probe chain escapes BOTH halves, and classifyKillProbe 
   }
 });
 
+// The pattern is the sole argument to a REMOTE `pkill -f`. `pkill -f ''` matches every process on that
+// host, and a one-character pattern matches most of them — so a degenerate pattern is not a failed kill,
+// it is a killed machine. It is also where the bracket escape stops working: `bracketEscapePattern("a")`
+// is `[a]`, and `[a]` contains `a`, so the probe self-matches again. Both are guarded at CONSTRUCTION.
+test("DER-2775: an unsafe kill pattern is REFUSED before it can reach pkill", () => {
+  assert.equal(typeof WR.assertKillPattern, "function", "the floor must be a pure, testable seam");
+  assert.equal(typeof WR.leadBriefPattern, "function", "…and patterns must be BUILT through one validated place");
+
+  // Every gate, against the value that trips it, through BOTH consumers.
+  const unsafe = [
+    ["", "empty"],
+    ["   ", "empty"],
+    [null, "empty"],
+    [undefined, "empty"],
+    ["a", "shorter than"],
+    ["[a]", "shorter than"],
+    ["/briefs/", "shorter than"], // the exact shape an empty ledgerRoot+runId+issueId produces
+    ["/Users/example/work-ledger/r1/DER-1", "missing"], // long enough, but not a brief path
+    ["/Users/example/work-ledger/r1/briefs/DER-1\nrm -rf /", "newline or NUL"],
+  ];
+  for (const [value, reason] of unsafe) {
+    assert.throws(() => WR.assertKillPattern(value), new RegExp(reason),
+      `assertKillPattern must refuse ${JSON.stringify(value)}`);
+    assert.throws(() => WR.remoteKillProbeCommand(value), /unsafe pattern/,
+      `and it must never become a KILL command: ${JSON.stringify(value)}`);
+    assert.throws(() => WR.presenceProbeCommand(value), /unsafe pattern/,
+      `nor a probe: ${JSON.stringify(value)}`);
+  }
+  // CONTROL — the real shape passes, so the floor is a gate and not a wall.
+  const good = "/Users/example/work-ledger/r1/briefs/DER-1";
+  assert.equal(WR.assertKillPattern(good), good);
+  assert.ok(WR.remoteKillProbeCommand(good).includes("pkill -f"));
+
+  // …and the builder catches the empty COMPONENT, which is the way this actually goes wrong: a missing
+  // --run or an unset ledgerRoot silently interpolates to nothing.
+  assert.equal(WR.leadBriefPattern({ runDir: "/Users/example/work-ledger/r1", issueId: "DER-1" }), good);
+  assert.equal(WR.leadBriefPattern({ runDir: "/Users/example/work-ledger/r1/", issueId: "DER-1" }), good, "a trailing slash must not double up");
+  for (const args of [
+    { runDir: "", issueId: "DER-1" },
+    { runDir: "   ", issueId: "DER-1" },
+    { runDir: "/Users/example/work-ledger/r1", issueId: "" },
+    { runDir: "/Users/example/work-ledger/r1", issueId: "DER-1 extra" },
+    {},
+  ]) {
+    assert.throws(() => WR.leadBriefPattern(args), /empty|whitespace|unsafe pattern/,
+      `leadBriefPattern must refuse ${JSON.stringify(args)}`);
+  }
+  // A MISSING component long enough to clear the length floor is the case the floor cannot see: a host
+  // config with no `ledgerRoot` stringifies to "undefined" and yields a pattern that matches nothing —
+  // a kill reporting a clean receipt for a lead it never touched.
+  for (const dir of ["undefined/r1", "null/r1", "/Users/x/undefined/r1", "/Users/x/r1/null"]) {
+    assert.throws(() => WR.leadBriefPattern({ runDir: dir, issueId: "DER-1" }), /"undefined"\/"null" path segment/,
+      `a stringified missing value must be refused, not silently probed: ${dir}`);
+  }
+  // CONTROL — the words must only be rejected as whole SEGMENTS, or a legitimate path is blocked.
+  assert.ok(WR.leadBriefPattern({ runDir: "/Users/undefinedale/runs/r1", issueId: "DER-1" }).endsWith("/briefs/DER-1"),
+    "a path that merely CONTAINS the substring is a real path and must pass");
+  // The degenerate case, stated as the reason the floor exists rather than as a bare number: the escape
+  // ITSELF fails on a one-character pattern, so length is load-bearing, not decoration.
+  assert.match("[a]", new RegExp(WR.bracketEscapePattern("a")), "a 1-char pattern self-matches even escaped — which is why there is a floor");
+});
+
+test("DER-2775: the pattern guard is on the PRODUCTION kill path, not merely exported", async () => {
+  // A floor nothing calls is decoration. This drives the real `reap` against the realistic way a
+  // component goes missing — a host config with no `ledgerRoot` — which used to stringify into
+  // `pkill -f 'undefined/r1/briefs/DER-1'` on the mini: a kill that matches nothing and hands back a
+  // clean teardown for a lead it never touched.
+  const repoRoot = await mkRepoWithHosts({
+    hosts: {
+      local: { cap: 3 },
+      mini: { enabled: true, cap: 3, ssh: "example-mini-host", repo: "/Users/example/your-repo", worktreeRoot: "/Users/example/agent-work" },
+    },
+  });
+  const { runsRoot, runDir } = await d2775Ledger();
+  try {
+    await withReapStubs({ probe: "killed" }, async ({ cmux, sshCalls }) => {
+      await assert.rejects(
+        () => withEnv({ WORK_CMUX_BIN: cmux }, () => runSubcommand(d2775Reap(runsRoot, repoRoot, "--abandon"))),
+        /"undefined"\/"null" path segment/,
+        "a missing ledgerRoot must stop the reap at pattern CONSTRUCTION, before any host is touched",
+      );
+      const calls = await sshCalls();
+      assert.equal(calls.some((c) => /pkill/.test(c)), false,
+        `no pkill may reach a host with an unvalidated pattern: ${JSON.stringify(calls)}`);
+      assert.equal((await d2740Read(runDir)).some((e) => e.type === "reaped"), false,
+        "and a reap that could not even build its kill records nothing terminal");
+    });
+  } finally {
+    await rm(runsRoot, { recursive: true, force: true });
+    await rm(repoRoot, { recursive: true, force: true });
+    await applyRepoConfig("/nonexistent-reset");
+  }
+});
+
 test("DER-2775 LIVE: the real chain detects a real survivor and does not hallucinate one (this host's pgrep)", async (t) => {
+  // Stubs cannot cover the one thing that actually differs between hosts: WHICH pgrep family is
+  // installed. This runs the PRODUCTION chain string through a REAL shell against REAL pgrep, so the
+  // family this host ships is the one under test. On macOS (BSD) it passes escaped or not — BSD pgrep
+  // excludes its ancestors. On Linux/procps (ubuntu-latest, i.e. every `tests (node 20|22|24)` CI job)
+  // the un-escaped form reports a phantom survivor on every probe and the un-escaped pkill SIGTERMs the
+  // probing shell outright, so the NEGATIVE case below is a hard gate on the escape being present.
   const have = spawnSync("sh", ["-c", "command -v pgrep >/dev/null && command -v pkill >/dev/null"]);
-  if (have.status !== 0) return t.skip("no pgrep/pkill on this host");
-  // Runs the PRODUCTION chain against real pgrep, so the family this host ships is the one under test.
-  // On macOS that is BSD pgrep; in CI (ubuntu-latest) it is procps, where the un-escaped form reports a
-  // phantom survivor on every probe and the un-escaped pkill kills the probing shell outright.
+  if (have.status !== 0) return t.skip("no pgrep/pkill on this host — the pgrep-family leg is NOT covered on this run");
+
   const marker = join(tmpdir(), `wr-d2775-${process.pid}-${Math.random().toString(36).slice(2)}`, "briefs", "DER-1");
   const chain = WR.remoteKillProbeCommand(marker);
-  const run = () => String(spawnSync("sh", ["-c", chain], { encoding: "utf8" }).stdout ?? "");
+  const run = (cmd) => String(spawnSync("sh", ["-c", cmd], { encoding: "utf8" }).stdout ?? "");
+  const verdict = (cmd) => WR.classifyKillProbe({ exitCode: 0, stdout: run(cmd) });
 
-  assert.equal(WR.classifyKillProbe({ exitCode: 0, stdout: run() }), "killed",
-    "NEGATIVE CONTROL: with nothing running, the chain must report a clean kill — an un-escaped pattern reports a phantom survivor here on procps");
+  // NEGATIVE: nothing is running, so the chain must report a clean kill. This is the assertion that
+  // fails on procps if the bracket escape is ever dropped.
+  assert.equal(verdict(chain), "killed",
+    "with nothing running, the real chain must report a clean kill — an un-escaped pattern reports a PHANTOM survivor on procps");
 
-  // POSITIVE CONTROL: a process that carries the marker AND ignores SIGTERM, so pkill cannot reap it.
-  // Without this half the probe could be a constant "killed" and the test would still pass.
-  const victim = spawn("/bin/sh", ["-c", 'trap "" TERM; sleep 30', marker], { stdio: "ignore" });
+  // DIFFERENTIAL: run the naive form the fix replaced, through the same real shell. On a self-matching
+  // family this answers differently from the escaped form, which is the escape earning its keep,
+  // measured rather than argued. On BSD both agree and this is a no-op — the asymmetry is the point.
+  const rawProbe = `pgrep -f '${marker}' >/dev/null 2>&1; echo RC=$?`;
+  const rawVerdict = WR.classifyKillProbe({ exitCode: 0, stdout: run(rawProbe) });
+  assert.ok(["killed", "survivor"].includes(rawVerdict), `unexpected raw verdict ${rawVerdict}`);
+  if (rawVerdict !== "killed") {
+    t.diagnostic(`self-matching pgrep family detected (procps): raw probe ⇒ ${rawVerdict} with nothing running; escaped ⇒ killed. The bracket escape is load-bearing on this host.`);
+  } else {
+    t.diagnostic("non-self-matching pgrep family (BSD): raw and escaped agree here; the escape is proven by the CI leg on ubuntu-latest.");
+  }
+
+  // POSITIVE CONTROL A — the probe half against an ordinary, killable process carrying the pattern in
+  // its argv. Without a positive control the negative case is a check that cannot fail.
+  const probeOnly = WR.presenceProbeCommand(marker);
+  const plain = spawn("node", ["-e", "setTimeout(()=>{}, 8000)", marker], { stdio: "ignore" });
+  try {
+    await new Promise((r) => setTimeout(r, 800));
+    assert.equal(WR.classifyKillProbe({ exitCode: 0, stdout: run(probeOnly) }), "survivor",
+      "the probe must SEE a live process carrying the pattern — otherwise 'killed' above means nothing");
+  } finally {
+    plain.kill("SIGKILL");
+    await new Promise((r) => plain.once("exit", r));
+  }
+
+  // POSITIVE CONTROL B — the FULL chain needs a victim that ignores SIGTERM, or `pkill` reaps it and the
+  // chain can only ever answer "killed". This is the survivor case the old `pkill …; true` could not
+  // express at all: the shell exits 0, and the process is still there.
+  const stubborn = spawn("/bin/sh", ["-c", 'trap "" TERM; sleep 30', marker], { stdio: "ignore" });
   try {
     await new Promise((r) => setTimeout(r, 500));
-    assert.equal(WR.classifyKillProbe({ exitCode: 0, stdout: run() }), "survivor",
-      "a process that survives the kill must be SEEN — this is the answer the old `pkill …; true` could never return");
+    assert.equal(verdict(chain), "survivor",
+      "a process that SURVIVES the kill must be reported as present, on a chain that exits 0");
   } finally {
-    victim.kill("SIGKILL");
-    await new Promise((r) => victim.once("exit", r));
+    stubborn.kill("SIGKILL");
+    await new Promise((r) => stubborn.once("exit", r));
   }
   await new Promise((r) => setTimeout(r, 300));
-  assert.equal(WR.classifyKillProbe({ exitCode: 0, stdout: run() }), "killed", "and once it is really gone, clean again");
+  assert.equal(verdict(chain), "killed", "and once it is really gone, clean again");
 });
 
 // ---- DER-2749: the configured commit identity must reach the cloud brief ----------------------------
