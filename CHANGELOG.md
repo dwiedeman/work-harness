@@ -122,6 +122,20 @@ Each fix below landed with a regression test that was **observed failing on the 
   actually built**, folded tri-state (`null` = UNKNOWN, never assumed true) and surfaced as
   `state.transcripts_unverified`. Cloud lanes are excluded by construction (RemoteTrigger, no locally
   readable transcript), so the banner stays meaningful.
+- **DER-2740 — `reap` no longer claims a teardown it did not achieve.** It discarded all four cleanup
+  results and appended the TERMINAL `reaped` regardless, and because `dedupeTerminalEvents` keeps the first
+  `reaped` per issue, a premature one could never be corrected later. The sharpest harm: a failed remote
+  `pkill` leaves the mini's `claude` **alive burning tokens** while the ledger says the issue is reaped and
+  nothing will look at it again. Cleanup stays best-effort — the run must be able to end — but every step's
+  exit code is now captured and classified. `remote_pkill` and `remote_worktree_remove` are REQUIRED, since
+  nothing else reclaims what they leave behind; the AUTO_MERGE delete and the local worktree remove stay
+  optional, because a missing ref and an already-gone worktree are the normal cases and treating them as
+  leaks would be the inverse defect. That also finally *reads* the `optional` marker, which had been set on
+  the AUTO_MERGE command since it was written and inspected by nobody. A leak records a separate
+  `reap_failed` event (not just a field on `reaped`, which dedup would swallow), surfaces as
+  `state.reap_failures` with per-step remediation, raises `pending.reap_failures`, and is actionable so it
+  wakes the loop. Note the original framing was backwards about panes: appending `reaped` is precisely what
+  enqueues an issue's refs into `sweepPlan`, and `sweep-workspaces` re-closes them *and* checks exit codes.
 
 ### Added
 
