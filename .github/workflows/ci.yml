@@ -37,7 +37,8 @@ jobs:
             skills/work/work-runner.test.mjs \
             skills/work/work-metrics.test.mjs \
             skills/work/session-end-telemetry.test.mjs \
-            skills/prep-for-work/prep-runner.test.mjs
+            skills/prep-for-work/prep-runner.test.mjs \
+            hooks/context-wrap-nudge.test.mjs
 
       # Installer contract (DER-2743): includes the smoke case AND the failure cases — a red suite and a
       # missing `node` must both make install.sh exit nonzero.

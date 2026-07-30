@@ -1216,10 +1216,25 @@ export function resolveContextWindow({ leadTypeCfg = {}, model = "", settingsMod
   // be for the wrong HOST (a remote lead judged against the orchestrator machine's settings) or missing entirely.
   // With no marker found, an Opus lead on a 1M window resolved to 200K — a 5× over-read that reported
   // healthy leads in the rotate band and spent rotations on them. Check the model id first.
-  if (String(model).includes("[1m]")) return 1_000_000;
-  if (/sonnet-5/.test(String(model))) return 1_000_000;
-  if (String(settingsModel).includes("[1m]")) return 1_000_000;
+  if (is1MWindow(model)) return 1_000_000;
+  // DER-2581 — the SAME test on the same class of evidence. The old asymmetry was the whole defect: the
+  // observed-model path had grown a `sonnet-5` special case while the settings path still tested for the
+  // `[1m]` marker ALONE, so an orch/shepherd session on any other natively-1M family resolved to 200K.
+  if (is1MWindow(settingsModel)) return 1_000_000;
   return 200_000;
+}
+
+// Families that are natively 1M-window and carry NO `[1m]` marker in their id. Every window resolver in
+// the harness tested for the marker alone, which is a 5× over-read on these — and an over-read here is
+// not a cosmetic number, it is a wrap/rotate recommendation against a healthy session. Live case, this
+// run: the orchestrator's own wrap-nudge twice reported "≈82% of the 200K-token window" for a session on
+// a 1M window (~16% of it), and twice talked the orchestrator into recommending an unnecessary handoff.
+// The inverse error is on record too (a 270K-window lead read as 28% of an assumed 1M), which is why this
+// is an explicit ALLOW-LIST rather than a default-to-1M: an unrecognised id resolves to the safe 200K.
+const NATIVE_1M_MODELS = /sonnet-5|opus-5|fable-5|opus-4-[678]/;
+export function is1MWindow(model) {
+  const m = String(model || "");
+  return m.length > 0 && (m.includes("[1m]") || NATIVE_1M_MODELS.test(m));
 }
 
 // Bands scale with the window for the same reason the hook's do: on a ≥1M window quality degrades well

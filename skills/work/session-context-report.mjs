@@ -23,6 +23,18 @@ import { homedir } from "node:os";
 
 const THROTTLE_MS = 5 * 60 * 1000;
 
+// DER-2581, third instrument. Deliberately DUPLICATED from work-runner.mjs's `is1MWindow` rather than
+// imported: this is a PostToolUse hook, so it is spawned on every tool call, and importing a 4,900-line
+// module to answer one predicate would put that parse on the critical path of every tool use. The
+// duplication is pinned by a test that asserts all three copies (here, work-runner, context-wrap-nudge)
+// agree across a shared table of model ids — so drift fails CI instead of silently reappearing here.
+const NATIVE_1M_MODELS = /sonnet-5|opus-5|fable-5|opus-4-[678]/;
+export function is1MWindow(model) {
+  const m = String(model || "");
+  return m.length > 0 && (m.includes("[1m]") || NATIVE_1M_MODELS.test(m));
+}
+
+function main() {
 try {
   const role = (process.env.WORK_ROLE ?? process.env.ROST_WORK_ROLE);
   const runDir = (process.env.WORK_RUN_DIR ?? process.env.ROST_WORK_RUN_DIR);
@@ -70,8 +82,9 @@ try {
     try {
       const s = JSON.parse(readFileSync(join(homedir(), ".claude", "settings.json"), "utf8"));
       const m = String(s?.model ?? "");
-      if (m.includes("[1m]")) window = 1_000_000;
-      else if (m) window = 200_000;
+      // Marker-only used to mean a natively-1M orch/shepherd reported 200K here while `lead-context`
+      // reported 1M for the same session — the two instruments disagreeing is exactly DER-2581.
+      if (m) window = is1MWindow(m) ? 1_000_000 : 200_000;
     } catch { /* stays null */ }
   }
   const issue = (String(input.cwd ?? "").match(/\b([A-Z]{2,6}-\d+)\b/) ?? [])[1] ?? null;
@@ -94,3 +107,9 @@ try {
   // Context telemetry must never break a tool call.
 }
 process.exit(0);
+}
+
+// Only run as a hook, never on import: the body above exits the process on every early-out path, so an
+// unguarded import kills whatever imported it — which is how a test file for this logic would silently
+// pass having asserted nothing (DER-2747's second defect, same shape, third file).
+if (process.argv[1] && import.meta.url === `file://${process.argv[1]}`) main();
