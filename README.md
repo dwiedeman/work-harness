@@ -103,6 +103,29 @@ Gate the run on the printed `PREFLIGHT GREEN`. Preflight probes the things that 
 per-account quota, credential expiry, skills skew between hosts, transcript persistence, disk headroom.
 Each check is written so it can return the failing answer; a check that cannot fail is not evidence.
 
+### Upgrading, and the version contract
+
+`install.sh` **is** the upgrade path — pull and re-run it. It copies into `~/.claude`, then runs the
+harness's own suites there and **exits nonzero if they are not green**, so a broken upgrade tells you
+instead of reporting success (DER-2743; before that fix both self-test lines ended in `|| true` and the
+install could not fail).
+
+```bash
+cd ~/work-harness && git pull && ./install.sh   # exits nonzero if the deployed suite is red
+cat VERSION                                      # what you just installed; CHANGELOG.md describes it
+```
+
+Two rules worth respecting:
+
+- **Never re-run `install.sh` while a run is in flight on that machine.** It replaces the code the running
+  orchestrator and leads are executing from. Install between runs.
+- **Keep hosts on the same version.** Multiple machines run copies of this harness against one shared
+  ledger; the version is not yet recorded *in* the ledger, so skew is currently invisible (tracked in
+  DER-2748). Until then, upgrading one host means upgrading all of them.
+
+`.github/REPO-SETUP.md` documents the CI checks and the branch-protection settings for anyone forking
+this repo to develop the harness itself rather than just install it.
+
 ### Telemetry hooks (optional but recommended)
 
 Without these, every token number the harness reports is an undercount. Add to `~/.claude/settings.json`:

@@ -1,0 +1,149 @@
+name: CI
+
+# DER-2751 (#20): before this workflow existed, NOTHING ran the harness's own test suite on push. An
+# unattended multi-host harness with no CI gate is the reviewer's stated reason it "is not yet a
+# dependable unattended production harness". Every gate below must be able to FAIL — no `|| true`,
+# no `continue-on-error` (that is the DER-2743 defect, in YAML).
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: tests (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 20 = oldest supported LTS; 22 = the version the harness is developed and run on today;
+        # 24 = current, so a runtime deprecation surfaces here rather than mid-run on an operator's box.
+        node: ["20", "22", "24"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      # The harness ships no dependencies and no package.json on purpose: it is stdlib-only node:test,
+      # so there is nothing to install and nothing to lock. If that ever changes, this comment is wrong.
+      - name: Runner + prep suites
+        run: |
+          node --test \
+            skills/work/work-runner.test.mjs \
+            skills/work/work-metrics.test.mjs \
+            skills/prep-for-work/prep-runner.test.mjs
+
+      # Installer contract (DER-2743): includes the smoke case AND the failure cases — a red suite and a
+      # missing `node` must both make install.sh exit nonzero.
+      - name: Installer contract
+        run: node --test install.test.mjs
+
+      # Repo release-engineering contract (DER-2751): every test file is wired into this workflow, the
+      # version is semver, the changelog names it.
+      - name: Repo contract
+        run: node --test repo-contract.test.mjs
+
+  static:
+    name: static checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Static-check tooling
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck zsh
+
+      - name: node --check every .mjs
+        run: |
+          fail=0
+          while IFS= read -r f; do
+            node --check "$f" || { echo "node --check FAILED: $f"; fail=1; }
+          done < <(git ls-files '*.mjs')
+          exit $fail
+        shell: bash
+
+      # Syntax-check each script with the interpreter its OWN shebang names. `bash -n` on the two
+      # `#!/bin/zsh` cmux scripts was checking them against the wrong grammar — it happened to pass, which
+      # is worse than failing, because it reported a clean bill of health it had no basis for.
+      - name: Syntax-check every .sh with its own interpreter
+        run: |
+          fail=0
+          while IFS= read -r f; do
+            if head -1 "$f" | grep -q 'zsh'; then
+              zsh -n "$f" || { echo "zsh -n FAILED: $f"; fail=1; }
+            else
+              bash -n "$f" || { echo "bash -n FAILED: $f"; fail=1; }
+            fi
+          done < <(git ls-files '*.sh')
+          exit $fail
+        shell: bash
+
+      # ShellCheck at --severity=error: a real blocking gate, deliberately scoped to errors rather than
+      # style. Tightening to `warning` is a follow-up (see CHANGELOG "Known follow-ups") — a gate that
+      # is red on arrival for style nits teaches operators to ignore CI, which is worse than no gate.
+      #
+      # ShellCheck supports sh/bash/dash/ksh ONLY: pointed at a `#!/bin/zsh` script it emits SC1071 as an
+      # ERROR and exits nonzero, so the un-scoped version of this gate could never pass. Scope it — and
+      # then SAY which files that excluded, because a silent exclusion reads as coverage it isn't.
+      - name: ShellCheck (errors, sh/bash/dash/ksh only)
+        run: |
+          fail=0
+          checked=0
+          skipped=""
+          while IFS= read -r f; do
+            if head -1 "$f" | grep -q 'zsh'; then
+              skipped="$skipped $f"
+              continue
+            fi
+            shellcheck --severity=error "$f" || fail=1
+            checked=$((checked + 1))
+          done < <(git ls-files '*.sh')
+          if [ -n "$skipped" ]; then
+            echo "NOT shellcheck'd — zsh is unsupported (SC1071), syntax-checked with 'zsh -n' instead:$skipped"
+          fi
+          if [ "$checked" -eq 0 ]; then
+            echo "FAIL: shellcheck examined 0 files — a gate that checked nothing is not a gate." >&2
+            exit 1
+          fi
+          echo "shellcheck examined $checked file(s) at --severity=error"
+          exit $fail
+        shell: bash
+
+  security-regression:
+    # DER-2737 (#1) is the one defect class that is live-exploitable on a PUBLIC repo: unauthenticated
+    # PR comments were parsed as privileged lifecycle input. Its regressions live in the runner suite;
+    # this job runs them BY NAME so a refactor that quietly deletes them fails CI loudly instead of
+    # silently reducing the test count.
+    name: public-comment security regression
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: DER-2737 comment-ingestion controls
+        # `--test-name-pattern` that matches NOTHING exits 0 — so this job would pass loudest at the
+        # exact moment the security controls were deleted. Require at least one test to have actually
+        # run, or the gate is theatre (DER-2743's lesson, one layer up).
+        run: |
+          set -o pipefail
+          pattern='DER-2737|drive-by|untrusted|allowlist'
+          out="$(node --test --test-name-pattern="$pattern" skills/work/work-runner.test.mjs 2>&1 | tee /dev/stderr)"
+          # Count PASSING TESTS whose names carry the security keywords — NOT `# pass`, which includes
+          # the TAP file-level line (`ok 1 - skills/work/work-runner.test.mjs`) and therefore reports 1
+          # even when the pattern matched nothing at all. Verified: pre-fix this said "pass 1" with zero
+          # controls present, which is exactly the green-on-nothing gate DER-2743 is about.
+          ran="$(printf '%s\n' "$out" | grep -cE "^ *ok [0-9]+ - .*($pattern)" || true)"
+          if [ "${ran:-0}" -lt 1 ]; then
+            echo "FAIL: no DER-2737 regression test matched /$pattern/ — the public-comment security controls are missing." >&2
+            exit 1
+          fi
+          echo "DER-2737 controls that ran: $ran"
+        shell: bash
