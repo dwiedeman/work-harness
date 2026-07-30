@@ -42,7 +42,7 @@ took **1.6–2.5**. Almost every opinion in this harness follows from that.
 | **Claude Code** | Every role — orchestrator, lead, shepherd — is a Claude Code session. | [claude.com/claude-code](https://claude.com/claude-code) · `npm i -g @anthropic-ai/claude-code` |
 | **Node.js ≥ 20** | The harness is Node built-ins only. No npm dependencies at all. | [nodejs.org](https://nodejs.org) |
 | **git ≥ 2.30** | One worktree per unit; `merge-base --is-ancestor` for head-movement proof. | [git-scm.com](https://git-scm.com/downloads) |
-| **GitHub CLI (`gh`)** | PR lifecycle, checks, review threads, merge queue. Must be authenticated. | [cli.github.com](https://cli.github.com) · then `gh auth login` |
+| **GitHub CLI (`gh`) ≥ 2.50** | PR lifecycle, checks, review threads, merge queue. Must be authenticated. The floor is `gh pr checks --json`, which `ready` needs to tell a **red** CI from a repo that has **no** CI — on an older `gh` that probe cannot answer and every PR holds on `checks=UNKNOWN`. Verified working on 2.76.2 and 2.86.0. | [cli.github.com](https://cli.github.com) · then `gh auth login` · check with `gh --version` |
 
 A Claude **subscription** (Pro/Max) is strongly recommended over metered API billing — the launchers
 drop `ANTHROPIC_API_KEY` deliberately so sessions ride OAuth. A long run on metered API pricing is

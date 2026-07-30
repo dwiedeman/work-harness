@@ -3410,17 +3410,116 @@ test("readyVerdict (H5): UNKNOWN threads is never 0; every gate must return the 
   assert.equal(readyVerdict({ ...base, shardsPass: 5, shardsTotal: 4 }).ready, false, "impossible shard read = inconsistent instrument");
 });
 
-test("parseChecksOutput (H5): one capture answers checks, shards and the first failing run", () => {
-  const text = [
-    "checks\tpass\t1m2s\thttps://x/runs/1",
-    "db-suite (1)\tpass\t2m\thttps://x/runs/2",
-    "db-suite (2)\tfail\t2m\thttps://x/actions/runs/30214392761/job/9",
-  ].join("\n");
-  const out = parseChecksOutput(text);
-  assert.equal(out.checks, "pass");
+// ---- DER-2774: the checks probe is TRI-STATE ---------------------------------------------------
+// H5's parser read the human TSV, matched a row literally NAMED `checks`, and returned `checks: null`
+// when it found none — so a DEAD PROBE, a repo with NO CI, and a RED CI on any repo whose required
+// job is not called `checks` were byte-identical answers. Every fixture below is a REAL capture from
+// `dwiedeman/work-harness` (gh 2.76.2 / 2.86.0), not an invented shape:
+//   PR #2 — a genuinely RED tree. Five checks, one `fail`, NO row named `checks`. `--json` exits 0.
+//   PR #1 — a branch with zero checks. exit 1, EMPTY stdout, the "no checks reported" sentence.
+const D2774_RED_JSON = JSON.stringify([
+  { bucket: "pass", link: "https://github.com/dwiedeman/work-harness/actions/runs/30509668831/job/90766795892", name: "tests (node 24)", state: "SUCCESS" },
+  { bucket: "pass", link: "https://github.com/dwiedeman/work-harness/actions/runs/30509668831/job/90766795929", name: "tests (node 20)", state: "SUCCESS" },
+  { bucket: "pass", link: "https://github.com/dwiedeman/work-harness/actions/runs/30509668831/job/90766795881", name: "tests (node 22)", state: "SUCCESS" },
+  { bucket: "pass", link: "https://github.com/dwiedeman/work-harness/actions/runs/30509668831/job/90766795833", name: "static checks", state: "SUCCESS" },
+  { bucket: "fail", link: "https://github.com/dwiedeman/work-harness/actions/runs/30509668831/job/90766795878", name: "public-comment security regression", state: "FAILURE" },
+]);
+// The same red tree as the pre-fix probe captured it: the exact TSV `gh pr checks <n> --repo <slug>`
+// printed for PR #2, with the exit code that mode really returns (1 — the lore that does NOT carry
+// over to `--json`, which exits 0 on the identical tree).
+const D2774_RED_TSV = [
+  "public-comment security regression\tfail\t5s\thttps://github.com/dwiedeman/work-harness/actions/runs/30509668831/job/90766795878\t",
+  "static checks\tpass\t15s\thttps://github.com/dwiedeman/work-harness/actions/runs/30509668831/job/90766795833\t",
+  "tests (node 20)\tpass\t19s\thttps://github.com/dwiedeman/work-harness/actions/runs/30509668831/job/90766795929\t",
+].join("\n") + "\n";
+const d2774Probe = (o) => ({ exitCode: 0, stdout: "", stderr: "", ...o });
+
+test("DER-2774: a RED check surface reads `fail`, from the buckets — not `null` because no job is named `checks`", () => {
+  const out = parseChecksOutput(d2774Probe({ stdout: D2774_RED_JSON }));
+  assert.equal(out.checks, "fail", "one fail bucket makes the whole surface fail, whatever the jobs are called");
+  assert.match(out.firstFailUrl, /90766795878/, "the red job's own link, so `ready` can resolve its run status");
+  // CONTROL — the identical repo, all green: the same parser must be able to return the passing answer.
+  const green = parseChecksOutput(d2774Probe({ stdout: D2774_RED_JSON.replace(/"fail"/, '"pass"').replace(/"FAILURE"/, '"SUCCESS"') }));
+  assert.equal(green.checks, "pass");
+  assert.equal(green.firstFailUrl, null);
+  // `--json` exits 0 on a failing tree (the exporter writes before the exit-code logic), so exit 0 is
+  // never itself evidence of green. Same buckets, exit 0 — and the answer is still `fail`.
+  assert.equal(parseChecksOutput({ exitCode: 0, stdout: D2774_RED_JSON, stderr: "" }).checks, "fail");
+  // A PENDING surface is neither, and a mixed fail+pending surface reports the fail.
+  const pending = JSON.parse(D2774_RED_JSON).map((c) => ({ ...c, bucket: "pending", state: "IN_PROGRESS" }));
+  assert.equal(parseChecksOutput(d2774Probe({ stdout: JSON.stringify(pending) })).checks, "pending");
+  assert.equal(parseChecksOutput(d2774Probe({ stdout: JSON.stringify([...pending, { bucket: "fail", name: "x", link: "u" }]) })).checks, "fail");
+});
+
+test("DER-2774: zero checks is ABSENT; every OTHER probe failure is UNKNOWN", () => {
+  // gh errors out BEFORE the JSON exporter when a branch has no checks: exit 1, empty stdout, and one
+  // specific sentence on stderr. This is the ONLY nonzero exit that may read as absent.
+  const absent = parseChecksOutput({ exitCode: 1, stdout: "", stderr: WR.GH_NO_CHECKS_SAMPLE_STDERR });
+  assert.equal(absent.checks, "absent");
+  // CONTROLS — the same exit code and the same empty stdout, with stderr that says something else.
+  // Each is a real failure this probe hits: a 404/typo'd repo, a dead credential, a throttle, and the
+  // SIGKILL timeout `runCommand` reports as exit 1 with NO stderr at all.
+  for (const [label, stderr] of [
+    ["missing PR", "GraphQL: Could not resolve to a PullRequest with the number of 9999. (repository.pullRequest)\n"],
+    ["missing repo", "GraphQL: Could not resolve to a Repository with the name 'dwiedeman/no-such-repo-xyz'. (repository)\n"],
+    ["auth", "error connecting to api.github.com\n"],
+    ["throttle", "API rate limit exceeded\n"],
+    ["killed by timeout", ""],
+  ]) {
+    const out = parseChecksOutput({ exitCode: 1, stdout: "", stderr });
+    assert.equal(out.checks, "unknown", `${label}: an unreadable probe is UNKNOWN, never ABSENT`);
+    assert.ok(out.checksNote, `${label}: an UNKNOWN must carry the reason the operator has to act on`);
+  }
+  assert.equal(parseChecksOutput({ exitCode: 127, stdout: "", stderr: "spawn gh ENOENT" }).checks, "unknown", "no gh at all");
+  assert.equal(parseChecksOutput({}).checks, "unknown", "a probe result with no exit code proves nothing");
+  assert.equal(parseChecksOutput().checks, "unknown", "and neither does no probe result at all");
+  // The pre-fix caller passed `chkRes.stdout` (a string). The new parser must REFUSE that rather than
+  // half-read it: a bare string has no exitCode, and the TSV body is not JSON.
+  assert.equal(parseChecksOutput(D2774_RED_TSV).checks, "unknown", "a raw stdout string is not a probe result");
+  assert.equal(parseChecksOutput({ exitCode: 1, stdout: D2774_RED_TSV, stderr: "" }).checks, "unknown",
+    "a TSV capture (probe invoked without --json) must not be silently mis-parsed");
+  // And the sentence itself is pinned, so a gh rewording is a deliberate edit here rather than a
+  // silent absent→unknown reclassification that would dead-end every no-CI adopter (DER-2753).
+  assert.match(WR.GH_NO_CHECKS_SAMPLE_STDERR, /^no checks reported on the '.+' branch\n$/);
+  // The matcher is derived from that sample, so these two properties have to hold together: it must
+  // still recognise the sentence for ANY branch name (a matcher narrowed to the recorded branch would
+  // silently reclassify every real adopter absent→unknown)…
+  for (const branch of ["main", "feature/x", "wh/der-2743-installer", "weird'quote"]) {
+    assert.equal(parseChecksOutput({ exitCode: 1, stdout: "", stderr: `no checks reported on the '${branch}' branch\n` }).checks, "absent", `branch ${branch}`);
+  }
+  // …and it must NOT swallow gh's sibling `--required` message, which means something different: the
+  // branch HAS checks, just none that are required.
+  assert.equal(parseChecksOutput({ exitCode: 1, stdout: "", stderr: "no required checks reported on the 'main' branch\n" }).checks, "unknown");
+});
+
+test("DER-2774: shards, skips and an unrecognised bucket all answer from `--json`", () => {
+  const shards = JSON.stringify([
+    { bucket: "pass", name: "checks", link: "https://x/runs/1" },
+    { bucket: "pass", name: "db-suite (1)", link: "https://x/runs/2" },
+    { bucket: "fail", name: "db-suite (2)", link: "https://x/actions/runs/30214392761/job/9" },
+  ]);
+  const out = parseChecksOutput(d2774Probe({ stdout: shards }));
+  assert.equal(out.checks, "fail", "a red shard reds the surface — the `checks` row no longer decides alone");
   assert.equal(out.shardsPass, 1);
   assert.equal(out.shardsTotal, 2);
   assert.match(out.firstFailUrl, /30214392761/);
+  // A path-gated skip is not a failure; a CANCELLED check is not a pass. The note keeps the
+  // cancelled-vs-failed distinction the `ready` caller already prints, without opening the gate.
+  const skipped = [{ bucket: "pass", name: "a" }, { bucket: "skipping", name: "b" }];
+  assert.equal(parseChecksOutput(d2774Probe({ stdout: JSON.stringify(skipped) })).checks, "pass");
+  const cancelled = parseChecksOutput(d2774Probe({ stdout: JSON.stringify([{ bucket: "pass", name: "a" }, { bucket: "cancel", name: "b", link: "u" }]) }));
+  assert.equal(cancelled.checks, "fail", "a cancelled check did not pass");
+  assert.match(cancelled.checksNote, /cancelled/i);
+  // A bucket gh grows later must NOT fall through to pass — the whole defect class in one line.
+  const strange = parseChecksOutput(d2774Probe({ stdout: JSON.stringify([{ bucket: "pass", name: "a" }, { bucket: "quantum", name: "b" }]) }));
+  assert.equal(strange.checks, "unknown");
+  assert.match(strange.checksNote, /quantum/);
+  // Malformed successes are UNKNOWN, not pass.
+  assert.equal(parseChecksOutput(d2774Probe({ stdout: "not json at all" })).checks, "unknown");
+  assert.equal(parseChecksOutput(d2774Probe({ stdout: '{"checks":"pass"}' })).checks, "unknown", "an object is not a check list");
+  // Exit 0 with an empty list: gh ANSWERED, and the answer is "none". Reading this as UNKNOWN would
+  // permanently dead-end the no-CI adopters direct mode exists for.
+  assert.equal(parseChecksOutput(d2774Probe({ stdout: "[]" })).checks, "absent");
 });
 
 test("materializeState: lead_process_dead raises leads_dead; a fresh spawn clears it (DER-2516)", () => {
@@ -3544,7 +3643,10 @@ const D2603_STAMPED = { type: "run_started", run_id: "R", harness_version: "0.2.
 const d2603Line = (verdict, gate, mode) => WR.readyLine({
   pr: 1081, head: D2603_HEAD, draft: false, threads: 0, onHead: true, checks: "pass", shards: "4/4",
   behind: 0, gate: gate.state, gateLabel: gate.label, ...verdict,
-  mergeAction: WR.mergeAction({ mode, pr: 1081, verdict }),
+  // DER-2774: `ready` binds a direct merge to the head it evaluated, so this line renders the same way
+  // the subcommand does — otherwise the positive control below would hold on a MISSING head instead of
+  // proving the gate lets healthy work through.
+  mergeAction: WR.mergeAction({ mode, pr: 1081, verdict, expectedHead: D2603_HEAD }),
 });
 
 test("DER-2603: no review_findings event ⇒ NEITHER go-ahead word, in queue OR direct mode", () => {
@@ -4200,18 +4302,35 @@ const D2753_READY = {
   draft: false, threads: 0, onHead: true, checks: "pass", shardsPass: 0, shardsTotal: 0,
   gate: { state: "current", blocks: false, label: "gate=CURRENT" },
 };
+// DER-2774 made the evaluated head a required direct-mode input — `ready` reads it from the same
+// `gh pr view --json headRefOid` that supplies `isDraft`, so it is always available where the verdict is.
+const D2774_HEAD = "c0ffee1234567890abcdef1234567890abcdef12";
 
-test("DER-2753: mergeMode:direct + a fully-ready PR ⇒ `gh pr merge <n> --squash --delete-branch`, NOT an enqueue", () => {
+test("DER-2753/DER-2774: mergeMode:direct + a fully-ready PR ⇒ a `gh pr merge` BOUND to the evaluated head, NOT an enqueue", () => {
   assert.equal(typeof WR.mergeAction, "function", "the queue-vs-direct decision must be a pure, testable seam");
   const verdict = readyVerdict(D2753_READY);
   assert.equal(verdict.ready, true, "precondition: this PR passes every gate");
-  const act = WR.mergeAction({ mode: "direct", strategy: "squash", pr: 41, verdict });
+  const act = WR.mergeAction({ mode: "direct", strategy: "squash", pr: 41, verdict, expectedHead: D2774_HEAD });
   assert.equal(act.action, "merge");
-  assert.deepEqual(act.args, ["pr", "merge", "41", "--squash", "--delete-branch"]);
+  // DER-2774: every gate above is a statement about ONE sha, and `ready` PRINTS a command someone runs
+  // later. Without the binding, a push landing in that window merges a tree nothing ever gated.
+  assert.deepEqual(act.args, ["pr", "merge", "41", "--squash", "--delete-branch", "--match-head-commit", D2774_HEAD]);
   assert.ok(!act.args.includes("--auto"), "direct mode must never arm the queue's auto-merge");
-  // CONTROL — the ROST-shaped repo that DOES have a queue keeps the old call verbatim: plain
-  // `--auto`, no strategy flag (the queue owns the strategy; see the SKILL.md learning).
-  const q = WR.mergeAction({ mode: "queue", strategy: "squash", pr: 41, verdict });
+  // …and the binding is not optional: no head, no merge call. (It cannot dead-end a caller — a PR whose
+  // head is unreadable already failed the draft gate before it reached here.)
+  // Rejects the empty/garbage cases AND an ABBREVIATED sha — `headRefOid` is always full-length, and a
+  // short one would be refused by GitHub at merge time with a worse message than this hold.
+  for (const bad of [undefined, null, "", "   ", "HEAD", "origin/main", "not-a-sha", "zzzzzzz",
+    D2774_HEAD.slice(0, 10), D2774_HEAD.slice(0, 39), `${D2774_HEAD}0`, 12345, { sha: D2774_HEAD }]) {
+    const held = WR.mergeAction({ mode: "direct", strategy: "squash", pr: 41, verdict, expectedHead: bad });
+    assert.equal(held.action, "hold", `expectedHead=${JSON.stringify(bad)} must not produce a merge`);
+    assert.equal(held.args, null, "no argv means no merge call is possible");
+    assert.match(held.why, /match-head-commit/, "the hold must name what is missing");
+  }
+  // CONTROL — the ROST-shaped repo that DOES have a queue keeps the old call verbatim: plain `--auto`,
+  // no strategy flag, and NO head pin (the queue re-evaluates its own entry, and `--auto` arms a future
+  // merge rather than performing one, so pinning a sha there would refuse legitimate re-arms).
+  const q = WR.mergeAction({ mode: "queue", strategy: "squash", pr: 41, verdict, expectedHead: D2774_HEAD });
   assert.equal(q.action, "enqueue");
   assert.deepEqual(q.args, ["pr", "merge", "41", "--auto"]);
 });
@@ -4221,6 +4340,8 @@ test("DER-2753: mergeMode:direct + an unready PR ⇒ NO merge call (the gate can
     ["open thread", { ...D2753_READY, threads: 1 }, /1 unresolved thread/],
     ["throttled thread read", { ...D2753_READY, threads: null }, /UNKNOWN/],
     ["red check", { ...D2753_READY, checks: "fail" }, /checks=fail/],
+    ["pending check", { ...D2753_READY, checks: "pending" }, /checks=pending/],
+    ["unreadable checks probe", { ...D2753_READY, checks: "unknown" }, /checks=UNKNOWN/],
     ["draft", { ...D2753_READY, draft: true }, /draft/],
     ["codex behind head", { ...D2753_READY, onHead: false }, /codex not on head/],
     ["stale-dirty gate", { ...D2753_READY, gate: gateEvidenceVerdict({ head: "a".repeat(40), gate: { sha: "b".repeat(40), blockers: 1 } }) }, /STALE/],
@@ -4228,33 +4349,84 @@ test("DER-2753: mergeMode:direct + an unready PR ⇒ NO merge call (the gate can
   for (const [label, inputs, whyRe] of cases) {
     const verdict = readyVerdict(inputs);
     assert.equal(verdict.ready, false, `precondition (${label}): not ready`);
-    const act = WR.mergeAction({ mode: "direct", strategy: "squash", pr: 41, verdict });
+    // A VALID head is supplied throughout, so the only thing that can hold these is the named gate.
+    const act = WR.mergeAction({ mode: "direct", strategy: "squash", pr: 41, verdict, expectedHead: D2774_HEAD });
     assert.equal(act.action, "hold", `${label}: direct mode must not merge`);
     assert.equal(act.args, null, `${label}: no argv means no merge call is possible`);
     assert.match(act.why, whyRe, `${label}: the hold must name the failing gate`);
   }
 });
 
-test("DER-2753: allowMergeWithoutChecks defaults FALSE — no CI ⇒ no merge; opt-in merges on the remaining gates", () => {
-  const noCi = { ...D2753_READY, checks: null }; // a public repo with zero required checks
-  const closed = readyVerdict(noCi);
-  assert.equal(closed.ready, false, "default must fail CLOSED on UNKNOWN checks");
-  assert.match(closed.why, /checks=UNKNOWN/);
-  assert.equal(WR.mergeAction({ mode: "direct", pr: 7, verdict: closed }).action, "hold");
-  // Opt-in: an adopter with no CI at all can still merge on draft/threads/codex/gate evidence.
-  const open = readyVerdict({ ...noCi, allowMergeWithoutChecks: true });
-  assert.equal(open.ready, true, "the explicit opt-in must actually unblock");
-  assert.match(open.why, /allowMergeWithoutChecks/, "the loosening must be named in the verdict — it is auditable");
-  assert.equal(WR.mergeAction({ mode: "direct", pr: 7, verdict: open }).action, "merge");
-  // CONTROL — the loosening covers ONLY an ABSENT check surface. A RED or PENDING check still blocks
-  // with the opt-in on, or `allowMergeWithoutChecks` would silently become "ignore CI".
-  for (const bad of ["fail", "pending"]) {
-    const v = readyVerdict({ ...D2753_READY, checks: bad, allowMergeWithoutChecks: true });
-    assert.equal(v.ready, false, `checks=${bad} must block even with allowMergeWithoutChecks:true`);
-    assert.equal(WR.mergeAction({ mode: "direct", pr: 7, verdict: v }).action, "hold");
+test("DER-2753/DER-2774: allowMergeWithoutChecks waives a VERIFIED-ABSENT check surface — and nothing else", () => {
+  // The inputs come THROUGH THE REAL PARSER, from real gh captures. The pre-fix version of this test
+  // handed `readyVerdict` a `checks: null` literal, which is exactly why it passed while the shipped
+  // pair (parser + verdict) waived a red tree: no test ever asked the parser what a red tree looks like.
+  const verdictFor = (probe, allow) => {
+    const chk = parseChecksOutput(probe);
+    return { chk, v: readyVerdict({ ...D2753_READY, checks: chk.checks, shardsPass: chk.shardsPass, shardsTotal: chk.shardsTotal, allowMergeWithoutChecks: allow }) };
+  };
+  const noCi = { exitCode: 1, stdout: "", stderr: WR.GH_NO_CHECKS_SAMPLE_STDERR };
+
+  // 1. Default false: a genuinely check-free repo still holds, and says which of the two it is.
+  const closed = verdictFor(noCi, false);
+  assert.equal(closed.chk.checks, "absent");
+  assert.equal(closed.v.ready, false, "default must fail CLOSED even on a verified-absent surface");
+  assert.match(closed.v.why, /checks=ABSENT/);
+  assert.equal(WR.mergeAction({ mode: "direct", pr: 7, verdict: closed.v, expectedHead: D2774_HEAD }).action, "hold");
+
+  // 2. Opt-in: that adopter — and ONLY that adopter — can merge on the remaining gates.
+  const open = verdictFor(noCi, true);
+  assert.equal(open.v.ready, true, "the explicit opt-in must actually unblock a check-free repo");
+  assert.match(open.v.why, /allowMergeWithoutChecks/, "the loosening must be named in the verdict — it is auditable");
+  assert.equal(WR.mergeAction({ mode: "direct", pr: 7, verdict: open.v, expectedHead: D2774_HEAD }).action, "merge");
+
+  // 3. THE P0. A RED tree on a repo with no job named `checks` — the shape of THIS repo, and of most
+  // adopters — read `checks: null` pre-fix, and null was waived. With the opt-in ON, `ready` printed
+  // the merge go-ahead on red. It must now block, and name the red rather than an absence.
+  const red = verdictFor({ exitCode: 0, stdout: D2774_RED_JSON, stderr: "" }, true);
+  assert.equal(red.chk.checks, "fail", "the parser must be able to SEE the red");
+  assert.equal(red.v.ready, false, "a red tree must never be waived — this is the P0");
+  assert.match(red.v.why, /checks=fail/);
+  assert.equal(WR.mergeAction({ mode: "direct", pr: 7, verdict: red.v, expectedHead: D2774_HEAD }).action, "hold");
+
+  // 4. Pending, and every UNREADABLE probe, also survive the opt-in. An UNKNOWN is not an absence, and
+  // its hold reason says so — "run the gate" and "make the probe readable" are different instructions.
+  const pendingJson = JSON.stringify([{ bucket: "pending", name: "tests (node 20)" }]);
+  assert.equal(verdictFor({ exitCode: 0, stdout: pendingJson, stderr: "" }, true).v.ready, false, "pending must block with the opt-in on");
+  for (const probe of [
+    { exitCode: 1, stdout: "", stderr: "GraphQL: Could not resolve to a Repository with the name 'x/y'. (repository)\n" },
+    { exitCode: 1, stdout: "", stderr: "" },
+    { exitCode: 127, stdout: "", stderr: "spawn gh ENOENT" },
+    { exitCode: 0, stdout: "not json", stderr: "" },
+  ]) {
+    const u = verdictFor(probe, true);
+    assert.equal(u.chk.checks, "unknown");
+    assert.equal(u.v.ready, false, "an unreadable probe must never be waived");
+    assert.match(u.v.why, /checks=UNKNOWN/);
+    assert.match(u.v.why, /VERIFIED-ABSENT/, "and must say why the waiver did not apply to it");
   }
-  // And the other gates are untouched by the opt-in.
-  assert.equal(readyVerdict({ ...noCi, threads: 2, allowMergeWithoutChecks: true }).ready, false);
+
+  // 4b. THE PRE-FIX PREDICATE, asserted directly on `readyVerdict`. The waiver used to read
+  // `checks == null || checks === ""`, so a caller that never ran the probe at all — or ran it and
+  // threw the result away — was indistinguishable from a repo with no CI, and the opt-in merged it.
+  // The waiver now keys on the literal "absent" state ONLY; no unset value may route into it.
+  for (const unset of [null, undefined, ""]) {
+    const v = readyVerdict({ ...D2753_READY, checks: unset, allowMergeWithoutChecks: true });
+    assert.equal(v.ready, false, `checks=${JSON.stringify(unset)} must fail CLOSED with the waiver ON — never-probed is not verified-absent`);
+    assert.match(v.why, /checks=UNKNOWN/);
+    assert.equal(WR.mergeAction({ mode: "direct", pr: 7, verdict: v, expectedHead: D2774_HEAD }).action, "hold");
+  }
+  // …and readyVerdict called with NO checks key at all is the same story.
+  const omitted = readyVerdict({ draft: false, threads: 0, onHead: true, shardsPass: 0, shardsTotal: 0, gate: D2753_READY.gate, allowMergeWithoutChecks: true });
+  assert.equal(omitted.ready, false, "omitting `checks` entirely must not be waivable either");
+
+  // 5. The other gates are untouched by the opt-in.
+  assert.equal(readyVerdict({ ...D2753_READY, checks: "absent", threads: 2, allowMergeWithoutChecks: true }).ready, false);
+  assert.equal(readyVerdict({ ...D2753_READY, checks: "absent", onHead: false, allowMergeWithoutChecks: true }).ready, false);
+  // A truthy non-`true` value cannot loosen the gate (DER-2753's `=== true`, re-pinned on the new key).
+  for (const truthy of ["yes", 1, {}]) {
+    assert.equal(readyVerdict({ ...D2753_READY, checks: "absent", allowMergeWithoutChecks: truthy }).ready, false, `allowMergeWithoutChecks=${JSON.stringify(truthy)} must not waive`);
+  }
 });
 
 test("DER-2753: an UNRESOLVED merge mode holds and names the config key (fail closed, don't guess)", () => {
@@ -4298,21 +4470,48 @@ test("DER-2753: queue presence is auto-detected, and an UNDETECTABLE queue never
 
 test("DER-2753: `ready` reports the mode-correct verdict word and the exact command to run", () => {
   assert.equal(typeof WR.readyLine, "function", "the ready line must be a pure seam so its wording is testable");
-  const base = { pr: 12, head: "c".repeat(40), draft: false, threads: 0, onHead: true, checks: "pass", shards: "0/0", behind: 0, gate: "current", gateLabel: "gate=CURRENT" };
+  const base = { pr: 12, head: D2774_HEAD, draft: false, threads: 0, onHead: true, checks: "pass", shards: "0/0", behind: 0, gate: "current", gateLabel: "gate=CURRENT" };
   const verdict = readyVerdict(D2753_READY);
-  const direct = WR.readyLine({ ...base, ...verdict, mergeAction: WR.mergeAction({ mode: "direct", pr: 12, verdict }) });
+  const direct = WR.readyLine({ ...base, ...verdict, mergeAction: WR.mergeAction({ mode: "direct", pr: 12, verdict, expectedHead: base.head }) });
   assert.match(direct, /\*\*\* MERGEABLE \(direct\) \*\*\*/, "an adopter with no queue must not be told to ENQUEUE");
-  assert.match(direct, /gh pr merge 12 --squash --delete-branch/, "print the command, so the shepherd cannot invent one");
-  const queued = WR.readyLine({ ...base, ...verdict, mergeAction: WR.mergeAction({ mode: "queue", pr: 12, verdict }) });
+  // DER-2774 — the PRINTED command is the artifact a human or shepherd actually runs, so the head
+  // binding has to survive all the way into the string, not just exist in the argv array.
+  assert.match(direct, new RegExp(`gh pr merge 12 --squash --delete-branch --match-head-commit ${base.head}`),
+    "print the command, so the shepherd cannot invent one — and print it BOUND to the head that was gated");
+  const queued = WR.readyLine({ ...base, ...verdict, mergeAction: WR.mergeAction({ mode: "queue", pr: 12, verdict, expectedHead: base.head }) });
   assert.match(queued, /\*\*\* ENQUEUEABLE \*\*\*/);
-  assert.match(queued, /gh pr merge 12 --auto/);
+  assert.match(queued, /gh pr merge 12 --auto$/, "queue mode stays verbatim — no strategy, no head pin");
   // Not ready ⇒ neither word appears, in EITHER mode. This is the string the shepherd greps.
   for (const mode of ["direct", "queue"]) {
     const bad = readyVerdict({ ...D2753_READY, threads: 3 });
-    const line = WR.readyLine({ ...base, ...bad, mergeAction: WR.mergeAction({ mode, pr: 12, verdict: bad }) });
+    const line = WR.readyLine({ ...base, ...bad, mergeAction: WR.mergeAction({ mode, pr: 12, verdict: bad, expectedHead: base.head }) });
     assert.doesNotMatch(line, /MERGEABLE|ENQUEUEABLE/, `${mode}: an unready PR must show no go-ahead word`);
     assert.match(line, /hold \(3 unresolved thread/);
   }
+});
+
+test("DER-2774: the `ready` CALL SITES pass what these functions now need — a symbol is not a wiring", async () => {
+  // The repo's own "a test binds to a symbol; production binds to a call site" class. Every assertion
+  // above proves something about a pure function; none of them proves `ready` CALLS it that way, and
+  // both fixes here are exactly the shape that fails silently when the parameter is threaded nowhere.
+  // Derived from the production call sites rather than hand-listed: the count is asserted, so a second
+  // call site added later cannot slip past this test unchecked.
+  const src = await readFile(new URL("./work-runner.mjs", import.meta.url), "utf8");
+  const body = src.slice(src.indexOf('case "ready":'), src.indexOf('case "preflight":'));
+  assert.ok(body.length > 1000, "the ready subcommand body must be locatable for this to prove anything");
+
+  const parseCalls = [...src.matchAll(/parseChecksOutput\(([^)]*)\)/g)].map((m) => m[1].trim()).filter((a) => !/^\{?\s*(exitCode|text)/.test(a) && a !== "");
+  assert.equal(parseCalls.length, 1, `expected exactly one production parseChecksOutput call site, got ${JSON.stringify(parseCalls)}`);
+  assert.equal(parseCalls[0], "chkRes", "the WHOLE probe result must be passed — `.stdout` alone cannot distinguish a dead probe from a check-free repo");
+  assert.match(body, /"pr", "checks", String\(n\), "--repo", slug, "--json", "[^"]*bucket[^"]*"/,
+    "the probe must ask for --json buckets; the TSV mode answers only about a row NAMED `checks`, and exits 1 on a red tree");
+
+  const mergeCalls = [...src.matchAll(/\bmergeAction\(\{([^}]*)\}\)/g)].map((m) => m[1]);
+  assert.equal(mergeCalls.length, 1, `expected exactly one production mergeAction call site, got ${mergeCalls.length}`);
+  assert.match(mergeCalls[0], /expectedHead:\s*head\b/, "the direct-merge command must be bound to the head `ready` evaluated");
+  // And that `head` is the one every other gate on this PR was evaluated against.
+  assert.match(body, /head = d\.headRefOid \?\? null/);
+  assert.match(body, /gateEvidenceVerdict\(\{ head,/);
 });
 
 test("DER-2753: the merge policy is CONFIG-driven and resets to the conservative default", async () => {
@@ -4329,8 +4528,8 @@ test("DER-2753: the merge policy is CONFIG-driven and resets to the conservative
     await applyRepoConfig(dir);
     assert.deepEqual(WR.getMergePolicy(), { mergeMode: "direct", mergeStrategy: "rebase", allowMergeWithoutChecks: true });
     assert.equal(getRepoIdentity().repoSlug, "someone/public-repo", "the merge keys must not disturb repo identity");
-    const act = WR.mergeAction({ mode: "direct", strategy: WR.getMergePolicy().mergeStrategy, pr: 55, verdict: readyVerdict(D2753_READY) });
-    assert.deepEqual(act.args, ["pr", "merge", "55", "--rebase", "--delete-branch"]);
+    const act = WR.mergeAction({ mode: "direct", strategy: WR.getMergePolicy().mergeStrategy, pr: 55, verdict: readyVerdict(D2753_READY), expectedHead: D2774_HEAD });
+    assert.deepEqual(act.args, ["pr", "merge", "55", "--rebase", "--delete-branch", "--match-head-commit", D2774_HEAD]);
     // A garbage config value must not be adopted — it stays at the safe default rather than reaching
     // `gh` as an invalid flag mid-merge.
     await writeFile(join(dir, ".claude", "work.config.json"), JSON.stringify({

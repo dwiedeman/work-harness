@@ -1079,19 +1079,96 @@ export function codexOnHead({ head = "", reviewSha = null, commentSha = null } =
   if (commentSha && head.startsWith(commentSha)) return true;
   return false;
 }
-// Parse `gh pr checks` TSV once and answer from the captured text (fix 3: three separate calls
+// Parse the checks probe ONCE and answer from the captured result (fix 3: three separate calls
 // observed three CI states and printed an arithmetically impossible shard count).
-export function parseChecksOutput(text = "") {
-  const rows = String(text).split("\n").filter((l) => l.trim()).map((l) => l.split("\t"));
-  const checksRow = rows.find((r) => r[0] === "checks");
-  const shardRows = rows.filter((r) => /^db-suite \(\d+\)/.test(r[0] ?? ""));
-  const firstFail = rows.find((r) => r[1] === "fail");
-  return {
-    checks: checksRow ? checksRow[1] : null,
-    shardsPass: shardRows.filter((r) => r[1] === "pass").length,
+//
+// DER-2774 — `gh pr checks` is a TRI-STATE instrument and the pre-fix parser collapsed three
+// different worlds onto one answer. It read the human TSV, looked for a row literally NAMED `checks`
+// (the single required context on the repo this harness grew up on), and returned `checks: null` when
+// it found none. `null` therefore meant, simultaneously: the probe died, the repo has no CI at all,
+// and — on ANY repo whose required job is not called `checks` — the CI is RED. This repo is the third
+// case: its jobs are `tests (node 20|22|24)`, `static checks`, `public-comment security regression`.
+// Measured on PR #2 of this repo, a genuinely red tree: every row parsed, no row named `checks`,
+// result `checks: null`. Paired with `repo.allowMergeWithoutChecks: true` — the loosening the SHIPPED
+// example config hands adopters alongside `"mergeMode": "direct"` — `readyVerdict` waived that null
+// and `ready` printed the merge go-ahead on red.
+//
+// Ground truth for `gh pr checks --json`, measured against gh 2.76.2 and 2.86.0. The exit-code lore
+// from the human TSV mode does NOT carry over: TSV exits 1 on a failing check, `--json` exits 0,
+// because the JSON exporter writes and returns before the exit-code logic runs.
+//   - any checks exist        → exit 0 + a JSON array on stdout. Failing AND pending both exit 0.
+//   - zero checks on the branch → exit 1, EMPTY stdout, stderr `no checks reported on the '<b>' branch`
+//   - anything else (auth, 404, throttle, SIGKILL timeout, gh missing) → exit ≠ 0, other/empty stderr
+// So exit 0 is never itself read as "pass" (the buckets decide), and a nonzero exit is ABSENT only
+// when gh said exactly that. Everything else is UNKNOWN — and UNKNOWN is never waivable.
+//
+// The exact zero-checks sentence, recorded verbatim from gh 2.76.2 and 2.86.0 against PR #1 of this
+// repo. Pinned so a future gh rewording is a deliberate edit here rather than a silent absent→unknown
+// reclassification, which would dead-end every no-CI adopter and regress DER-2753. Its LIMIT, stated
+// rather than implied: this pins OUR matcher against a RECORDED sample — nothing here re-invokes gh,
+// so a wording change surfaces the next time someone runs the probe, not from CI.
+export const GH_NO_CHECKS_SAMPLE_STDERR = "no checks reported on the 'wh/der-2743-installer' branch\n";
+// The matcher is DERIVED from that sample's invariant prefix — everything before the branch name —
+// so the constant is load-bearing rather than a fixture sitting beside a hand-written duplicate: edit
+// the sentence and production changes with it. Deliberately does NOT include the branch clause, so a
+// gh change to how the branch is quoted cannot turn ABSENT into UNKNOWN. If the ` on the ` marker ever
+// disappears the derived matcher becomes the whole sentence, i.e. STRICTER — it fails closed (more
+// reads become UNKNOWN and block), never open. It also does not match gh's sibling `--required`
+// message ("no REQUIRED checks reported"), which `ready` never triggers and which would mean
+// something different if it did. The prefix is regex-ESCAPED before compiling, so editing the sample
+// can never throw at import time (which would take the whole harness down over a docs change) — it
+// is always matched as a literal substring.
+const GH_NO_CHECKS_RE = new RegExp(
+  GH_NO_CHECKS_SAMPLE_STDERR.split(" on the ")[0].trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
+  "i",
+);
+// gh's own bucket vocabulary. `cancel` counts as failing: a cancelled check did not pass, and the
+// `ready` caller already resolves the run's real status into the note (`← CANCELLED, NOT a failure`),
+// so the operator gets the distinction without the gate opening. A bucket string gh grows later that
+// is not in this set reads UNKNOWN rather than being silently ignored on the way to "pass".
+const CHECK_BUCKETS_FAILING = new Set(["fail", "cancel"]);
+const CHECK_BUCKETS_KNOWN = new Set(["pass", "fail", "pending", "skipping", "cancel"]);
+const firstStderrLine = (s) => String(s ?? "").split("\n").map((l) => l.trim()).find(Boolean) ?? "";
+
+export function parseChecksOutput({ exitCode, stdout = "", stderr = "" } = {}) {
+  const base = { checks: "unknown", shardsPass: 0, shardsTotal: 0, firstFailUrl: null, checksNote: null };
+  if (exitCode !== 0) {
+    if (GH_NO_CHECKS_RE.test(String(stderr ?? ""))) {
+      return { ...base, checks: "absent", checksNote: "gh reports no checks at all on this branch" };
+    }
+    return { ...base, checksNote: `gh pr checks exited ${exitCode ?? "?"}: ${firstStderrLine(stderr) || "no stderr"}` };
+  }
+  let rows;
+  try {
+    rows = JSON.parse(String(stdout ?? ""));
+  } catch {
+    // Includes the pre-DER-2774 TSV capture: refuse it loudly instead of half-reading it.
+    return { ...base, checksNote: "gh pr checks --json emitted output that is not JSON (probe called without --json?)" };
+  }
+  if (!Array.isArray(rows)) return { ...base, checksNote: "gh pr checks --json did not emit an array" };
+  const shardRows = rows.filter((c) => /^db-suite \(\d+\)/.test(String(c?.name ?? "")));
+  const out = {
+    ...base,
+    shardsPass: shardRows.filter((c) => c?.bucket === "pass").length,
     shardsTotal: shardRows.length,
-    firstFailUrl: firstFail ? firstFail[3] ?? null : null,
+    firstFailUrl: rows.find((c) => CHECK_BUCKETS_FAILING.has(String(c?.bucket ?? "")))?.link ?? null,
   };
+  // gh errors out before the exporter when a branch has zero checks, so an empty array should be
+  // unreachable — but if a future gh returns one, exit 0 means gh ANSWERED, and its answer is "none".
+  // Reading that as UNKNOWN instead would permanently dead-end the no-CI adopters DER-2753 exists for.
+  if (!rows.length) return { ...out, checks: "absent", checksNote: "gh pr checks --json returned an empty check list" };
+  const buckets = rows.map((c) => String(c?.bucket ?? ""));
+  if (buckets.some((b) => CHECK_BUCKETS_FAILING.has(b))) {
+    const cancelled = buckets.filter((b) => b === "cancel").length;
+    return { ...out, checks: "fail", checksNote: cancelled ? `${cancelled} cancelled check(s) counted as failing` : null };
+  }
+  const strange = [...new Set(buckets.filter((b) => !CHECK_BUCKETS_KNOWN.has(b)))];
+  if (strange.length) {
+    return { ...out, checks: "unknown", checksNote: `gh returned unrecognised check bucket(s): ${strange.join(", ")}` };
+  }
+  if (buckets.includes("pending")) return { ...out, checks: "pending" };
+  const skipped = buckets.filter((b) => b === "skipping").length;
+  return { ...out, checks: "pass", checksNote: skipped ? `${skipped} check(s) skipped (path-gated)` : null };
 }
 // The gate verdict, pure (control-tested): enqueueable ONLY when every input is the PASSING answer —
 // an UNKNOWN thread count (throttled null) is never 0 (fix 6).
@@ -1191,18 +1268,37 @@ export function gateEvidenceLookup({ events = null, issueId = null, ledgerRead =
 }
 
 // DER-2753 `allowMergeWithoutChecks`: a PUBLIC adopter repo often has NO required checks at all, so
-// `gh pr checks` reports nothing, `checks` reads UNKNOWN, and this verdict never passes — which in
-// direct-merge mode means the shepherd can never merge anything. The opt-in loosens EXACTLY that one
-// case (an ABSENT check surface) and nothing else: a `fail` or `pending` check still blocks with the
-// flag on, or the key would quietly mean "ignore CI". Default false — the loosening is the adopter's
-// explicit, written decision, and the verdict says so out loud so it stays auditable in the run log.
+// `gh pr checks` reports nothing, and this verdict never passes — which in direct-merge mode means
+// the shepherd can never merge anything. The opt-in loosens EXACTLY one case and nothing else.
+//
+// DER-2774 — that "one case" was not the case it tested for. The waiver keyed on `checks == null`,
+// and `parseChecksOutput` returned null for a DEAD PROBE and for a RED CI on any repo without a job
+// named `checks`, as well as for a genuinely check-free repo. So on most adopter repos the loosening
+// an owner enabled to mean "I have no CI" silently also meant "ignore CI". The waiver now keys on the
+// VERIFIED-ABSENT answer — gh answered, and its answer was "no checks" — so `fail`, `pending` and
+// `unknown` all still block with the flag on. UNKNOWN vs ABSENT is the same distinction the gate
+// evidence above already draws, for the same reason: "there is nothing to wait for" and "I could not
+// tell" oblige the operator to do different things, and a gate that cannot say which one it means is
+// a gate operators learn to wave past. Default false — the loosening is the adopter's explicit,
+// written decision, and the verdict names it so it stays auditable in the run log.
+function checksHold(checks, allowMergeWithoutChecks) {
+  if (checks === "absent") {
+    return "checks=ABSENT (gh reports no checks on this branch — set repo.allowMergeWithoutChecks:true only if this repo genuinely has no CI)";
+  }
+  if (checks === "unknown" || checks == null || checks === "") {
+    const tail = allowMergeWithoutChecks === true
+      ? " — allowMergeWithoutChecks waives a VERIFIED-ABSENT check surface, never an unreadable probe"
+      : "";
+    return `checks=UNKNOWN (the checks probe could not be read${tail})`;
+  }
+  return `checks=${checks}`;
+}
 export function readyVerdict({ draft, threads, onHead, checks, shardsPass, shardsTotal, gate, allowMergeWithoutChecks = false } = {}) {
   if (draft !== false) return { ready: false, why: "draft" };
   if (threads !== 0) return { ready: false, why: threads == null || Number.isNaN(threads) ? "threads UNKNOWN (throttled — never treat as 0)" : `${threads} unresolved thread(s)` };
   if (!onHead) return { ready: false, why: "codex not on head" };
-  const checksAbsent = checks == null || checks === "";
-  const checksWaived = checksAbsent && allowMergeWithoutChecks === true;
-  if (checks !== "pass" && !checksWaived) return { ready: false, why: `checks=${checks ?? "UNKNOWN"}` };
+  const checksWaived = checks === "absent" && allowMergeWithoutChecks === true;
+  if (checks !== "pass" && !checksWaived) return { ready: false, why: checksHold(checks, allowMergeWithoutChecks) };
   if (shardsTotal > 0 && shardsPass !== shardsTotal) return { ready: false, why: `db shards ${shardsPass}/${shardsTotal}` };
   if (shardsPass > shardsTotal) return { ready: false, why: "INCONSISTENT shard read — re-run" };
   // DER-2603 — a caller that never COMPUTED a gate verdict must not pass either. `gate` was optional, so
@@ -1210,7 +1306,7 @@ export function readyVerdict({ draft, threads, onHead, checks, shardsPass, shard
   // throttled thread count as 0. `ready` computes this from the ledger via gateEvidenceLookup.
   if (!gate) return { ready: false, why: "gate UNKNOWN (no pre-PR review evidence was read for this PR — `ready` derives it from the run ledger; pass --run <id>)" };
   if (gate.blocks) return { ready: false, why: gate.label };
-  return { ready: true, why: checksWaived ? "all gates pass (checks UNKNOWN — WAIVED by repo.allowMergeWithoutChecks)" : "all gates pass" };
+  return { ready: true, why: checksWaived ? "all gates pass (checks ABSENT — WAIVED by repo.allowMergeWithoutChecks)" : "all gates pass" };
 }
 
 // ── Merge mode: queue vs direct (DER-2753) ──────────────────────────────────────────────────────
@@ -1253,7 +1349,20 @@ export function resolveMergeMode({ configured = null, queueDetected = null } = {
 
 // The single decision point for "what do I run to land this PR". Returns argv (for `gh`) or null.
 // `hold` with `args: null` is the fail-closed answer: with no argv there is no merge call to make.
-export function mergeAction({ mode, strategy = "squash", pr, verdict, deleteBranch = true } = {}) {
+//
+// DER-2774 — a direct merge is bound to the commit `ready` actually evaluated. `ready` prints a
+// command and a human or shepherd runs it later; every gate it checked (threads, Codex-on-head, CI,
+// gate evidence) is a statement about ONE sha, and a plain `gh pr merge <n>` lands whatever is on the
+// branch at the moment it runs. A push between the two — a lead's late commit, a kickback fix, a
+// force-push — merges a tree nothing ever gated. `--match-head-commit` makes GitHub refuse that
+// merge, which is the whole protection: the window cannot be closed by running faster.
+// `expectedHead` is therefore REQUIRED in direct mode. That cannot dead-end a caller: `ready` reads
+// it from the same `gh pr view --json headRefOid` that supplies `isDraft`, so a PR whose head is
+// unreadable already fails the draft gate and never reaches here.
+// Queue mode deliberately does NOT pass it (settled shape): the native queue re-evaluates its entry
+// against the branch it is about to merge and ejects a stale candidate itself, and `--auto` arms a
+// future merge rather than performing one, so pinning a sha there would refuse legitimate re-arms.
+export function mergeAction({ mode, strategy = "squash", pr, verdict, deleteBranch = true, expectedHead = null } = {}) {
   if (!verdict?.ready) return { action: "hold", args: null, why: verdict?.why ?? "no ready verdict — run `ready` first" };
   if (!MERGE_MODES.has(mode)) {
     return {
@@ -1270,9 +1379,22 @@ export function mergeAction({ mode, strategy = "squash", pr, verdict, deleteBran
   if (!MERGE_STRATEGIES.has(strategy)) {
     return { action: "hold", args: null, why: `repo.mergeStrategy=${JSON.stringify(strategy)} is not "squash", "merge" or "rebase" — fix .claude/work.config.json` };
   }
+  // FULL oid only (40 hex today, 64 if GitHub ever moves to SHA-256). The sole producer is
+  // `gh pr view --json headRefOid`, which is always full-length; an abbreviated sha would not match
+  // GitHub's head and would be refused at merge time, so holding here — where the harness can name
+  // the problem — beats printing a command `gh` will reject with a less useful message.
+  const head = typeof expectedHead === "string" ? expectedHead.trim() : "";
+  if (!/^([0-9a-f]{40}|[0-9a-f]{64})$/i.test(head)) {
+    return {
+      action: "hold",
+      args: null,
+      why: `direct merge needs the head sha \`ready\` evaluated (got ${expectedHead == null || expectedHead === "" ? "none" : JSON.stringify(expectedHead)}) — without --match-head-commit the merge lands whatever is on the branch when it runs, not the tree that passed the gates`,
+    };
+  }
   const args = ["pr", "merge", String(pr), `--${strategy}`];
   if (deleteBranch) args.push("--delete-branch");
-  return { action: "merge", args, why: `direct merge (${strategy}) — every readyVerdict gate passed` };
+  args.push("--match-head-commit", head);
+  return { action: "merge", args, why: `direct merge (${strategy}) bound to ${head.slice(0, 10)} — every readyVerdict gate passed` };
 }
 
 // One `ready` result → one operator/shepherd line. Extracted so the GO-AHEAD WORD is testable: the
@@ -6482,10 +6604,13 @@ export async function runSubcommand(argv) {
         const cmtRes = await runCommand({ command: "gh", args: ["api", `repos/${slug}/issues/${n}/comments`, "--paginate", "-q", `[.[]|select(.user.login=="${bot}")]|last|.body`], cwd: repoRootReady });
         const commentSha = codexCommentSha(cmtRes.stdout ?? "");
         const onHead = codexOnHead({ head: head ?? "", reviewSha, commentSha });
-        // Checks — captured ONCE (fix 3); a red resolves its run's status (fix 4).
-        const chkRes = await runCommand({ command: "gh", args: ["pr", "checks", String(n), "--repo", slug], cwd: repoRootReady });
-        const chk = parseChecksOutput(chkRes.stdout ?? "");
-        let note = "";
+        // Checks — captured ONCE (fix 3); a red resolves its run's status (fix 4). DER-2774: `--json`
+        // so the answer comes from every check's BUCKET rather than from one row's name, and the whole
+        // probe result (exit code + stderr) is handed over, because a dead probe and a check-free repo
+        // are only distinguishable there. Requires gh ≥ 2.50 (`pr checks --json`, cli/cli#9079).
+        const chkRes = await runCommand({ command: "gh", args: ["pr", "checks", String(n), "--repo", slug, "--json", "name,state,bucket,link"], cwd: repoRootReady });
+        const chk = parseChecksOutput(chkRes);
+        let note = chk.checksNote ? ` [checks: ${chk.checksNote}]` : "";
         if (chk.firstFailUrl) {
           const rid = (String(chk.firstFailUrl).match(/runs\/(\d+)/) ?? [])[1];
           if (rid) {
@@ -6510,10 +6635,13 @@ export async function runSubcommand(argv) {
           draft, threads, onHead, checks: chk.checks, shardsPass: chk.shardsPass, shardsTotal: chk.shardsTotal, gate,
           allowMergeWithoutChecks: mergePolicy.allowMergeWithoutChecks,
         });
-        const action = mergeAction({ mode: resolvedMode.mode, strategy: mergePolicy.mergeStrategy, pr: n, verdict });
+        // DER-2774: the printed direct-merge command is bound to the SAME head every gate above was
+        // evaluated against, so a push landing between `ready` and the merge is refused by GitHub
+        // rather than silently merged.
+        const action = mergeAction({ mode: resolvedMode.mode, strategy: mergePolicy.mergeStrategy, pr: n, verdict, expectedHead: head });
         results.push({ pr: n, head, draft, threads, onHead, reviewSha, commentSha, checks: chk.checks, shards: `${chk.shardsPass}/${chk.shardsTotal}`, behind, push, gate: gate.state, gateLabel: gate.label, ...verdict, note, mergeMode: resolvedMode.mode, mergeModeSource: resolvedMode.source, mergeAction: action });
       }
-      const header = `merge mode: ${resolvedMode.mode ?? "UNRESOLVED"} (${resolvedMode.source}) — ${resolvedMode.why}${mergePolicy.allowMergeWithoutChecks ? "  [repo.allowMergeWithoutChecks=true: an ABSENT check surface is waived; a red/pending check still blocks]" : ""}`;
+      const header = `merge mode: ${resolvedMode.mode ?? "UNRESOLVED"} (${resolvedMode.source}) — ${resolvedMode.why}${mergePolicy.allowMergeWithoutChecks ? "  [repo.allowMergeWithoutChecks=true: waives checks=ABSENT only (gh answered \"no checks on this branch\"); fail, pending and UNKNOWN all still block]" : ""}`;
       const text = [header, ...results.map((r) => readyLine(r))].join("\n");
       return { results, mergeMode: resolvedMode.mode, stdout: o.json ? JSON.stringify(results) : text };
     }
