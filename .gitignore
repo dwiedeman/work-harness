@@ -3,3 +3,9 @@ tmp/
 .DS_Store
 *.local.md
 work.config.json
+
+# Run-planning artifacts: written per fix-run, addressed to the orchestrator, and not part of the
+# shipped harness. Committed once by accident via `git add -A` (removed in the same-day follow-up);
+# ignored so it cannot happen again.
+ORCH-BRIEF.md
+*-fix-plan.md
