@@ -8337,3 +8337,270 @@ test("DER-2781: a leaked teardown does not BLOCK completion, but the success rec
     ],
   });
 });
+
+// ---- DER-2779: the dispatch gate must attest THIS process's own version --------------------------
+// The DER-2748 comparator only ever ran between versions ALREADY WRITTEN to a ledger, so the one host
+// whose code was about to act was the one host it never looked at. Measured on the parent commit: a
+// 9.9.9 process dispatching into a ledger whose only recorded version is 0.1.0 was NOT blocked, while
+// the identical skew with one extra heartbeat in the file WAS — which is what proves the comparator was
+// already right and only the attestation was missing.
+
+// `getHarnessVersion` reads WORK_HARNESS_VERSION on every call, so this is how a test plays a host on a
+// different build without a second checkout. Restored unconditionally: a leaked override would silently
+// re-point every later test's idea of "this build".
+async function withHarnessVersion(version, fn) {
+  const had = Object.prototype.hasOwnProperty.call(process.env, "WORK_HARNESS_VERSION");
+  const prior = process.env.WORK_HARNESS_VERSION;
+  if (version === null) delete process.env.WORK_HARNESS_VERSION;
+  else process.env.WORK_HARNESS_VERSION = version;
+  try { return await fn(); } finally {
+    if (had) process.env.WORK_HARNESS_VERSION = prior;
+    else delete process.env.WORK_HARNESS_VERSION;
+  }
+}
+
+const d2779Started = (harness_version, { source_id = "alpha:1:a1", seq = 1, id = 41 } = {}) => ({
+  ts: "2026-07-29T00:00:00.000Z", actor: "orch", type: "run_started", run_id: "R1", mode: "project",
+  schema_version: 1, event_id: d2748Id(id), source_id, seq,
+  ...(harness_version === null ? {} : { harness_version }),
+});
+
+async function d2779Run(...events) {
+  const dir = await mkdtemp(join(tmpdir(), "wr-d2779-"));
+  const runsRoot = join(dir, "runs");
+  const runDir = join(runsRoot, "R1");
+  await mkdir(runDir, { recursive: true });
+  await writeFile(join(runDir, "events.jsonl"), events.map(d2748Line).join(""), "utf8");
+  return { dir, runsRoot, runDir };
+}
+
+test("DER-2779: a WRONG-VERSION process is refused at dispatch even though the ledger records ONE version", async () => {
+  const { dir, runsRoot, runDir } = await d2779Run(d2779Started("0.1.0"));
+  const dispatch = (extra = []) => runSubcommand(["spawn-lead", "--run", "R1", "--issue", "DER-1",
+    "--runs-root", runsRoot, "--repo-root", dir, "--dry-run", ...extra]);
+  const ledgerLines = async () => (await readFile(join(runDir, "events.jsonl"), "utf8")).split("\n").filter((l) => l.trim()).length;
+  try {
+    // THE FINDING. Nothing in this ledger disagrees with itself; the disagreement is with the process
+    // holding the keyboard, and that is precisely the version about to write.
+    await withHarnessVersion("9.9.9", async () => {
+      await assert.rejects(dispatch(), (err) => {
+        assert.match(err.message, /harness version/i);
+        assert.match(err.message, /9\.9\.9/, "name the version THIS process is running");
+        assert.match(err.message, /0\.1\.0/, "and the version the run was written by");
+        assert.match(err.message, /alpha:1:a1/, "and WHERE that other version ran — a version with no host is not actionable");
+        assert.match(err.message, /THIS PROCESS/, "the operator must be able to tell which side is theirs");
+        assert.match(err.message, /--allow-version-skew/, "and how to proceed deliberately");
+        // POISON SEMANTICS, correct direction: nothing has been written yet, so this one is repairable.
+        // Claiming permanence here sends an operator hunting for damage that does not exist.
+        assert.match(err.message, /not written its version into the ledger yet/);
+        assert.doesNotMatch(err.message, /cannot be withdrawn/);
+        return true;
+      }, "a 9.9.9 checkout must not dispatch into a 0.1.0 run");
+      assert.equal(await ledgerLines(), 1, "a REFUSED dispatch writes nothing — a refusal must not be what poisons the run");
+    });
+
+    // CONTROL: the gate is not a blanket refusal. Same process version as the run ⇒ dispatch proceeds.
+    await withHarnessVersion("0.1.0", async () => {
+      const ok = await dispatch();
+      assert.match(ok.stdout, /cmux/, "a same-version dispatch must behave exactly as before");
+    });
+
+    // And the degrade is explicit, never a default.
+    await withHarnessVersion("9.9.9", async () => {
+      const forced = await dispatch(["--allow-version-skew"]);
+      assert.match(forced.stdout, /cmux/);
+    });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("DER-2779: an attestation is compared only against STAMPED recorded versions — in BOTH directions", () => {
+  const v = (evs, attestedVersion) => WR.ledgerProtocolVerdict(evs, { attestedVersion, attestedBy: "THIS PROCESS (probe:1:aa)" });
+
+  // (1) one recorded version, a different process version ⇒ refused, and the two stay separable.
+  const skewed = v([d2779Started("0.1.0")], "9.9.9");
+  assert.equal(skewed.ok, false, "this is the finding: the current process was never in the comparison");
+  assert.deepEqual(skewed.recorded_harness_versions, ["0.1.0"], "what the LEDGER says must stay readable on its own");
+  assert.deepEqual(skewed.harness_versions, ["0.1.0", "9.9.9"]);
+  assert.equal(skewed.attested_harness_version, "9.9.9");
+  assert.match(skewed.reasons.join(" "), /THIS PROCESS \(probe:1:aa\)/);
+
+  // (2) matching ⇒ ok. Without this control the gate could be a constant throw.
+  assert.equal(v([d2779Started("0.1.0")], "0.1.0").ok, true);
+
+  // (3) a ledger that makes NO claim cannot be refused by an attestation — writing a version next to a
+  // pre-stamp run_started manufactures skew rather than discovering it, and DER-2748 tolerates the
+  // legacy shape on purpose ("ABSENT ... must never block").
+  assert.equal(v([d2779Started(null)], "9.9.9").ok, true, "a pre-stamp ledger must still dispatch");
+  assert.equal(v([d2779Started("unknown")], "9.9.9").ok, true, "an explicit 'unknown' is not a claim either");
+  assert.equal(v([], "9.9.9").ok, true, "and neither is an empty ledger");
+  assert.deepEqual(v([d2779Started(null)], "9.9.9").harness_versions, ["unknown"], "the attestation is not folded in at all");
+
+  // (4) the REVERSE is NOT carved out. A process that cannot read its own VERSION, against a run that
+  // names one, is exactly the host we cannot identify — refuse it.
+  assert.equal(v([d2779Started("0.2.0")], "unknown").ok, false, "the carve-out is about the LEDGER's silence, not the process's");
+
+  // (5) no attestation ⇒ the DER-2748 verdict, unchanged.
+  const bare = WR.ledgerProtocolVerdict([d2779Started("0.1.0")]);
+  assert.equal(bare.ok, true);
+  assert.equal(bare.attested_harness_version, null);
+});
+
+test("DER-2779: read-only subcommands stay usable against a version-skewed run", async () => {
+  // VERSION_GATED_SUBCOMMANDS is dispatch-only BY DESIGN: an operator diagnosing a skewed run must still
+  // be able to read it, or the gate's own remediation instructions are unreachable.
+  const { dir, runsRoot } = await d2779Run(
+    d2779Started("0.2.0"),
+    { ts: "2026-07-29T00:01:00.000Z", actor: "orch", type: "host_heartbeat", host: "mini",
+      harness_version: "0.1.0", schema_version: 1, event_id: d2748Id(42), source_id: "beta:2:b2", seq: 1 },
+  );
+  const ro = (argv) => runSubcommand([...argv, "--run", "R1", "--runs-root", runsRoot, "--repo-root", dir]);
+  try {
+    const st = (await ro(["state"])).state;
+    assert.equal(st.protocol.ok, false, "the skew is REPORTED by the reader, not thrown at it");
+    assert.deepEqual(st.protocol.harness_versions, ["0.1.0", "0.2.0"]);
+    const wake = JSON.parse((await ro(["watch", "--since", "99", "--nudge-since", "0", "--timeout", "1"])).stdout);
+    assert.equal(wake.pending.protocol_skew, true);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("DER-2779: `state` reports the LEDGER, never its reader — so the refusal names this process itself", async () => {
+  // The split the refusal message depends on: the gate attests, the diagnostics do not. If `state` also
+  // attested, a wrong-version operator merely READING a healthy run would see protocol.ok:false and read
+  // it as corruption. That is why the throw prints this process's version instead of pointing at `state`.
+  const { dir, runsRoot } = await d2779Run(d2779Started("0.1.0"));
+  try {
+    await withHarnessVersion("9.9.9", async () => {
+      const st = (await runSubcommand(["state", "--run", "R1", "--runs-root", runsRoot, "--repo-root", dir])).state;
+      assert.equal(st.protocol.ok, true, "one recorded version is an internally consistent ledger");
+      assert.deepEqual(st.protocol.harness_versions, ["0.1.0"]);
+      await assert.rejects(
+        runSubcommand(["spawn-lead", "--run", "R1", "--issue", "DER-1", "--runs-root", runsRoot, "--repo-root", dir, "--dry-run"]),
+        /THIS process reports harness 9\.9\.9/,
+        "the refusal must carry the half of the comparison `state` cannot show",
+      );
+    });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("DER-2779: a process's FIRST write attests its version, and one write is enough to skew the run", async () => {
+  // The other half. A `watch` loop, an `append`, a `pull-host` relay from a wrong-version checkout used
+  // to fold and extend a run while declaring nothing, so the skew existed but nothing recorded it.
+  const dir = await mkdtemp(join(tmpdir(), "wr-d2779-attest-"));
+  try {
+    const version = (await readFile(new URL("../../VERSION", import.meta.url), "utf8")).trim();
+    const runsRoot = join(dir, "runs");
+    const { runId } = await runSubcommand(["init-run", "--project", "p", "--runs-root", runsRoot, "--repo-root", dir]);
+    const runDir = join(runsRoot, runId);
+    const runner = new URL("./work-runner.mjs", import.meta.url).pathname;
+    const heartbeats = async () => (await readEvents(runDir)).filter((e) => e.type === "host_heartbeat");
+
+    assert.equal((await heartbeats()).length, 0, "init-run's own run_started IS this process's attestation — never a heartbeat ahead of it");
+
+    // A SEPARATE PROCESS on a 0.1.0 build appends one ordinary event. It is never asked to attest.
+    const appendFrom = (v, n) => new Promise((res, rej) => {
+      const ch = spawn(process.execPath, [runner, "append", "--run", runId, "--runs-root", runsRoot,
+        JSON.stringify({ actor: "orch", type: "note", issue: "DER-1", n })],
+      { cwd: dir, stdio: "ignore", env: { ...process.env, WORK_HARNESS_VERSION: v } });
+      ch.on("error", rej);
+      ch.on("exit", (code) => (code === 0 ? res() : rej(new Error(`append exited ${code}`))));
+    });
+    await appendFrom("0.1.0", 1);
+
+    const hb = await heartbeats();
+    assert.equal(hb.length, 1, "the first write attests — nobody has to remember to run `heartbeat`");
+    assert.equal(hb[0].harness_version, "0.1.0", "and it is the WRITER's own reading of VERSION");
+    assert.match(String(hb[0].note ?? ""), /auto-attestation/);
+    const evs = await readEvents(runDir);
+    assert.ok(evs.findIndex((e) => e.type === "host_heartbeat") < evs.findIndex((e) => e.type === "note"),
+      "the attestation precedes the write it vouches for");
+
+    // The skew is now visible to EVERY reader, and to the gate, without anyone running `heartbeat`.
+    const st = (await runSubcommand(["state", "--run", runId, "--runs-root", runsRoot, "--repo-root", dir])).state;
+    assert.equal(st.protocol.ok, false);
+    assert.deepEqual(st.protocol.harness_versions, ["0.1.0", version].sort());
+
+    // POISON SEMANTICS, the permanent direction: the divergent claim is IN an append-only file now.
+    await assert.rejects(
+      runSubcommand(["spawn-lead", "--run", runId, "--issue", "DER-1", "--runs-root", runsRoot, "--repo-root", dir, "--dry-run"]),
+      (err) => {
+        assert.match(err.message, /cannot be withdrawn/, "append-only with no supersession — the flag is now permanent for this run");
+        assert.match(err.message, /do not delete, truncate or rewrite events\.jsonl/, "or an operator reads a conservative refusal as corruption");
+        assert.match(err.message, /--allow-version-skew/);
+        return true;
+      },
+    );
+
+    // Deduped per (run, HOST, VERSION). Per source_id would be one extra line per CLI invocation, and
+    // this runner is invoked on every poll cycle.
+    await appendFrom("0.1.0", 2);
+    assert.equal((await heartbeats()).length, 1, "a second process at the same host+version adds no fact");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("DER-2779 CONTROL: a LEGACY pre-stamp ledger is neither attested nor blocked", async () => {
+  // The tolerance DER-2748 shipped, and the one this change could most easily have deleted: attesting on
+  // every write would put "0.2.0" beside a run_started that claims nothing, and every later dispatch on
+  // a real pre-0.2.0 run would refuse.
+  const { dir, runsRoot, runDir } = await d2779Run(
+    { ts: "2026-07-20T01:00:00.000Z", run_id: "R1", actor: "orch", type: "run_started", project: "p", mode: "project" },
+  );
+  try {
+    await appendEvent(runDir, { actor: "orch", type: "note", issue: "DER-9" });
+    const evs = await readEvents(runDir);
+    assert.equal(evs.filter((e) => e.type === "host_heartbeat").length, 0,
+      "writing a version next to a ledger that claims none MANUFACTURES skew instead of discovering it");
+    assert.equal(evs.length, 2, "and the write itself still happened — attestation is an append, never a precondition");
+    await withHarnessVersion("9.9.9", async () => {
+      const ok = await runSubcommand(["spawn-lead", "--run", "R1", "--issue", "DER-1",
+        "--runs-root", runsRoot, "--repo-root", dir, "--dry-run"]);
+      assert.match(ok.stdout, /cmux/, "a legacy ledger must still dispatch, from any build");
+    });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("DER-2779: the attestation is written ONCE — under in-process concurrency, and for an unknown-version host", async () => {
+  // Two ways one extra line per write could become one extra line per EVENT, which on a run that reaches
+  // five figures of ledger lines is the difference between a fact and noise.
+  const { dir, runsRoot, runDir } = await d2779Run(d2779Started("0.1.0"));
+  const heartbeats = async () => (await readEvents(runDir)).filter((e) => e.type === "host_heartbeat");
+  try {
+    // (a) 12 appends racing inside ONE process. The memo is claimed synchronously, before the first
+    // await, or every racer sees an unattested ledger and appends its own heartbeat — and the heartbeat's
+    // own appendEvent re-enters this path, so a memo claimed too late is unbounded recursion, not one
+    // extra line.
+    await Promise.all(Array.from({ length: 12 }, (_, i) => appendEvent(runDir, { actor: "orch", type: "probe", n: i })));
+    const evs = await readEvents(runDir);
+    assert.equal(evs.filter((e) => e.type === "probe").length, 12, "no append may be lost to the attestation");
+    assert.equal((await heartbeats()).length, 1, "however many appends race, this process attests once");
+
+    // (b) A host that cannot read its own VERSION reports "unknown". It must still attest (against a
+    // ledger that names a version, it is the host we can least identify) — and its OWN prior attestation
+    // must count as already-recorded, or every CLI invocation appends another `unknown` heartbeat.
+    const runner = new URL("./work-runner.mjs", import.meta.url).pathname;
+    const appendFromUnknown = (n) => new Promise((res, rej) => {
+      const ch = spawn(process.execPath, [runner, "append", "--run", "R1", "--runs-root", runsRoot,
+        JSON.stringify({ actor: "orch", type: "note", n })],
+      { cwd: dir, stdio: "ignore", env: { ...process.env, WORK_HARNESS_VERSION: "unknown" } });
+      ch.on("error", rej);
+      ch.on("exit", (code) => (code === 0 ? res() : rej(new Error(`append exited ${code}`))));
+    });
+    await appendFromUnknown(1);
+    const unknowns = (await heartbeats()).filter((e) => e.harness_version === "unknown");
+    assert.equal(unknowns.length, 1, "an unidentifiable host must still put itself on the record");
+    await appendFromUnknown(2);
+    assert.equal((await heartbeats()).filter((e) => e.harness_version === "unknown").length, 1,
+      "and its own prior attestation counts — otherwise `unknown` grows one line per invocation forever");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
