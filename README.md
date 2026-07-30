@@ -341,6 +341,19 @@ behavior, each naming the issue that will fix it. A pin going **red means the bu
 pin; do not change the harness to satisfy it. Pins exist so that an all-green E2E is never mistaken for
 "no known defects", which is the failure this suite was written to avoid.
 
+## Security
+
+`work-harness` runs with **your** credentials — git identity, `gh` token, model accounts, shell. It is a
+control plane for work you authorized, not a sandbox around an adversary.
+
+**Supported:** supervised sessions, in repositories you trust, on plans you wrote or reviewed.
+**Not supported:** unattended operation against semi-trusted issue text, plan text, or PR content.
+
+The trust boundary is the filesystem: anything that can write the run directory can write any ledger
+event. Privileged events are shape-validated and surfaced loudly, but **authority is a documented
+convention, not authentication**. Read [`SECURITY.md`](SECURITY.md) before running this against anything
+you do not control — including how to report a vulnerability privately.
+
 ---
 
 ## License
