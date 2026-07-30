@@ -3821,14 +3821,34 @@ function heldFragmentPathFor(runDir, host) {
   return join(runDir, `${LEDGER_HELD_FILE_PREFIX}${host}${LEDGER_HELD_FILE_SUFFIX}`);
 }
 
-// One host's current hold, or null. DER-2839: the failure path needs to REPORT the hold it is preserving
-// — returning `held: null` there would launder "I did not look" into "there is nothing held" one layer
+// One host's current hold. DER-2839: the failure path needs to REPORT the hold it is preserving —
+// returning `held: null` there would launder "I did not look" into "there is nothing held" one layer
 // above the shell defect this exists to close.
+//
+// Three outcomes, deliberately distinct (Codex review of this change, #2 — the first draft collapsed the
+// last two into `null` and so reproduced the very laundering it exists to prevent, one layer up):
+//
+//   null                            no hold file — a fact, established by ENOENT
+//   { unreadable: true, … }         a hold EXISTS but cannot be vouched for (unreadable / malformed)
+//   the record                      a hold we can age
+//
+// The middle case matches `readHeldFragments`, whose header already states the rule for the whole family:
+// "FAIL-CLOSED on an unreadable/undatable record: a hold we cannot age is one we cannot vouch for, so it
+// counts as stale rather than silently disappearing."
 async function readHeldFragmentFor(runDir, host) {
+  let raw;
   try {
-    const rec = JSON.parse(await readFile(heldFragmentPathFor(runDir, host), "utf8"));
-    return rec && typeof rec === "object" && !Array.isArray(rec) ? rec : null;
-  } catch { return null; }
+    raw = await readFile(heldFragmentPathFor(runDir, host), "utf8");
+  } catch (err) {
+    // Only a genuinely ABSENT file is "no hold". A permission error or any other read failure is a hold
+    // whose state is unknown — never absence.
+    return err?.code === "ENOENT" ? null : { unreadable: true, bytes: null, first_seen_at: null, stale: true };
+  }
+  try {
+    const rec = JSON.parse(raw);
+    if (rec && typeof rec === "object" && !Array.isArray(rec)) return rec;
+  } catch { /* malformed ⇒ unreadable, below */ }
+  return { unreadable: true, bytes: null, first_seen_at: null, stale: true };
 }
 
 // `fragment: null` ⇒ nothing is held any more: the record is DELETED, which is how the signal
@@ -5846,8 +5866,14 @@ async function readCursor(runDir, host) {
 // So: no suppression and no laundering. `tail`'s exit status propagates through ssh, "I could not read
 // it" and "it was empty" become different facts — the distinction `classifyKillProbe` already draws for
 // the kill probe — and the remote's stderr survives to say WHY.
+// The path is SHELL-QUOTED (Codex review of this change, #5). `ssh host <string>` is evaluated by the
+// remote shell, and the path is built from `ledgerRoot` (config) and the run id — so an entirely valid
+// `ledgerRoot: "/Volumes/Work Ledger"` split into two operands and made every pull fail, and a
+// metacharacter in either component was interpreted remotely. Pre-existing on main, but this builder is
+// now the only place that constructs it, so it is the only place that has to be right. `cursor` is
+// arithmetic on a parsed integer and is not interpolated as text.
 function remoteLedgerTailCommand(remotePath, cursor) {
-  return `tail -n +${cursor + 1} ${remotePath}`;
+  return `tail -n +${cursor + 1} ${shellQuote(String(remotePath))}`;
 }
 
 async function pullHostInto(runDir, hostName, runId) {
@@ -5867,7 +5893,11 @@ async function pullHostInto(runDir, hostName, runId) {
     const why = String(res.stderr ?? "").trim().split("\n").filter(Boolean).pop() || `exit ${res.exitCode}`;
     return {
       host: hostName, pulled: 0, quarantined: 0, cursor,
-      held: held ? { bytes: held.bytes, first_seen_at: held.first_seen_at } : null,
+      // `unreadable` rides along when the hold exists but could not be vouched for — the same fail-closed
+      // shape `readHeldFragments` reports, rather than a `null` that would read as "nothing held".
+      held: held
+        ? { bytes: held.bytes ?? null, first_seen_at: held.first_seen_at ?? null, ...(held.unreadable ? { unreadable: true, stale: true } : {}) }
+        : null,
       pull_failed: true, pull_error: why,
     };
   }
@@ -8329,10 +8359,28 @@ export async function runSubcommand(argv) {
       const PULL_INTERVAL_MS = 45000;
       const started = Date.now();
       let lastSideEffect = 0; // 0 ⇒ run pull/reconcile immediately on entry, then every ~45s
+      // DER-2839 (Codex review of that change, #1): `pullHostInto` now REPORTS a failed remote read, and
+      // this loop is its primary automatic consumer. Discarding the result — as it did — meant a mini
+      // whose ledger is permanently unreadable stopped ingesting events indefinitely while the operator
+      // saw routine watch output: the failure signal the fix introduced, silently thrown away by the one
+      // caller that runs unattended.
+      //
+      // Latched per host and cleared by the next SUCCESSFUL pull, so it re-surfaces on every wake until
+      // it is actually fixed — the same treatment as spawn_failures/gate_missing. Reported, never fatal:
+      // the pre-start window before a remote host first writes its ledger is a legitimate failure, and
+      // making it fatal would wedge the mini lane on a routine race.
+      const pullFailures = new Map();
       for (;;) {
         if ((pullHostNames.length || reconcileMerged || reconcilePrEvents) && Date.now() - lastSideEffect >= PULL_INTERVAL_MS) {
           for (const h of pullHostNames) {
-            try { await pullHostInto(runDir, h, o.runId); } catch { /* mini best-effort; next cycle retries */ }
+            try {
+              const pulled = await pullHostInto(runDir, h, o.runId);
+              if (pulled?.pull_failed) pullFailures.set(h, pulled.pull_error || `exit ${pulled.exitCode ?? "?"}`);
+              else pullFailures.delete(h);
+            } catch (err) {
+              // A throw is also "the pull did not happen" — it must not be quieter than a nonzero exit.
+              pullFailures.set(h, String(err?.message ?? err));
+            }
           }
           if (reconcileMerged) {
             try { await reconcileMergedInto(runDir, o.runId, repoRoot); } catch { /* gh best-effort */ }
@@ -8370,6 +8418,11 @@ export async function runSubcommand(argv) {
               // as healthy in-flight work. Role failures (no issue) appear as "shepherd"/"orch".
               spawn_failures: (st.spawn_failures ?? []).map((f) => f.issue ?? f.role),
               reap_failures: (st.reap_failures ?? []).map((f) => f.issue),
+              // DER-2839: hosts whose remote ledger could not be READ this cycle — missing, unreadable, or
+              // an ssh failure. Distinct from `held_fragment_stale` (a tail stuck MID-LINE, where the read
+              // succeeded) because the remedy differs: nothing here has been ingested at all. Carries the
+              // remote's own stderr, so the operator gets the reason and not just the fact.
+              pull_failed: [...pullFailures].map(([host, why]) => ({ host, why })),
               // DER-2744: in-flight lanes whose transcript persistence was never proven. Every
               // transcript-reading instrument is blind for these, and a blind lane looks exactly like a
               // dead one — so it belongs next to leads_dead, not in a report nobody runs.

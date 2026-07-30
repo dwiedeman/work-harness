@@ -50,6 +50,32 @@ would otherwise conclude the file had drifted.
   for the stale dry-run preview; the empty-but-successful control passed on the parent and still passes,
   which is what stops the fix from being "call every pull a failure" — a change that would wedge the mini
   lane while looking like a security improvement.
+  **Five findings from the Codex review of this change were fixed on the branch**, four of which are the
+  same defect class the change is about, reappearing at layers the fix had not yet reached — recorded
+  because "I fixed the laundering" was only true of the shell:
+  (1) *P1* — `watch --pull-hosts` is the pull's only UNATTENDED consumer and it `await`ed the result and
+  threw it away, so a mini whose ledger is permanently unreadable stopped ingesting events indefinitely
+  while the operator saw routine watch output. Failures now latch per host, clear on the next successful
+  pull, and re-surface on every wake as `pending.pull_failed` (host + the remote's own reason) — the same
+  treatment as `spawn_failures`. Reported, never fatal: the pre-start window before a host first writes
+  its ledger is a legitimate failure and making it fatal would wedge the lane on a routine race.
+  (2) The new single-host hold reader returned `null` for a hold that EXISTS but is unreadable — the
+  identical "I did not look" → "there is nothing there" collapse, one layer above the shell, and in
+  direct disagreement with its own sibling `readHeldFragments`, whose header already states the family
+  rule ("a hold we cannot age is one we cannot vouch for, so it counts as stale rather than silently
+  disappearing"). It now distinguishes ENOENT (no hold) from unreadable/malformed (`unreadable: true`,
+  `stale: true`).
+  (3) The failure tests asserted the on-disk state but not the RESPONSE CONTRACT, so an implementation
+  that kept the hold on disk while reporting `held: null` with no reason passed them — the two behaviors
+  this entry claims. Both are now pinned, including that `pull_error` describes the actual failure.
+  (4) The dry-run test asserted only that the preview LACKED `|| true`, which stays green if production
+  drifts to a different path or cursor — the whole failure mode a preview has. It now captures what the
+  ssh stub was actually handed and compares. (Writing it surfaced a real ordering constraint: a
+  successful pull advances the cursor, so preview and execution are only comparable at the same cursor.)
+  (5) *Pre-existing on `main`, closed here because the new builder is now the only site that constructs
+  the path*: the remote path was unquoted, so a valid `ledgerRoot: "/Volumes/Work Ledger"` split into two
+  operands and failed every pull, and a metacharacter in `ledgerRoot` or the run id was interpreted by
+  the remote shell.
   **Repo-wide sweep** (the acceptance criterion): two `|| true` sites remain in command construction and
   both were verified fail-closed against their masked paths rather than reasoned about. `install.sh:41`
   masks a *display* grep of the suite summary — load-bearing under the file's `set -euo pipefail`, and
