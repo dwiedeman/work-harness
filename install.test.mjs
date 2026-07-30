@@ -11,7 +11,7 @@
 // script — that is the point.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, writeFile, copyFile, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, copyFile, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -25,7 +25,7 @@ const RED = 'import { test } from "node:test";\nimport assert from "node:assert/
 // A fixture SRC tree shaped the way install.sh expects: its `find` line names every skill dir and the
 // hook, and under `set -euo pipefail` a missing path is fatal — so the fixture ships them all, and a
 // failure here is about the self-test, not about a missing fixture file.
-async function fixture({ runner = GREEN, metrics = GREEN, prep = GREEN, telemetry = GREEN, hook = GREEN } = {}) {
+async function fixture({ runner = GREEN, metrics = GREEN, prep = GREEN, telemetry = GREEN, hook = GREEN, version = "9.9.9\n" } = {}) {
   const dir = await mkdtemp(join(tmpdir(), "wh-install-"));
   const src = join(dir, "src");
   for (const d of ["skills/work", "skills/work-lead", "skills/work-shepherd", "skills/prep-for-work", "hooks"]) {
@@ -42,6 +42,9 @@ async function fixture({ runner = GREEN, metrics = GREEN, prep = GREEN, telemetr
   await writeFile(join(src, "skills/work-lead/SKILL.md"), "# lead\n", "utf8");
   await writeFile(join(src, "skills/work-shepherd/SKILL.md"), "# shepherd\n", "utf8");
   await writeFile(join(src, "hooks/context-wrap-nudge.mjs"), "// hook\n", "utf8");
+  // VERSION is shipped, not just repo metadata — the runner reads it from `<skillsDir>/../../VERSION`,
+  // which is `$DEST/VERSION` once installed (DER-2748). `version: null` models a broken source tree.
+  if (version !== null) await writeFile(join(src, "VERSION"), version, "utf8");
   return { dir, src, dest: join(dir, "claude-home") };
 }
 
@@ -121,6 +124,45 @@ test("install.sh: a red session-end-telemetry suite fails the install", async ()
     assert.match(r.out, /session-end-telemetry|skills\/work/, "the installer must say WHICH suite failed");
   } finally {
     await rm(f.dir, { recursive: true, force: true });
+  }
+});
+
+test("install.sh: VERSION is shipped into the destination, and a source tree without it is refused", async () => {
+  // Two installed hosts that both report `harness_version: "unknown"` look same-version to each other,
+  // which is exactly the skew DER-2748's check exists to catch — so a missing VERSION fails the install
+  // rather than installing something that cannot describe itself.
+  const ok = await fixture();
+  try {
+    const r = await runInstall(ok);
+    assert.equal(r.code, 0, r.out);
+    assert.equal((await readFile(join(ok.dest, "VERSION"), "utf8")).trim(), "9.9.9", "VERSION must land in $DEST");
+  } finally {
+    await rm(ok.dir, { recursive: true, force: true });
+  }
+  const broken = await fixture({ version: null });
+  try {
+    const r = await runInstall(broken);
+    assert.notEqual(r.code, 0, `a source tree with no VERSION must be refused\n${r.out}`);
+    assert.match(r.out, /VERSION is missing/);
+  } finally {
+    await rm(broken.dir, { recursive: true, force: true });
+  }
+});
+
+test("install.sh: a REAL install of this repo succeeds — catches repo-vs-installed layout drift", async () => {
+  // The fixture tests above use synthetic suites, so they structurally CANNOT catch a file the runner
+  // needs at runtime that install.sh fails to copy. That is how the VERSION gap survived: the suite
+  // passed in the checkout and failed only from ~/.claude, which is the copy that actually runs. This
+  // test installs the real repo into a temp CLAUDE_HOME and runs the real suites there.
+  const dest = await mkdtemp(join(tmpdir(), "wh-realinstall-"));
+  try {
+    const r = await runInstall({ src: REPO, dest });
+    assert.equal(r.code, 0, `a real install of this repo must succeed\n${r.out.slice(-4000)}`);
+    for (const rel of ["VERSION", "skills/work/work-runner.mjs", "skills/work/session-token-report.mjs", "hooks/context-wrap-nudge.mjs"]) {
+      await readFile(join(dest, rel)); // throws if install.sh didn't ship it
+    }
+  } finally {
+    await rm(dest, { recursive: true, force: true });
   }
 });
 
