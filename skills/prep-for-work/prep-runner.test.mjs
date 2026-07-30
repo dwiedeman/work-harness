@@ -1008,6 +1008,219 @@ test("CLI query-check: refuses an injected query WITHOUT executing it", async ()
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
+// ---- evidence-query EXIT STATUS + numeric output (DER-2783) ----
+//
+// The gate asked one question ("how many non-empty lines?") where there are two, and got both wrong ends
+// of the same defect. Every test below is written against symbols that exist on BOTH sides of this change
+// (runSubcommand, validatePlan, evaluateQueryOutput) so each one can be run on the parent commit and
+// fail with an ASSERTION rather than a module-load error — a test that only errors proves nothing.
+
+test("evaluateQueryOutput: numeric mode reads the number, and ONLY when stdout is one bare integer (DER-2783)", () => {
+  // `grep -c` prints ONE line whatever the count, so line-counting made expectAtLeast >= 2 unsatisfiable
+  // at any number of matches — while SKILL.md documents exactly that shape with a floor of 6.
+  assert.deepEqual(evaluateQueryOutput("5\n", 5, { numeric: true }), { count: 5, ok: true });
+  assert.deepEqual(evaluateQueryOutput("500\n", 6, { numeric: true }), { count: 500, ok: true });
+  // BSD `wc -l` right-aligns its number in a padded field. Without the trim, numeric mode would be dead
+  // on macOS for the command most likely to want it — a mode that cannot fire is not a mode.
+  assert.deepEqual(evaluateQueryOutput("       5\n", 5, { numeric: true }), { count: 5, ok: true });
+  // The bare-integer guard is the second half of the rule: `grep -c` over MULTIPLE files emits
+  // `path:count` lines — a per-file breakdown that must fall back to line counting, never read as 5.
+  assert.deepEqual(evaluateQueryOutput("a.txt:3\nb.txt:2\n", 3, { numeric: true }), { count: 2, ok: false });
+  assert.deepEqual(evaluateQueryOutput("a\nb\nc\n", 3, { numeric: true }), { count: 3, ok: true });
+  // CONTROLS — default (non-numeric) behaviour is untouched, including the fail-closed empty cases.
+  assert.deepEqual(evaluateQueryOutput("5\n", 5), { count: 1, ok: false });
+  assert.deepEqual(evaluateQueryOutput("", 1, { numeric: true }), { count: 0, ok: false });
+  assert.deepEqual(evaluateQueryOutput(null, 1, { numeric: true }), { count: 0, ok: false });
+  assert.deepEqual(evaluateQueryOutput("-3\n", 1, { numeric: true }), { count: 1, ok: true }, "a negative is not a count — it is one line of output");
+});
+
+test("validatePlan: a run that FAILED cannot be honoured, even when its stamped count clears the floor (DER-2783)", () => {
+  const base = { name: "recurrence", query: "git log --oneline --since=2026-07-01 | grep -c 'fix('", window: "the 6 cited commits", expectAtLeast: 6 };
+  // The count says 6 and the floor is 6 — and the run exited nonzero, so that 6 measures nothing. The
+  // failed marker has to reach validate's DECISION, not merely sit in the stamp.
+  const failed = validatePlan(goodPlan([goodIssue({ evidenceQueries: [{ ...base, observed: { count: 6, failed: true } }] })]));
+  assert.equal(failed.ok, false, "a query whose last run failed is not evidence, whatever number it stamped");
+  assert.match(failed.errors.join("\n"), /run FAILED/);
+  assert.match(failed.errors.join("\n"), /query-check --record/);
+  // Plan-level queries gate identically — the two loops share one helper and must not drift.
+  const planLevel = validatePlan(goodPlan([goodIssue()], { evidenceQueries: [{ ...base, observed: { count: 6, failed: true } }] }));
+  assert.equal(planLevel.ok, false);
+  assert.match(planLevel.errors.join("\n"), /run FAILED/);
+  // CONTROLS — an explicit clean run passes, and a plan stamped before this field existed (no `failed`
+  // key at all) is still honoured on its count, exactly as it was.
+  assert.equal(validatePlan(goodPlan([goodIssue({ evidenceQueries: [{ ...base, observed: { count: 6, failed: false } }] })])).ok, true);
+  assert.equal(validatePlan(goodPlan([goodIssue({ evidenceQueries: [{ ...base, observed: { count: 6 } }] })])).ok, true);
+});
+
+test("CLI query-check: output alone is NOT a pass — a nonzero exit is a failed run (DER-2783)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "prep-exit-"));
+  try {
+    const planPath = join(dir, "plan.json");
+    // Three lines of output and exit 1. spawnSync sets `run.error` only when the shell cannot be
+    // SPAWNED, so the old gate saw a clean run, counted 3 and stamped `ok`.
+    const q = { name: "cited commits", query: `printf 'a\\nb\\nc\\n' ; false`, window: "the 3 commits the plan cites", expectAtLeast: 3 };
+    await writeFile(planPath, JSON.stringify(goodPlan([goodIssue({ evidenceQueries: [q] })])), "utf8");
+    const res = await runSubcommand(["query-check", planPath, "--repo-root", dir, "--record"]);
+    assert.equal(res.exitCode, 1, res.stdout);
+    assert.match(res.stdout, /exited 1/);
+    assert.match(res.stdout, /FAILED run, not a count/);
+    assert.doesNotMatch(res.stdout, /^ok {3}/m, "a failed run must never print the ok line");
+    // …and the stamp carries the failure through to validate, which must refuse it rather than read the
+    // fail-closed 0 as a measurement.
+    const { readFile } = await import("node:fs/promises");
+    const saved = JSON.parse(await readFile(planPath, "utf8"));
+    assert.equal(saved.issues[0].evidenceQueries[0].observed.failed, true);
+    assert.equal(saved.issues[0].evidenceQueries[0].observed.count, 0);
+    const validated = await runSubcommand(["validate", planPath]);
+    assert.equal(validated.exitCode, 1, validated.stdout);
+    assert.match(validated.stdout, /run FAILED/);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("CLI query-check: the canonical `git log … | grep -c` with ZERO matches must not read as ok 1 ≥ 1 (DER-2783)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "prep-zero-"));
+  try {
+    const { spawnSync } = await import("node:child_process");
+    const git = (...args) => {
+      const r = spawnSync("git", args, { cwd: dir, encoding: "utf8" });
+      assert.equal(r.status, 0, `git ${args.join(" ")} failed: ${r.stderr ?? r.error?.message}`);
+    };
+    git("init", "-q", "-b", "main");
+    git("-c", "user.email=t@example.invalid", "-c", "user.name=T", "-c", "commit.gpgsign=false",
+      "commit", "-q", "--allow-empty", "-m", "chore: seed");
+    const planPath = join(dir, "plan.json");
+    // THE motivating shape, verbatim from SKILL.md, against a history with no `fix(` commits: grep -c
+    // prints "0" and exits 1. One non-empty line — the old gate reported `ok 1 ≥ 1`, i.e. a kill
+    // criterion returning zero would have auto-selected "delete the tool" while the problem recurred.
+    const q = { name: "recurrence", query: `git log --oneline --since=2000-01-01 | grep -c 'fix('`, window: "the whole seeded history", expectAtLeast: 1 };
+    await writeFile(planPath, JSON.stringify(goodPlan([goodIssue({ evidenceQueries: [q] })])), "utf8");
+    const res = await runSubcommand(["query-check", planPath, "--repo-root", dir]);
+    assert.equal(res.exitCode, 1, res.stdout);
+    assert.match(res.stdout, /exited 1/);
+    assert.doesNotMatch(res.stdout, /1 ≥ 1/, "the string '0' is not one match — the run failed");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("CLI query-check: a `grep -c`-terminated pipeline counts by NUMBER, not by line (DER-2783)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "prep-numeric-"));
+  try {
+    const planPath = join(dir, "plan.json");
+    // Five matches, printed as the single line "5". Before numeric mode this floor was UNSATISFIABLE —
+    // 5 matches and 500 matches both counted 1 — while SKILL.md tells operators to write exactly this.
+    const q = { name: "fix commits", query: `printf 'fix(a)\\nfix(b)\\nfix(c)\\nfix(d)\\nfix(e)\\n' | grep -c 'fix('`, window: "the 5 cited commits", expectAtLeast: 5 };
+    await writeFile(planPath, JSON.stringify(goodPlan([goodIssue({ evidenceQueries: [q] })])), "utf8");
+    const res = await runSubcommand(["query-check", planPath, "--repo-root", dir, "--record"]);
+    assert.equal(res.exitCode, 0, res.stdout);
+    assert.match(res.stdout, /5 ≥ 5/);
+    const { readFile } = await import("node:fs/promises");
+    const saved = JSON.parse(await readFile(planPath, "utf8"));
+    assert.equal(saved.issues[0].evidenceQueries[0].observed.count, 5);
+    assert.equal(saved.issues[0].evidenceQueries[0].observed.failed, false);
+    assert.equal((await runSubcommand(["validate", planPath])).exitCode, 0);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("CLI query-check: `grep -c` over MULTIPLE files is a per-file breakdown, not a count (DER-2783)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "prep-multifile-"));
+  try {
+    await writeFile(join(dir, "a.txt"), "x\nx\nx\n", "utf8");
+    await writeFile(join(dir, "b.txt"), "x\nx\n", "utf8");
+    const planPath = join(dir, "plan.json");
+    // stdout is "a.txt:3\nb.txt:2" — 5 matches, but the OUTPUT is two lines and no bare integer. Numeric
+    // mode must decline it; reading the first number, or summing, would be inventing a total grep never
+    // reported. Fail-closed at 2 is the correct answer, and the message must say 2.
+    const q = { name: "x matches", query: `grep -c 'x' a.txt b.txt`, window: "5 matches across 2 files", expectAtLeast: 3 };
+    await writeFile(planPath, JSON.stringify(goodPlan([goodIssue({ evidenceQueries: [q] })])), "utf8");
+    const res = await runSubcommand(["query-check", planPath, "--repo-root", dir]);
+    assert.equal(res.exitCode, 1, res.stdout);
+    assert.match(res.stdout, /returned 2 < 3/);
+    assert.doesNotMatch(res.stdout, /returned 5|returned 3 </);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("CLI query-check: numeric mode needs a PIPE — a `;`-joined trailing `wc -l` counted nothing upstream (DER-2783)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "prep-sep-"));
+  try {
+    await writeFile(join(dir, "five.txt"), "1\n2\n3\n4\n5\n", "utf8");
+    const planPath = join(dir, "plan.json");
+    const run = async (query, expectAtLeast) => {
+      await writeFile(planPath, JSON.stringify(goodPlan([goodIssue({ evidenceQueries: [{ name: "lines", query, window: "five.txt", expectAtLeast }] })])), "utf8");
+      return runSubcommand(["query-check", planPath, "--repo-root", dir]);
+    };
+    // `;` is not a pipe: this `wc -l` counted five.txt, NOT what `true` produced, so its 5 is not this
+    // query's answer. Fail-closed to line counting — 1 line — rather than credit an unrelated number.
+    const semi = await run(`true ; wc -l < five.txt`, 5);
+    assert.equal(semi.exitCode, 1, semi.stdout);
+    assert.match(semi.stdout, /returned 1 < 5/);
+    // CONTROL — the same trailing stage reached by a PIPE is the query's answer.
+    const piped = await run(`cat five.txt | wc -l`, 5);
+    assert.equal(piped.exitCode, 0, piped.stdout);
+    assert.match(piped.stdout, /5 ≥ 5/);
+    // CONTROL — a one-stage counting query (separator null: there is no upstream it could have missed)
+    // is numeric too. This is the deliberate widening beyond "reached by a pipe": SKILL.md's own control
+    // list carries `rg -c 'evidenceQueries' <file>` and `wc -l < README.md`, and without this clause
+    // those keep the unsatisfiable-floor defect this issue exists to remove.
+    const alone = await run(`wc -l < five.txt`, 5);
+    assert.equal(alone.exitCode, 0, alone.stdout);
+    assert.match(alone.stdout, /5 ≥ 5/);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+// THE TRAP this change had to walk past: `priorart-check`'s sweep() uses the SAME `run.error` idiom, and
+// there it is CORRECT — grep exiting 1 on no-match is its normal signal. A blanket status-0 rule would
+// fire the rg→grep fallback on every clean sweep and then hard-fail with "needs ripgrep". This control
+// exists so a future reader cannot "finish the family" by mistake: the family has one member.
+test("CLI priorart-check: sweep() still reads grep's exit-1-on-no-match as EMPTY, not as a failure (DER-2783)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "prep-sweep-"));
+  try {
+    const planPath = join(dir, "plan.json");
+    await writeFile(planPath, JSON.stringify(goodPlan([goodIssue({ priorArt: undefined, notes: "add a `zzqqxx-no-such-term` detector" })])), "utf8");
+    const res = await runSubcommand(["priorart-check", planPath, "--repo-root", dir, "--record"]);
+    assert.equal(res.exitCode, 0, res.stdout);
+    assert.match(res.stdout, /no prior art found/);
+    assert.doesNotMatch(res.stdout, /needs ripgrep/, "a clean sweep is an empty result, not a broken engine");
+    const { readFile } = await import("node:fs/promises");
+    const saved = JSON.parse(await readFile(planPath, "utf8"));
+    assert.deepEqual(saved.issues[0].priorArt.candidates, []);
+    assert.ok(saved.issues[0].priorArt.terms.includes("zzqqxx-no-such-term"));
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+// Direct coverage of the two new predicates. Imported dynamically rather than at the top of this file on
+// purpose: a static import of a symbol the parent commit does not export fails the whole MODULE, which
+// would have turned every must-fail above into an unusable load error.
+test("queryCountsNumerically / evaluateQueryRun: the LAST stage decides, and only off the shared parse (DER-2783)", async () => {
+  const { queryCountsNumerically, evaluateQueryRun } = await import("./prep-runner.mjs");
+  const yes = (q) => assert.equal(queryCountsNumerically(q), true, `should count numerically: ${q}`);
+  const no = (q) => assert.equal(queryCountsNumerically(q), false, `must NOT count numerically: ${q}`);
+  yes(`git log --oneline --since=2026-07-01 | grep -c 'fix('`);
+  yes(`git log --oneline | grep --count 'fix('`);
+  yes(`git log --oneline | grep -rc 'fix('`);              // the flag inside a short cluster
+  yes(`rg -n 'x' . | wc -l`);
+  yes(`rg -c 'evidenceQueries' skills/prep-for-work/prep-runner.mjs`); // one stage, no upstream to miss
+  yes(`wc -l < README.md`);                                 // redirect target is not a word — still `wc -l`
+  no(`git log --oneline ; wc -l`);                          // `;` — counted nothing upstream
+  no(`git log --oneline && wc -l`);
+  no(`rg -c 'x' skills || grep -rc 'x' skills`);            // `||` — the LAST stage is the one that ran
+  no(`git log --oneline | grep -C 2 'fix('`);               // -C is context, not --count (case matters)
+  no(`printf 'x\n' | wc`);                                  // wc with no -l prints three numbers
+  no(`printf 'x\n' | grep -- -c`);                          // after `--` it is an operand, not a flag
+  no(`git log --oneline`);
+  no(`git log --oneline | head -3`);
+  // A query the validator REFUSES still parses, and an unlexable one yields no stages at all — neither
+  // may throw here, because this predicate runs on whatever the plan file happened to contain.
+  no(`grep 'unterminated`);
+  no(null);
+  no("   ");
+  no(`$(echo grep) -c x`);                                  // expansion-built name is never a command
+  // evaluateQueryRun is the seam the CLI uses: status first, then the output, never the reverse.
+  assert.equal(evaluateQueryRun({ status: 1, stdout: "a\nb\nc\n" }, 3, "printf x ; false").failed, true);
+  assert.equal(evaluateQueryRun({ status: null, signal: "SIGTERM", stdout: "" }, 1, "x").failed, true);
+  assert.match(evaluateQueryRun({ status: null, signal: "SIGTERM" }, 1, "x").failure, /killed by SIGTERM/);
+  assert.equal(evaluateQueryRun({ error: new Error("boom"), status: null }, 1, "x").failed, true);
+  assert.deepEqual(evaluateQueryRun({ status: 0, stdout: "5\n" }, 5, `printf 'q\n' | grep -c q`), { count: 5, ok: true, failed: false, failure: null });
+});
+
 test("classifySymbol: exported, renamed, private and absent symbols", () => {
   const src = [
     "export async function pub() {}",
