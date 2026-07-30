@@ -4486,14 +4486,85 @@ export function bracketEscapePattern(pattern) {
   return s;
 }
 
+// --- The pattern itself is the dangerous value ------------------------------------------------------
+//
+// This string is the sole argument to `pkill -f` on a remote host. `pkill -f ''` matches EVERY process
+// there, and a one-character pattern matches most of them — a degenerate pattern does not fail, it kills
+// the machine. Callers interpolate `${ledgerRoot}/${runId}/briefs/${issueId}`, and none of those three
+// components is validated anywhere upstream: an empty `ledgerRoot` in `work.config.json`, a `--run` the
+// caller forgot to pass, or a future change to the interpolation is each one edit away from producing
+// `/briefs/` or worse. This floor is not defending against today's code — it makes the worst outcome in
+// this file unreachable regardless of what upstream does.
+//
+// The bracket escape is also NOT self-sufficient at these sizes, which is the second reason for a length
+// floor: `bracketEscapePattern("a")` is `[a]`, and the string `[a]` CONTAINS `a`, so the probe
+// self-matches again. The escape only holds once the pattern is longer than its own bracketed form — a
+// `/briefs/<id>` path always is.
+export const KILL_PATTERN_MIN_LENGTH = 12;
+const KILL_PATTERN_REQUIRED_SEGMENT = "/briefs/";
+
+export function assertKillPattern(pattern) {
+  const p = String(pattern ?? "");
+  const why = (reason) =>
+    new Error(
+      `refusing to build a process-kill on an unsafe pattern (${reason}): ${JSON.stringify(p)}. ` +
+        "This value is passed straight to `pkill -f` on a remote host, where an empty or degenerate " +
+        `pattern matches EVERY process. A lead-kill pattern must contain "${KILL_PATTERN_REQUIRED_SEGMENT}" ` +
+        `and be at least ${KILL_PATTERN_MIN_LENGTH} characters. Fix the caller (an empty ledgerRoot, run ` +
+        "id, or issue id upstream) — never widen this check.",
+    );
+  if (!p.trim()) throw why("empty");
+  if (p.length < KILL_PATTERN_MIN_LENGTH) throw why(`shorter than the ${KILL_PATTERN_MIN_LENGTH}-character floor`);
+  if (!p.includes(KILL_PATTERN_REQUIRED_SEGMENT)) throw why(`missing the "${KILL_PATTERN_REQUIRED_SEGMENT}" segment`);
+  // A newline would read as a separate line of the composed shell command should this value ever reach an
+  // unquoted context; a NUL cannot survive argv at all. Neither appears in a legitimate brief path, so
+  // both are caller bugs rather than inputs to sanitize.
+  if (/[\0\n\r]/.test(p)) throw why("contains a newline or NUL");
+  return p;
+}
+
+// The ONE place a lead's brief-path kill/probe pattern is built. Four call sites in two shapes used to
+// interpolate it by hand, which is exactly how a component goes empty with nothing noticing. Validating
+// at CONSTRUCTION means the unsafe value never exists, rather than being caught just before the shell.
+export function leadBriefPattern({ runDir, issueId } = {}) {
+  const dir = String(runDir ?? "").trim().replace(/\/+$/, "");
+  const id = String(issueId ?? "").trim();
+  if (!dir) throw new Error("leadBriefPattern: empty run dir — refusing to build a kill pattern (see assertKillPattern)");
+  if (!id) throw new Error("leadBriefPattern: empty issue id — refusing to build a kill pattern (see assertKillPattern)");
+  if (/\s/.test(id)) throw new Error(`leadBriefPattern: issue id ${JSON.stringify(id)} contains whitespace — that is not an issue id`);
+  // The length floor cannot catch a MISSING component that is long enough to look fine: a host config
+  // with no `ledgerRoot` interpolates to the literal "undefined", and `undefined/r1/briefs/DER-1` clears
+  // every check above while matching no process at all — a kill that reports a clean receipt for a lead
+  // it never touched. Only a stringified missing value produces these segments; no real path has one.
+  //
+  // Tested against the ASSEMBLED pattern, not against `dir` alone. `issueId` reaches the same shell by the
+  // same route and fails the same way — `/root/r1/briefs/undefined` clears the floor, carries `/briefs/`,
+  // matches nothing, and reports the same false clean kill — and it is the likelier of the two to go
+  // missing, since an issue id is per-call while `ledgerRoot` is configured once. Checking one component
+  // and not its sibling is how this class survives a fix.
+  const pattern = `${dir}${KILL_PATTERN_REQUIRED_SEGMENT}${id}`;
+  if (/(^|\/)(undefined|null)(\/|$)/.test(pattern)) {
+    throw new Error(
+      `leadBriefPattern: ${JSON.stringify(pattern)} contains an "undefined"/"null" path segment — a missing ` +
+        "config value (a host's `ledgerRoot`, an absent --run, or an unresolved issue id) was stringified " +
+        "into it. The resulting pattern would match nothing and report a CLEAN kill for a lead it never touched.",
+    );
+  }
+  return assertKillPattern(pattern);
+}
+
+// The presence half on its own. `lead-context`'s liveness probe is exactly this minus the kill, and it
+// used to hand-roll the identical string — sharing it means the two cannot drift into escaping
+// differently, and it gives the live pgrep test a production binding for the probe-only case.
+export function presenceProbeCommand(pattern) {
+  return `pgrep -f ${shellQuote(bracketEscapePattern(assertKillPattern(pattern)))} >/dev/null 2>&1; echo RC=$?`;
+}
+
 // One ssh round trip: kill, settle, then ASK whether it is still there. `echo RC=$?` is what makes the
 // answer readable — `pgrep` alone would only set an exit status that the trailing `echo` overwrites.
 export function remoteKillProbeCommand(pattern) {
-  // `pkill -f ''` matches EVERY process on the host. Nothing should ever call this with an empty
-  // pattern, which is exactly why an empty one has to be a loud bug and not a silent shell command.
-  if (!String(pattern ?? "").trim()) throw new Error("remoteKillProbeCommand: refusing to build a kill on an EMPTY pattern — `pkill -f ''` matches every process on the host");
-  const p = shellQuote(bracketEscapePattern(pattern));
-  return `pkill -f ${p} >/dev/null 2>&1; sleep 1; pgrep -f ${p} >/dev/null 2>&1; echo RC=$?`;
+  const p = shellQuote(bracketEscapePattern(assertKillPattern(pattern)));
+  return `pkill -f ${p} >/dev/null 2>&1; sleep 1; ${presenceProbeCommand(pattern)}`;
 }
 
 // The verdict, from the composite output of the chain above. Deliberately three-valued and fail-closed:
@@ -5745,7 +5816,7 @@ export async function runSubcommand(argv) {
             // branch only runs when a PREDECESSOR was recorded, and we are about to spawn its replacement
             // onto the same worktree. `pkill …; true` let an unkilled predecessor survive into a second
             // live lead. Refusing here is recoverable (retry the spawn); two writers are not.
-            const briefMatch = `${remoteHost.ledgerRoot}/${o.runId}/briefs/${o.issueId}`;
+            const briefMatch = leadBriefPattern({ runDir: `${remoteHost.ledgerRoot}/${o.runId}`, issueId: o.issueId });
             const probe = classifyKillProbe(await runCommand({ command: "ssh", args: [remoteHost.ssh, remoteKillProbeCommand(briefMatch)] }));
             if (probe !== "killed") {
               throw new Error(
@@ -6211,8 +6282,8 @@ export async function runSubcommand(argv) {
           // "alive" for EVERY lead on a procps host — the shell ssh spawned carries the pattern in its
           // own cmdline and procps pgrep excludes only itself, so the probe matched itself. That reads as
           // universal health, which is the direction that keeps a dead lead invisible.
-          const pat = `${hostCfg.ledgerRoot}/${o.runId}/briefs/${issue}`;
-          const res = await runCommand({ command: "ssh", args: [hostCfg.ssh, `pgrep -f ${shellQuote(bracketEscapePattern(pat))} >/dev/null 2>&1; echo RC=$?`] });
+          const pat = leadBriefPattern({ runDir: `${hostCfg.ledgerRoot}/${o.runId}`, issueId: issue });
+          const res = await runCommand({ command: "ssh", args: [hostCfg.ssh, presenceProbeCommand(pat)] });
           // classifyKillProbe's verdicts map 1:1 onto this probe's — it is the same RC contract, minus
           // the kill: `survivor` here just means the lead is alive, which is the healthy answer.
           const v = classifyKillProbe(res);
@@ -6221,7 +6292,7 @@ export async function runSubcommand(argv) {
         // Local: `pgrep` is spawned directly (no intermediate shell holding the pattern), so only pgrep
         // itself could match — and every family excludes itself. Escaped anyway: the two branches must
         // not be able to drift into meaning different things.
-        const res = await runCommand({ command: "pgrep", args: ["-f", bracketEscapePattern(`${runDir}/briefs/${issue}`)] });
+        const res = await runCommand({ command: "pgrep", args: ["-f", bracketEscapePattern(leadBriefPattern({ runDir, issueId: issue }))] });
         return res.exitCode === 0 ? "alive" : res.exitCode === 1 ? "dead" : "unknown";
       };
       const readings = [];
@@ -6366,7 +6437,7 @@ export async function runSubcommand(argv) {
           // leads on one worktree — the branch-corruption failure this whole close-then-respawn dance
           // exists to prevent. `unknown` refuses too: an unverified kill is not a kill, and a rotation is
           // always safe to retry, whereas a second writer on live uncommitted work is not recoverable.
-          const pat = `${hostCfg.ledgerRoot}/${o.runId}/briefs/${o.issueId}`;
+          const pat = leadBriefPattern({ runDir: `${hostCfg.ledgerRoot}/${o.runId}`, issueId: o.issueId });
           const probe = classifyKillProbe(await runCommand({ command: "ssh", args: [ssh, remoteKillProbeCommand(pat)] }));
           if (probe !== "killed") {
             throw new Error(
@@ -6478,7 +6549,7 @@ export async function runSubcommand(argv) {
           // in the process args BEFORE removing the worktree it's cwd'd in, so a mini reap is clean.
           // POSTCONDITION OUT (DER-2775): kill THEN probe in one round trip, and record what the probe
           // found. `pkill …; true` reported success unconditionally — a survivor got a clean receipt.
-          const briefMatch = `${remoteHost.ledgerRoot}/${o.runId}/briefs/${o.issueId}`;
+          const briefMatch = leadBriefPattern({ runDir: `${remoteHost.ledgerRoot}/${o.runId}`, issueId: o.issueId });
           const r = await runCommand({ command: "ssh", args: [remoteHost.ssh, remoteKillProbeCommand(briefMatch)] });
           // REQUIRED: a failure here leaves the remote lead alive, spending, with nothing watching it.
           cleanupSteps.push(killProbeStep("remote_pkill", r));
