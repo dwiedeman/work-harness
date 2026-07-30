@@ -279,6 +279,10 @@ These are the rules the harness enforces on itself. Each exists because breaking
   review event exists.
 - **A different sha is not a later sha.** Head movement is verified with `git merge-base --is-ancestor`,
   because a hand-off once carried an *ancestor* of the kickback sha and silently cleared five findings.
+  A sha git *cannot resolve* is unverified, not new — it holds the kickback pending rather than clearing it.
+- **Discovery is not authentication.** Cloud-lead lifecycle is derived from open-PR state, and a public
+  repo announces its issue ids in PR titles. A PR must be authored by a trusted login *and* have its head
+  branch on the repo itself before anything it says becomes a ledger event.
 - **A death claim is a suspicion, not a verdict.** Liveness probes produce false positives; a false
   death that reaches a respawn puts a second writer on live uncommitted work. Post-death work refutes
   the claim automatically, and the surfaced entry says so.
