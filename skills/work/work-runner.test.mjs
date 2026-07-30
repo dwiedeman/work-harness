@@ -6801,9 +6801,21 @@ test("DER-2775: an unsafe kill pattern is REFUSED before it can reach pkill", ()
     assert.throws(() => WR.leadBriefPattern({ runDir: dir, issueId: "DER-1" }), /"undefined"\/"null" path segment/,
       `a stringified missing value must be refused, not silently probed: ${dir}`);
   }
+  // …and the SIBLING component, which the first version of this guard checked `runDir` for and missed.
+  // `issueId` reaches the same `pkill -f` by the same route and fails identically: `/…/briefs/undefined`
+  // clears the length floor, carries `/briefs/`, matches no process, and reports a CLEAN kill for a lead
+  // it never touched. It is the likelier of the two to go missing — an issue id is resolved per call,
+  // while `ledgerRoot` is configured once. Checking one component and not its sibling is how this class
+  // survives its own fix, so both are asserted here against the ASSEMBLED pattern.
+  for (const issueId of ["undefined", "null"]) {
+    assert.throws(() => WR.leadBriefPattern({ runDir: "/Users/example/work-ledger/r1", issueId }), /"undefined"\/"null" path segment/,
+      `a stringified missing issue id must be refused, not silently probed: ${issueId}`);
+  }
   // CONTROL — the words must only be rejected as whole SEGMENTS, or a legitimate path is blocked.
   assert.ok(WR.leadBriefPattern({ runDir: "/Users/undefinedale/runs/r1", issueId: "DER-1" }).endsWith("/briefs/DER-1"),
     "a path that merely CONTAINS the substring is a real path and must pass");
+  assert.ok(WR.leadBriefPattern({ runDir: "/Users/example/work-ledger/r1", issueId: "DER-undefined-2" }).endsWith("/briefs/DER-undefined-2"),
+    "an issue id that merely CONTAINS the substring is a real id and must pass");
   // The degenerate case, stated as the reason the floor exists rather than as a bare number: the escape
   // ITSELF fails on a one-character pattern, so length is load-bearing, not decoration.
   assert.match("[a]", new RegExp(WR.bracketEscapePattern("a")), "a 1-char pattern self-matches even escaped — which is why there is a floor");

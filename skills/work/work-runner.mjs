@@ -4536,14 +4536,21 @@ export function leadBriefPattern({ runDir, issueId } = {}) {
   // with no `ledgerRoot` interpolates to the literal "undefined", and `undefined/r1/briefs/DER-1` clears
   // every check above while matching no process at all — a kill that reports a clean receipt for a lead
   // it never touched. Only a stringified missing value produces these segments; no real path has one.
-  if (/(^|\/)(undefined|null)(\/|$)/.test(dir)) {
+  //
+  // Tested against the ASSEMBLED pattern, not against `dir` alone. `issueId` reaches the same shell by the
+  // same route and fails the same way — `/root/r1/briefs/undefined` clears the floor, carries `/briefs/`,
+  // matches nothing, and reports the same false clean kill — and it is the likelier of the two to go
+  // missing, since an issue id is per-call while `ledgerRoot` is configured once. Checking one component
+  // and not its sibling is how this class survives a fix.
+  const pattern = `${dir}${KILL_PATTERN_REQUIRED_SEGMENT}${id}`;
+  if (/(^|\/)(undefined|null)(\/|$)/.test(pattern)) {
     throw new Error(
-      `leadBriefPattern: run dir ${JSON.stringify(dir)} contains an "undefined"/"null" path segment — a missing ` +
-        "config value (most likely a host's `ledgerRoot`) or an absent --run was stringified into it. The " +
-        "resulting pattern would match nothing and report a CLEAN kill for a lead it never touched.",
+      `leadBriefPattern: ${JSON.stringify(pattern)} contains an "undefined"/"null" path segment — a missing ` +
+        "config value (a host's `ledgerRoot`, an absent --run, or an unresolved issue id) was stringified " +
+        "into it. The resulting pattern would match nothing and report a CLEAN kill for a lead it never touched.",
     );
   }
-  return assertKillPattern(`${dir}${KILL_PATTERN_REQUIRED_SEGMENT}${id}`);
+  return assertKillPattern(pattern);
 }
 
 // The presence half on its own. `lead-context`'s liveness probe is exactly this minus the kill, and it
