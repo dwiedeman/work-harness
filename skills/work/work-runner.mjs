@@ -2453,6 +2453,19 @@ let DOCKER_SCOPE_PREFIXES = [...COLLISION_DEFAULTS.dockerScopePrefixes];
 // Multi-host dispatch (DER-multihost): the orchestrator can overflow leads onto a second machine
 // (the mini) via `cmux ssh`. `hosts` comes from `.claude/work.config.json` (applyRepoConfig); absent
 // ⇒ a single local host at cap 2 (current single-host behavior). `let`, not `const`, for retune.
+// DER-2749. `commitAuthor` is documented in work.config.example.json — with a note that deploy checks map
+// commit author to an account — and until now NOTHING in the runner read it. `renderCloudBrief` accepted a
+// `commitAuthor` argument and the cloud call site never passed one, so there was no source to pass even if
+// it had. A cloud lead therefore committed as whatever the cloud environment defaulted to.
+let COMMIT_AUTHOR = null;
+// A PARTIAL identity is a config error, not a default: name-without-email renders
+// `git config user.email ""`, which actively SETS a broken author — worse than leaving the environment's
+// own default alone. Recorded here and refused where it matters (the cloud brief) rather than thrown from
+// config parsing, which every subcommand runs and which must not die over a key it does not use.
+let COMMIT_AUTHOR_ERROR = null;
+export function getCommitAuthor() { return COMMIT_AUTHOR; }
+export function getCommitAuthorError() { return COMMIT_AUTHOR_ERROR; }
+
 const HOSTS_DEFAULT = { local: { cap: 2 } };
 let HOSTS = { ...HOSTS_DEFAULT };
 export function getHosts() { return HOSTS; }
@@ -4860,10 +4873,20 @@ export async function annotateShaAncestry(events, { repoRoot, kickbackSha, run =
 // comments. Best-effort — a gh failure returns 0, never throws the watch loop. Dedups on `${type}:${pr}`
 // against events already in the ledger, so re-scanning is idempotent.
 async function reconcilePrEventsInto(runDir, runId, repoRoot) {
-  const listRes = await runCommand({ command: "gh", args: ["pr", "list", "--state", "open", "--json", "number", "--limit", "100"], cwd: repoRoot });
+  // DER-2750: ONE call, not 1+N. This used to list PR numbers and then `gh pr view` each one, so the cost
+  // scaled with the whole repo's open-PR count (ceiling 100) at a 45s cadence — tracking unrelated activity
+  // like dependabot rather than run size (~8k calls/hour worst case against a 5k/hour budget).
+  //
+  // The fix is deliberately NOT to narrow the list to the run's known PRs, which was the obvious-looking
+  // move and would have broken cloud-lead discovery: a cloud lead ANNOUNCES itself by opening a draft PR the
+  // ledger does not know about yet, and `deriveCloudPrEvents` decides relevance from branch/title. The waste
+  // was the per-PR fan-out, not the breadth — and `gh pr list --json` accepts every field the loop fetched,
+  // including `comments`, so the fan-out collapses into the call that was already being made.
+  const listRes = await runCommand({ command: "gh", args: ["pr", "list", "--state", "open", "--json", "number,isDraft,body,headRefName,title,headRefOid,comments", "--limit", "100"], cwd: repoRoot });
   if (listRes.exitCode !== 0) return { folded: 0 };
-  let prs;
-  try { prs = JSON.parse(listRes.stdout || "[]").map((p) => p.number); } catch { return { folded: 0 }; }
+  let prRows;
+  try { prRows = JSON.parse(listRes.stdout || "[]"); } catch { return { folded: 0 }; }
+  if (!Array.isArray(prRows)) return { folded: 0 };
   const existing = await readEvents(runDir);
   const state = materializeState(existing, { run_id: runId });
   const scope = Object.keys(state.issues);
@@ -4899,11 +4922,9 @@ async function reconcilePrEventsInto(runDir, runId, repoRoot) {
     await appendEvent(runDir, e);
     folded += 1;
   };
-  for (const pr of prs) {
-    const vRes = await runCommand({ command: "gh", args: ["pr", "view", String(pr), "--json", "comments,isDraft,body,headRefName,title,headRefOid"], cwd: repoRoot });
-    if (vRes.exitCode !== 0) continue;
-    let data;
-    try { data = JSON.parse(vRes.stdout || "{}"); } catch { continue; }
+  for (const data of prRows) {
+    const pr = data?.number;
+    if (pr == null) continue;
     // Belt-and-braces fix_pushed (item 1): SHA-keyed, so it bypasses the `${type}:${pr}` seen set (which
     // would block a 2nd fix on a different SHA). deriveKickbackFixEvents does the SHA-based idempotency.
     // MUST append BEFORE the derived handed_off for the same scan (2026-07-16 flap guard): the fold only
@@ -4959,6 +4980,8 @@ export async function applyRepoConfig(repoRoot) {
   LEGACY_EVENT_MARKER = null;
   LEGACY_HANDOFF_MARKER = null;
   TRUSTED_COMMENT_AUTHORS_EXTRA = [];
+  COMMIT_AUTHOR = null;
+  COMMIT_AUTHOR_ERROR = null;
   let cfg;
   try {
     cfg = JSON.parse(await readFile(join(repoRoot, ".claude", "work.config.json"), "utf8"));
@@ -4987,6 +5010,13 @@ export async function applyRepoConfig(repoRoot) {
   if (cfg.modelPrices && typeof cfg.modelPrices === "object") MODEL_PRICES = { ...cfg.modelPrices };
   if (typeof cfg.legacyEventMarker === "string" && cfg.legacyEventMarker) LEGACY_EVENT_MARKER = cfg.legacyEventMarker;
   if (typeof cfg.legacyHandoffMarker === "string" && cfg.legacyHandoffMarker) LEGACY_HANDOFF_MARKER = cfg.legacyHandoffMarker;
+  if (cfg.commitAuthor !== undefined && cfg.commitAuthor !== null) {
+    const ca = cfg.commitAuthor;
+    const name = ca && typeof ca.name === "string" ? ca.name.trim() : "";
+    const email = ca && typeof ca.email === "string" ? ca.email.trim() : "";
+    if (name && email) COMMIT_AUTHOR = { name, email };
+    else COMMIT_AUTHOR_ERROR = `commitAuthor is configured but incomplete (name=${JSON.stringify(name)}, email=${JSON.stringify(email)}) — set BOTH keys or remove the block. A half-set identity makes the lead run \`git config user.email ""\`, which SETS a broken author rather than leaving the environment default alone.`;
+  }
   if (cfg.repo && typeof cfg.repo === "object") {
     for (const k of Object.keys(REPO_IDENTITY_DEFAULT)) {
       if (typeof cfg.repo[k] === "string" && cfg.repo[k]) REPO_IDENTITY[k] = cfg.repo[k];
@@ -5314,11 +5344,17 @@ export async function runSubcommand(argv) {
           if (!assignedBudget) throw new Error(`run plan ${planPath} has no budget for ${o.issueId} — add it (or pass --budget-files/--budget-additions); an un-budgeted unit is an unbounded one`);
         }
       }
+      // DER-2749: refuse rather than quietly drop the line. A cloud brief is the only instruction the lead
+      // gets, so a misconfigured identity has to surface here, where it is actionable.
+      if (isCloud && getCommitAuthorError()) throw new Error(`write-brief --cloud: ${getCommitAuthorError()}`);
       const brief = isCloud
         ? renderCloudBrief({
             issueId: o.issueId, title: o.title, branch: o.branch, runId: o.runId,
             acceptance: o.acceptance, kickback: o.kickback, findings: o.findings, bundle: bundleArr, priorRounds,
             assignedBudget,
+            // DER-2749: repo/owner already reach the brief through getRepoIdentity()'s fallback inside the
+            // renderer; commitAuthor had no path in at all until now.
+            commitAuthor: getCommitAuthor(),
           })
         : renderBrief({
         issueId: o.issueId, title: o.title, worktree: o.worktree, branch: o.branch,

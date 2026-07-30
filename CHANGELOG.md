@@ -163,6 +163,25 @@ Each fix below landed with a regression test that was **observed failing on the 
   ledger with no `run_started`. This legitimately refuses plan shapes that used to reach dispatch (missing
   plan review, unresolved gates, unrecorded symbol/evidence checks, a risk lane on a weak lead type); the
   escape is the documented `planReviewSkipped:{why}`, not a `--force`.
+- **DER-2749 — the configured commit identity now reaches a cloud lead's brief.** `renderCloudBrief` had
+  always accepted a `commitAuthor` and emitted the `git config user.name/email` step when given one, but the
+  cloud call site never passed it — and, worse than filed, **`applyRepoConfig` never parsed the documented
+  `commitAuthor` key at all**, so there was no source to pass even if the call site had asked. Every cloud
+  lead committed as whatever the cloud environment defaulted to, which reds a deploy check that maps commit
+  author to an account. Now parsed, plumbed, and refused when half-set: name-without-email would render
+  `git config user.email ""`, actively SETTING a broken author rather than leaving the default alone, so a
+  partial block is a config error naming the key. Omitting the block entirely stays legitimate and emits no
+  git-config step.
+- **DER-2750 — cloud reconciliation costs one `gh` call instead of 1+N.** It listed open PR numbers and then
+  ran `gh pr view` per PR, so the cost scaled with the whole repo's open-PR count (ceiling 100) at a 45s
+  cadence — tracking unrelated activity such as dependabot rather than run size, ~8k calls/hour worst case
+  against a 5k/hour budget. The fix is deliberately **not** to narrow the list to the run's known PRs, which
+  looks like the obvious move and would break cloud-lead discovery: a cloud lead announces itself by opening
+  a draft PR the ledger does not know about yet, and relevance is decided from branch/title. The waste was
+  the per-PR fan-out, and `gh pr list --json` accepts every field the loop fetched — including `comments` —
+  so it collapses into the call already being made. Measured: 12 open PRs went from 1 list + 12 views to
+  1 list + 0 views, with a control proving an untracked draft is still discovered and an unrelated
+  dependabot PR still ignored.
 
 ### Added
 

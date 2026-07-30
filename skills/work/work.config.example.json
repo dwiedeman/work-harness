@@ -19,7 +19,7 @@
   "//trustedCommentAuthors": "SECURITY (DER-2737). PR comments are how a CLOUD lead reports lifecycle events (WORK-EVENT / WORK-HANDOFF), and the fold treats them as privileged ledger input — so it accepts them ONLY from these logins, plus `repo.ownerLogin` and known harness bots. Deny-by-default: with no `repo.ownerLogin` configured, NO human login is trusted and comment folding is off. Add a second maintainer or a bot that posts on the harness's behalf here. Anyone who can comment on any open PR in the repo can otherwise write your ledger.",
   "trustedCommentAuthors": [],
 
-  "//commitAuthor": "Commits are authored as this identity. Some deploy checks (e.g. Vercel) map commit author → account and red the PR on a mismatch.",
+  "//commitAuthor": "Commits are authored as this identity, and it is what reaches a CLOUD lead's brief as its `git config user.name/email` step (DER-2749). Some deploy checks (e.g. Vercel) map commit author → account and red the PR on a mismatch. BOTH keys are required together: a half-set identity is REFUSED when a cloud brief is written, because name-without-email would make the lead run `git config user.email \"\"` and actively set a broken author rather than leave the environment default alone. Omit the whole block if you do not care about commit identity — then no git-config step is emitted at all.",
   "commitAuthor": {
     "name": "Your Name",
     "email": "0000000+your-github-login@users.noreply.github.com"

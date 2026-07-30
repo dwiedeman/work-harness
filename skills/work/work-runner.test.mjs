@@ -6202,3 +6202,171 @@ test("DER-2740: reap_failed is actionable, and --dry-run still records nothing",
     await applyRepoConfig("/nonexistent-reset");
   }
 });
+
+// ---- DER-2749: the configured commit identity must reach the cloud brief ----------------------------
+// `renderCloudBrief` has always ACCEPTED `commitAuthor` and emits the `git config user.name/email` line
+// when given one — but the cloud call site never passed it, AND `applyRepoConfig` never parsed the
+// documented `commitAuthor` key at all, so there was no source to pass. A cloud lead therefore committed
+// under whatever identity the cloud env defaulted to, which reds a deploy check that maps author → account.
+const D2749_CFG = {
+  repo: { repoSlug: "acme/widgets", ownerLogin: "acme-owner" },
+  commitAuthor: { name: "Acme Bot", email: "12345+acme-bot@users.noreply.github.com" },
+};
+
+async function d2749Run(cfg) {
+  const repoRoot = await mkdtemp(join(tmpdir(), "wr-d2749-"));
+  await mkdir(join(repoRoot, ".claude"), { recursive: true });
+  await writeFile(join(repoRoot, ".claude", "work.config.json"), JSON.stringify(cfg), "utf8");
+  const runsRoot = await mkdtemp(join(tmpdir(), "wr-d2749-runs-"));
+  const runDir = join(runsRoot, "r1");
+  await mkdir(join(runDir, "briefs"), { recursive: true });
+  await writeFile(join(runDir, "events.jsonl"),
+    `${JSON.stringify({ actor: "orch", type: "run_started", run_id: "r1", ts: "2026-07-29T01:00:00.000Z" })}\n`, "utf8");
+  return { repoRoot, runsRoot, runDir };
+}
+
+test("DER-2749: a configured commitAuthor reaches the CLOUD brief with its real values", async () => {
+  const { repoRoot, runsRoot, runDir } = await d2749Run(D2749_CFG);
+  try {
+    await runSubcommand(["write-brief", "--run", "r1", "DER-9", "--runs-root", runsRoot,
+      "--repo-root", repoRoot, "--host", "cloud", "--branch", "der-9-x", "--title", "t", "--acceptance", "a"]);
+    const brief = await readFile(join(runDir, "briefs", "DER-9.md"), "utf8");
+    assert.match(brief, /git config user\.name "Acme Bot"/,
+      "a cloud lead that commits as nobody reds the deploy check that maps author → account");
+    assert.match(brief, /git config user\.email "12345\+acme-bot@users\.noreply\.github\.com"/);
+    assert.match(brief, /acme\/widgets/, "the repo slug reaches the brief too");
+  } finally {
+    await rm(repoRoot, { recursive: true, force: true });
+    await rm(runsRoot, { recursive: true, force: true });
+    await applyRepoConfig("/nonexistent-reset");
+  }
+});
+
+test("DER-2749 CONTROL: no configured commitAuthor ⇒ no git-config line (absence stays legitimate)", async () => {
+  // An adopter who does not care about commit identity must not get a brief that sets a broken one.
+  const { repoRoot, runsRoot, runDir } = await d2749Run({ repo: { repoSlug: "acme/widgets" } });
+  try {
+    await runSubcommand(["write-brief", "--run", "r1", "DER-9", "--runs-root", runsRoot,
+      "--repo-root", repoRoot, "--host", "cloud", "--branch", "der-9-x", "--title", "t", "--acceptance", "a"]);
+    const brief = await readFile(join(runDir, "briefs", "DER-9.md"), "utf8");
+    assert.doesNotMatch(brief, /git config user\.name/, "nothing configured ⇒ nothing claimed");
+  } finally {
+    await rm(repoRoot, { recursive: true, force: true });
+    await rm(runsRoot, { recursive: true, force: true });
+    await applyRepoConfig("/nonexistent-reset");
+  }
+});
+
+test("DER-2749: a HALF-configured commitAuthor is refused, naming the key", async () => {
+  // name-without-email would render `git config user.email ""`, i.e. actively SET a broken identity —
+  // worse than leaving the environment default alone. A partial config is an error, not a default.
+  const { repoRoot, runsRoot } = await d2749Run({ repo: { repoSlug: "a/b" }, commitAuthor: { name: "Only Name" } });
+  try {
+    await assert.rejects(
+      () => runSubcommand(["write-brief", "--run", "r1", "DER-9", "--runs-root", runsRoot,
+        "--repo-root", repoRoot, "--host", "cloud", "--branch", "der-9-x", "--title", "t", "--acceptance", "a"]),
+      /commitAuthor/,
+      "a half-set identity must be refused with the config key named, not silently dropped",
+    );
+  } finally {
+    await rm(repoRoot, { recursive: true, force: true });
+    await rm(runsRoot, { recursive: true, force: true });
+    await applyRepoConfig("/nonexistent-reset");
+  }
+});
+
+// ---- DER-2750: reconcile must cost O(1) gh calls, not 1+N ------------------------------------------
+// It ran `gh pr list` then `gh pr view` PER OPEN PR — so the cost scaled with the whole repo's open-PR
+// count (ceiling 100) at a 45s cadence, tracking unrelated activity like dependabot rather than run size.
+// The fix is NOT to narrow the list: an untracked new draft PR is exactly how a cloud lead announces
+// itself, and `deriveCloudPrEvents` decides relevance from branch/title. `gh pr list --json` accepts every
+// field the per-PR loop needed, including `comments`, so the fan-out collapses into the call already made.
+async function withFakeGh(rows, body) {
+  const dir = await mkdtemp(join(tmpdir(), "wr-d2750-"));
+  const bin = join(dir, "bin");
+  await mkdir(bin, { recursive: true });
+  const log = join(dir, "gh.log");
+  await writeFile(join(bin, "gh"), [
+    "#!/bin/sh",
+    `printf '%s\\n' "$*" >> ${JSON.stringify(log)}`,
+    `case "$1 $2" in`,
+    `  "pr list") cat ${JSON.stringify(join(dir, "rows.json"))} ;;`,
+    // Emulate `pr view` FAITHFULLY (one file per PR), so the discovery control below passes on the
+    // pre-fix code too. A stub that returned {} would make that control fail for a stub reason and
+    // prove nothing about narrowing.
+    `  "pr view") cat ${JSON.stringify(dir)}/pr-$3.json ;;`,
+    `  *) printf '%s\\n' '[]' ;;`,
+    "esac",
+    "exit 0",
+  ].join("\n") + "\n", "utf8");
+  await chmod(join(bin, "gh"), 0o755);
+  await writeFile(join(dir, "rows.json"), JSON.stringify(rows), "utf8");
+  for (const r of rows) await writeFile(join(dir, `pr-${r.number}.json`), JSON.stringify(r), "utf8");
+  const prevPath = process.env.PATH;
+  process.env.PATH = `${bin}:${prevPath}`;
+  try {
+    return await body({ calls: async () => (await readFile(log, "utf8").catch(() => "")).trim().split("\n").filter(Boolean) });
+  } finally {
+    process.env.PATH = prevPath;
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+async function d2750Run() {
+  const runsRoot = await mkdtemp(join(tmpdir(), "wr-d2750-runs-"));
+  const runDir = join(runsRoot, "r1");
+  await mkdir(runDir, { recursive: true });
+  const evs = [
+    { actor: "orch", type: "run_started", run_id: "r1" },
+    { actor: "orch", type: "lead_spawned", issue: "DER-9", host: "cloud", workspace_ref: "workspace:1" },
+  ];
+  await writeFile(join(runDir, "events.jsonl"),
+    `${evs.map((e) => JSON.stringify({ ...e, ts: "2026-07-29T01:00:00.000Z" })).join("\n")}\n`, "utf8");
+  return { runsRoot, runDir };
+}
+
+test("DER-2750: reconcile costs O(1) gh calls regardless of how many PRs the repo has open", async () => {
+  // 12 open PRs, only one of which belongs to this run. Old shape: 1 list + 12 views.
+  const rows = Array.from({ length: 12 }, (_, i) => ({
+    number: 900 + i, isDraft: false, body: "", headRefName: `unrelated-${i}`, title: `chore ${i}`,
+    headRefOid: `sha${i}`, comments: [],
+  }));
+  rows[0] = { number: 700, isDraft: true, body: "session_01ABC", headRefName: "der-9-x", title: "DER-9 thing", headRefOid: "shaX", comments: [] };
+  const { runsRoot } = await d2750Run();
+  try {
+    await withFakeGh(rows, async ({ calls }) => {
+      await runSubcommand(["reconcile-pr-events", "--run", "r1", "--runs-root", runsRoot, "--repo-root", process.cwd()]);
+      const c = await calls();
+      const views = c.filter((l) => l.startsWith("pr view"));
+      const lists = c.filter((l) => l.startsWith("pr list"));
+      assert.equal(views.length, 0, `the per-PR fan-out must be gone, saw ${views.length} \`gh pr view\` calls`);
+      assert.equal(lists.length, 1, `exactly one list call, saw ${lists.length}`);
+      assert.match(lists[0], /comments/, "the list must request the fields the loop used to fetch");
+    });
+  } finally {
+    await rm(runsRoot, { recursive: true, force: true });
+  }
+});
+
+test("DER-2750 CONTROL: an UNTRACKED new draft PR is still discovered (narrowing the list would break cloud-lead discovery)", async () => {
+  // This is the trap the issue calls out: a cloud lead announces itself by opening a draft PR the ledger
+  // does not know about yet. If the fix had narrowed the list to the run's known PRs, that announcement
+  // would never be seen and the unit would stall.
+  const rows = [
+    { number: 701, isDraft: true, body: "boot claude.ai/code/session_01ZZZ", headRefName: "der-9-feature", title: "DER-9: wip", headRefOid: "shaN", comments: [] },
+    { number: 902, isDraft: false, body: "", headRefName: "dependabot/npm/x", title: "bump x", headRefOid: "shaD", comments: [] },
+  ];
+  const { runsRoot, runDir } = await d2750Run();
+  try {
+    await withFakeGh(rows, async () => {
+      await runSubcommand(["reconcile-pr-events", "--run", "r1", "--runs-root", runsRoot, "--repo-root", process.cwd()]);
+    });
+    const evs = await readEvents(runDir);
+    const online = evs.filter((e) => e.type === "lead_online");
+    assert.equal(online.length, 1, "the untracked draft that names a run issue must still be discovered");
+    assert.equal(online[0].pr, 701);
+    assert.equal(evs.some((e) => e.pr === 902), false, "an unrelated dependabot PR must not fold into the run");
+  } finally {
+    await rm(runsRoot, { recursive: true, force: true });
+  }
+});
