@@ -4406,6 +4406,20 @@ test("DER-2753/DER-2774: allowMergeWithoutChecks waives a VERIFIED-ABSENT check 
     assert.match(u.v.why, /VERIFIED-ABSENT/, "and must say why the waiver did not apply to it");
   }
 
+  // 4b. THE PRE-FIX PREDICATE, asserted directly on `readyVerdict`. The waiver used to read
+  // `checks == null || checks === ""`, so a caller that never ran the probe at all — or ran it and
+  // threw the result away — was indistinguishable from a repo with no CI, and the opt-in merged it.
+  // The waiver now keys on the literal "absent" state ONLY; no unset value may route into it.
+  for (const unset of [null, undefined, ""]) {
+    const v = readyVerdict({ ...D2753_READY, checks: unset, allowMergeWithoutChecks: true });
+    assert.equal(v.ready, false, `checks=${JSON.stringify(unset)} must fail CLOSED with the waiver ON — never-probed is not verified-absent`);
+    assert.match(v.why, /checks=UNKNOWN/);
+    assert.equal(WR.mergeAction({ mode: "direct", pr: 7, verdict: v, expectedHead: D2774_HEAD }).action, "hold");
+  }
+  // …and readyVerdict called with NO checks key at all is the same story.
+  const omitted = readyVerdict({ draft: false, threads: 0, onHead: true, shardsPass: 0, shardsTotal: 0, gate: D2753_READY.gate, allowMergeWithoutChecks: true });
+  assert.equal(omitted.ready, false, "omitting `checks` entirely must not be waivable either");
+
   // 5. The other gates are untouched by the opt-in.
   assert.equal(readyVerdict({ ...D2753_READY, checks: "absent", threads: 2, allowMergeWithoutChecks: true }).ready, false);
   assert.equal(readyVerdict({ ...D2753_READY, checks: "absent", onHead: false, allowMergeWithoutChecks: true }).ready, false);
