@@ -72,6 +72,44 @@ test("VERSION is semver and CHANGELOG has a section for exactly that version", a
   );
 });
 
+test("DER-2780: no shipped doc or comment still claims harness-version skew is untracked or VERSION uncopied", async () => {
+  // Four sites (README.md's upgrade section, CHANGELOG.md's own preamble, CHANGELOG.md's "Known
+  // follow-ups" bullet, and a work-runner.mjs comment) described version-skew detection as untracked and
+  // `install.sh` as never copying VERSION — after DER-2748/DER-2779 made the ledger track skew and refuse
+  // a mixed-version dispatch, and after install.sh was fixed to copy VERSION and refuse to install
+  // without it. One of the four directly contradicted a "Fixed" bullet nine lines above it in the SAME
+  // file. DER-2780 corrected all four in place; this guard is what stops a fifth from creeping back in.
+  //
+  // Shape: discover the files to check by scanning tracked source rather than hand-listing "README.md and
+  // CHANGELOG.md" — a future false claim is exactly as likely to land in a SKILL.md or a different .mjs
+  // comment, and a hand-picked file list goes stale exactly like a hand-picked line number does.
+  //
+  // Stated limit: this is a literal-string sieve, not an intent check. It proves these EXACT claims are
+  // absent from shipped prose/comments right now; it cannot catch a differently-worded claim making the
+  // same false point. That is a known, accepted gap, not an oversight — a hand-maintained inventory of
+  // "prose that depends on X" would be the wrong shape to grow instead of accepting this limit, since it
+  // just relocates the staleness into the inventory itself.
+  const FALSE_CLAIMS = [
+    /skew is currently invisible/i,
+    /version is not yet recorded/i,
+    /is deliberately NOT in this entry/i,
+    /does not copy `?VERSION`?/i,
+    /copies[^.\n]*but NOT `?VERSION`?/i,
+  ];
+  const files = gitFiles("*.md")
+    .concat(gitFiles("*.mjs"), gitFiles("*.sh"))
+    .filter((f) => !f.endsWith(".test.mjs"));
+  assert.ok(files.length >= 10, `expected shipped docs/sources to be tracked, found ${files.length}`);
+  const hits = [];
+  for (const f of files) {
+    const body = await read(f);
+    for (const pattern of FALSE_CLAIMS) {
+      if (pattern.test(body)) hits.push(`${f} matches ${pattern}`);
+    }
+  }
+  assert.deepEqual(hits, [], `stale/contradictory version-skew claim(s) found:\n${hits.join("\n")}`);
+});
+
 test("the branch-protection settings that CI can't apply itself are written down, with the checks named", async () => {
   // Honest bookkeeping: applying protection needs repo `admin`, which the harness's own credentials do
   // not have. The contract is therefore "documented + reproducible in one paste", and this test fails if

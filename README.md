@@ -119,9 +119,13 @@ Two rules worth respecting:
 
 - **Never re-run `install.sh` while a run is in flight on that machine.** It replaces the code the running
   orchestrator and leads are executing from. Install between runs.
-- **Keep hosts on the same version.** Multiple machines run copies of this harness against one shared
-  ledger; the version is not yet recorded *in* the ledger, so skew is currently invisible (tracked in
-  DER-2748). Until then, upgrading one host means upgrading all of them.
+- **Keep hosts on the same version — the harness enforces this, it does not just recommend it.** Every
+  host that writes to the ledger stamps its `harness_version` (`run_started` / `heartbeat`), and the
+  dispatch gate additionally attests the *acting* process's own version before it spawns anything
+  (DER-2748, DER-2779). A ledger holding two harness versions refuses `spawn-lead`/`spawn-shepherd`/
+  `spawn-orch`/`rotate-*` until you either re-install the lagging host or pass `--allow-version-skew` to
+  proceed deliberately; a `schema_version` this build does not implement is never overridable. Skew shows
+  in `state.protocol` and on every `watch` wake.
 
 `.github/REPO-SETUP.md` documents the CI checks and the branch-protection settings for anyone forking
 this repo to develop the harness itself rather than just install it.

@@ -3227,10 +3227,10 @@ let HARNESS_VERSION_CACHE = null;
 // as a DISTINCT version for skew purposes: an "unknown" host alongside a "0.2.0" host is exactly the
 // situation this is meant to refuse.
 //
-// KNOWN GAP: `install.sh` copies `skills/` and `hooks/` but NOT `VERSION`, so a host running from
-// `~/.claude/skills/work/` finds no VERSION file and reports "unknown". Two such hosts therefore look
-// same-version to each other. Closing it is a one-line `cp "$SRC/VERSION" "$DEST/VERSION"` in the
-// installer plus the `../../VERSION` candidate below; until then, `WORK_HARNESS_VERSION` is the override.
+// `install.sh` copies `VERSION` to `$CLAUDE_HOME` alongside `skills/` and `hooks/`, and refuses to
+// install at all if `$SRC/VERSION` is missing — so an installed host resolves this via the
+// `../../VERSION` candidate below the same as a checkout does. `WORK_HARNESS_VERSION` remains the
+// override for a host installed some other way (e.g. copied by hand, no `install.sh` run).
 export function getHarnessVersion() {
   const env = process.env.WORK_HARNESS_VERSION;
   if (typeof env === "string" && env.trim()) return env.trim();
