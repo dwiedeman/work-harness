@@ -1,10 +1,12 @@
 // Unit tests for scripts/work-runner.mjs — run with: node --test scripts/work-runner.test.mjs
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, readFile, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { fileURLToPath } from "node:url";
 
 import {
   parseArgs, slugify, buildRunId,
@@ -4415,6 +4417,628 @@ test("DER-2748: NO protocol field is settable from an untrusted PR comment", asy
     assert.equal(WR.ledgerProtocolVerdict(await readEvents(dir)).ok, true, "and it cannot fake a mixed-version run");
   } finally {
     await applyRepoConfig("/nonexistent-reset");
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// ---- DER-2742: create-worktree must never rm -rf its target (2026-07-29) ----
+//
+// The local path did `await rm(wt, { recursive: true, force: true })` UNCONDITIONALLY before
+// `git worktree add`. The path is deterministic (`<worktreeRoot>/<runId>/<issueId>`), so any retry or
+// re-run of the same run+issue recursively deleted whatever was there — a lead's uncommitted work
+// included — and then `git worktree add -b` failed anyway because the branch already existed. Net: it
+// destroyed work AND did not succeed. Every test below runs the REAL subcommand against a REAL throwaway
+// git repo under $TMPDIR; none of them touch this checkout.
+
+// A self-contained repo with a resolvable `origin/main` (an update-ref, so no network and no remote).
+async function mkWorktreeSandbox() {
+  const dir = await mkdtemp(join(tmpdir(), "wr-d2742-"));
+  const repo = join(dir, "repo");
+  await mkdir(repo, { recursive: true });
+  const git = (...args) => {
+    const r = spawnSync("git", ["-C", repo, ...args], { encoding: "utf8" });
+    if (r.status !== 0) throw new Error(`git ${args.join(" ")} failed: ${r.stderr || r.stdout}`);
+    return String(r.stdout ?? "");
+  };
+  const init = spawnSync("git", ["init", "--quiet", "-b", "main", repo], { encoding: "utf8" });
+  if (init.status !== 0) throw new Error(`git init failed: ${init.stderr}`);
+  git("config", "user.email", "harness@example.com");
+  git("config", "user.name", "Harness Test");
+  git("config", "commit.gpgsign", "false");
+  await writeFile(join(repo, "README.md"), "seed\n", "utf8");
+  git("add", "-A");
+  git("commit", "-q", "-m", "seed");
+  git("update-ref", "refs/remotes/origin/main", "HEAD");
+  return { dir, repo, git };
+}
+
+const PRECIOUS = "a lead's UNCOMMITTED work — 3 hours of it\n";
+
+async function survives(p) {
+  try { return await readFile(p, "utf8"); } catch { return null; }
+}
+
+test("DER-2742: an occupied non-worktree target is REFUSED, never deleted (uncommitted work survives)", async () => {
+  const { dir, repo } = await mkWorktreeSandbox();
+  const runsRoot = join(dir, "runs");
+  const wtRoot = join(dir, "agent-work");
+  try {
+    const { runId } = await runSubcommand(["init-run", "--project", "sandbox", "--runs-root", runsRoot, "--repo-root", repo]);
+    const wt = join(wtRoot, runId, "DER-9");
+    await mkdir(wt, { recursive: true });
+    const precious = join(wt, "UNCOMMITTED.md");
+    await writeFile(precious, PRECIOUS, "utf8");
+
+    let threw = null;
+    try {
+      await runSubcommand(["create-worktree", "--run", runId, "DER-9", "--runs-root", runsRoot, "--repo-root", repo, "--worktree-root", wtRoot]);
+    } catch (e) { threw = e; }
+
+    // THE load-bearing assertion of DER-2742.
+    assert.equal(await survives(precious), PRECIOUS, "create-worktree must NEVER delete an occupied target");
+    assert.ok(threw, "an occupied path that is not a registered worktree must REFUSE, not take over silently");
+    const msg = String(threw.message);
+    assert.match(msg, /REFUS/i, "the refusal must say it refused");
+    assert.match(msg, /worktree remove|worktree prune|git status/, "the refusal must carry recovery instructions");
+    assert.match(msg, /Nothing was deleted/i);
+    // …and it must not have half-registered anything.
+    const evs = await readEvents(join(runsRoot, runId));
+    assert.ok(!evs.some((e) => e.type === "worktree_created"), "a refusal must not record a worktree_created");
+  } finally {
+    await applyRepoConfig("/nonexistent-reset");
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("DER-2742: re-running create-worktree on the EXPECTED registered worktree resumes idempotently", async () => {
+  const { dir, repo, git } = await mkWorktreeSandbox();
+  const runsRoot = join(dir, "runs");
+  const wtRoot = join(dir, "agent-work");
+  try {
+    const { runId } = await runSubcommand(["init-run", "--project", "sandbox", "--runs-root", runsRoot, "--repo-root", repo]);
+    const args = ["create-worktree", "--run", runId, "DER-9", "--runs-root", runsRoot, "--repo-root", repo, "--worktree-root", wtRoot];
+    const first = await runSubcommand(args);
+    const wt = first.worktree;
+    assert.equal(wt, join(wtRoot, runId, "DER-9"));
+    assert.equal(await survives(join(wt, "README.md")), "seed\n", "the healthy create must actually produce a worktree");
+    const precious = join(wt, "UNCOMMITTED.md");
+    await writeFile(precious, PRECIOUS, "utf8");
+
+    const second = await runSubcommand(args);
+    assert.equal(await survives(precious), PRECIOUS, "a resume must preserve the dispatched lead's dirty state");
+    assert.equal(second.worktree, wt);
+    assert.equal(second.branch, first.branch);
+    assert.equal(second.resumed, true, "the second call must report a RESUME, not a fresh create");
+    // Still exactly one registration for that path, still on the requested branch.
+    const list = git("worktree", "list", "--porcelain");
+    assert.equal((list.match(new RegExp(`^worktree .*${runId}.*DER-9$`, "gm")) ?? []).length, 1);
+    assert.match(list, /branch refs\/heads\/der-9-work/);
+    const evs = await readEvents(join(runsRoot, runId));
+    assert.equal(evs.filter((e) => e.type === "worktree_created").length, 2, "both calls record what they did");
+    assert.equal(evs.filter((e) => e.type === "worktree_created").at(-1).resumed, true);
+  } finally {
+    await applyRepoConfig("/nonexistent-reset");
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("DER-2742: a registered worktree on a DIFFERENT branch is refused, not stomped", async () => {
+  const { dir, repo } = await mkWorktreeSandbox();
+  const runsRoot = join(dir, "runs");
+  const wtRoot = join(dir, "agent-work");
+  try {
+    const { runId } = await runSubcommand(["init-run", "--project", "sandbox", "--runs-root", runsRoot, "--repo-root", repo]);
+    const base = ["create-worktree", "--run", runId, "DER-9", "--runs-root", runsRoot, "--repo-root", repo, "--worktree-root", wtRoot];
+    const { worktree: wt } = await runSubcommand([...base, "--branch", "der-9-work"]);
+    const precious = join(wt, "UNCOMMITTED.md");
+    await writeFile(precious, PRECIOUS, "utf8");
+    let threw = null;
+    try { await runSubcommand([...base, "--branch", "der-9-work-rot2"]); } catch (e) { threw = e; }
+    assert.equal(await survives(precious), PRECIOUS);
+    assert.ok(threw, "a branch mismatch at the expected path is ambiguous — it must refuse");
+    assert.match(String(threw.message), /der-9-work/, "the refusal must name the branch that IS checked out there");
+    assert.match(String(threw.message), /Nothing was deleted/i);
+  } finally {
+    await applyRepoConfig("/nonexistent-reset");
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("DER-2742: a registered-but-vanished (prunable) worktree is pruned and re-created, not refused", async () => {
+  const { dir, repo, git } = await mkWorktreeSandbox();
+  const runsRoot = join(dir, "runs");
+  const wtRoot = join(dir, "agent-work");
+  try {
+    const { runId } = await runSubcommand(["init-run", "--project", "sandbox", "--runs-root", runsRoot, "--repo-root", repo]);
+    const args = ["create-worktree", "--run", runId, "DER-9", "--runs-root", runsRoot, "--repo-root", repo, "--worktree-root", wtRoot];
+    const { worktree: wt } = await runSubcommand(args);
+    // Somebody (a cleanup script, an operator) deleted the directory out from under git.
+    await rm(wt, { recursive: true, force: true });
+    const again = await runSubcommand(args);
+    assert.equal(again.worktree, wt);
+    assert.equal(await survives(join(wt, "README.md")), "seed\n", "the vanished worktree must come back");
+    assert.equal((git("worktree", "list", "--porcelain").match(/^worktree /gm) ?? []).length, 2, "no duplicate registration");
+  } finally {
+    await applyRepoConfig("/nonexistent-reset");
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("DER-2742: an existing branch with a FREE path attaches instead of failing on `add -b`", async () => {
+  const { dir, repo, git } = await mkWorktreeSandbox();
+  const runsRoot = join(dir, "runs");
+  const wtRoot = join(dir, "agent-work");
+  try {
+    const { runId } = await runSubcommand(["init-run", "--project", "sandbox", "--runs-root", runsRoot, "--repo-root", repo]);
+    const args = ["create-worktree", "--run", runId, "DER-9", "--runs-root", runsRoot, "--repo-root", repo, "--worktree-root", wtRoot];
+    const { worktree: wt } = await runSubcommand(args);
+    // A lead COMMITTED to its branch, then the worktree was removed cleanly. The branch survives.
+    await writeFile(join(wt, "kept.md"), "committed work\n", "utf8");
+    spawnSync("git", ["-C", wt, "add", "-A"], { encoding: "utf8" });
+    spawnSync("git", ["-C", wt, "-c", "user.email=h@e.com", "-c", "user.name=H", "commit", "-q", "-m", "lead work"], { encoding: "utf8" });
+    git("worktree", "remove", "--force", wt);
+    const again = await runSubcommand(args);
+    assert.equal(again.worktree, wt);
+    assert.equal(again.attached, true, "an existing branch must be ATTACHED, not re-created with -b");
+    assert.equal(await survives(join(wt, "kept.md")), "committed work\n", "the branch's committed work must come back");
+  } finally {
+    await applyRepoConfig("/nonexistent-reset");
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("DER-2742: a SYMLINK at the target is refused and never followed into a delete", async () => {
+  const { dir, repo } = await mkWorktreeSandbox();
+  const runsRoot = join(dir, "runs");
+  const wtRoot = join(dir, "agent-work");
+  try {
+    const { runId } = await runSubcommand(["init-run", "--project", "sandbox", "--runs-root", runsRoot, "--repo-root", repo]);
+    const elsewhere = join(dir, "somewhere-else");
+    await mkdir(elsewhere, { recursive: true });
+    const precious = join(elsewhere, "UNCOMMITTED.md");
+    await writeFile(precious, PRECIOUS, "utf8");
+    const wt = join(wtRoot, runId, "DER-9");
+    await mkdir(join(wtRoot, runId), { recursive: true });
+    await symlink(elsewhere, wt);
+    let threw = null;
+    try {
+      await runSubcommand(["create-worktree", "--run", runId, "DER-9", "--runs-root", runsRoot, "--repo-root", repo, "--worktree-root", wtRoot]);
+    } catch (e) { threw = e; }
+    assert.equal(await survives(precious), PRECIOUS, "a symlinked target must never be followed into an rm -rf");
+    assert.ok(threw, "a symlink at the worktree path is not a registered worktree — refuse");
+    assert.match(String(threw.message), /symlink/i);
+  } finally {
+    await applyRepoConfig("/nonexistent-reset");
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("DER-2742 CONTROL: the healthy first create still works and records worktree_created", async () => {
+  const { dir, repo } = await mkWorktreeSandbox();
+  const runsRoot = join(dir, "runs");
+  const wtRoot = join(dir, "agent-work");
+  try {
+    const { runId } = await runSubcommand(["init-run", "--project", "sandbox", "--runs-root", runsRoot, "--repo-root", repo]);
+    const res = await runSubcommand(["create-worktree", "--run", runId, "DER-9", "--runs-root", runsRoot, "--repo-root", repo, "--worktree-root", wtRoot, "--bundle", "DER-10"]);
+    assert.equal(res.branch, "der-9-work");
+    assert.equal(res.resumed, undefined, "a first create is not a resume");
+    assert.equal(await survives(join(res.worktree, "README.md")), "seed\n");
+    const ev = (await readEvents(join(runsRoot, runId))).find((e) => e.type === "worktree_created");
+    assert.equal(ev.worktree, res.worktree);
+    assert.deepEqual(ev.bundle, ["DER-9", "DER-10"]);
+  } finally {
+    await applyRepoConfig("/nonexistent-reset");
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("DER-2742: create-worktree --dry-run stays PURE on an occupied path (DER-2514)", async () => {
+  const { dir, repo } = await mkWorktreeSandbox();
+  const runsRoot = join(dir, "runs");
+  const wtRoot = join(dir, "agent-work");
+  try {
+    const { runId } = await runSubcommand(["init-run", "--project", "sandbox", "--runs-root", runsRoot, "--repo-root", repo]);
+    const wt = join(wtRoot, runId, "DER-9");
+    await mkdir(wt, { recursive: true });
+    const precious = join(wt, "UNCOMMITTED.md");
+    await writeFile(precious, PRECIOUS, "utf8");
+    const res = await runSubcommand(["create-worktree", "--run", runId, "DER-9", "--runs-root", runsRoot, "--repo-root", repo, "--worktree-root", wtRoot, "--dry-run"]);
+    assert.match(res.stdout, /^git worktree add -b der-9-work /);
+    assert.equal(await survives(precious), PRECIOUS);
+    const evs = await readEvents(join(runsRoot, runId));
+    assert.ok(!evs.some((e) => e.type === "worktree_created"), "a dry run records nothing");
+  } finally {
+    await applyRepoConfig("/nonexistent-reset");
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// ---- DER-2742: the decision itself, as data (every branch, no filesystem) ----
+
+const D2742_MAIN = { path: "/repo", head: "aaa", branch: "main" };
+const d2742Plan = (over = {}) => WR.planWorktreeAction({
+  path: "/wt/R1/DER-9", branch: "der-9-work", repo: "/repo",
+  entries: [D2742_MAIN], pathState: "absent", branchExists: false, ...over,
+});
+
+test("parseWorktreeList: porcelain entries incl. detached, locked, prunable", () => {
+  const out = WR.parseWorktreeList([
+    "worktree /repo", "HEAD aaa", "branch refs/heads/main", "",
+    "worktree /wt/a", "HEAD bbb", "branch refs/heads/der-9-work", "",
+    "worktree /wt/b", "HEAD ccc", "detached", "locked held by hand", "",
+    "worktree /wt/gone", "HEAD ddd", "branch refs/heads/der-8-work", "prunable gitdir file points to non-existent location", "",
+  ].join("\n"));
+  assert.equal(out.length, 4);
+  assert.equal(out[1].branch, "der-9-work", "refs/heads/ is stripped so callers can compare to --branch");
+  assert.equal(out[2].detached, true);
+  assert.equal(out[2].locked, true);
+  assert.equal(out[2].lockedReason, "held by hand");
+  assert.equal(out[3].prunable, true);
+  assert.match(out[3].prunableReason, /non-existent/);
+  assert.deepEqual(WR.parseWorktreeList(""), []);
+});
+
+test("planWorktreeAction: RESUME only for the expected path on the requested branch", () => {
+  const registered = { path: "/wt/R1/DER-9", head: "bbb", branch: "der-9-work" };
+  assert.equal(d2742Plan({ entries: [D2742_MAIN, registered], pathState: "occupied-dir", branchExists: true }).action, "resume");
+  // git records RESOLVED paths — /tmp → /private/tmp on macOS. Without realPath matching, this healthy
+  // resume reads as "unregistered occupied path" and every retry gets refused.
+  assert.equal(d2742Plan({
+    path: "/tmp/R1/DER-9", realPath: ["/private/tmp/R1/DER-9"], pathState: "occupied-dir", branchExists: true,
+    entries: [D2742_MAIN, { path: "/private/tmp/R1/DER-9", head: "bbb", branch: "der-9-work" }],
+  }).action, "resume");
+});
+
+test("planWorktreeAction: never a delete — every ambiguous occupant REFUSES with instructions", () => {
+  const cases = {
+    "occupied-dir": { pathState: "occupied-dir" },
+    symlink: { pathState: "symlink", realPath: ["/elsewhere"] },
+    file: { pathState: "file" },
+    "branch-mismatch": { pathState: "occupied-dir", entries: [D2742_MAIN, { path: "/wt/R1/DER-9", head: "b", branch: "der-9-work-rot2" }] },
+    detached: { pathState: "occupied-dir", entries: [D2742_MAIN, { path: "/wt/R1/DER-9", head: "b", branch: null, detached: true }] },
+    locked: { pathState: "occupied-dir", entries: [D2742_MAIN, { path: "/wt/R1/DER-9", head: "b", branch: "der-9-work", locked: true, lockedReason: "why" }] },
+    "branch-elsewhere": { pathState: "absent", entries: [D2742_MAIN, { path: "/other/DER-9", head: "b", branch: "der-9-work" }] },
+    unprobed: { pathState: "who-knows" },
+  };
+  for (const [label, over] of Object.entries(cases)) {
+    const p = d2742Plan(over);
+    assert.equal(p.action, "refuse", `${label} must refuse`);
+    assert.match(p.message, /REFUSED/, label);
+    assert.match(p.message, /Nothing was deleted/, label);
+    assert.match(p.message, /worktree remove --force/, `${label} must tell the operator how to proceed`);
+  }
+  // A locked worktree on the RIGHT branch still refuses — the lock is somebody's deliberate act.
+  assert.equal(d2742Plan(cases.locked).reason, "locked");
+  // …and the whole function has no delete outcome at all.
+  for (const over of Object.values(cases)) assert.notEqual(d2742Plan(over).action, "delete");
+});
+
+test("planWorktreeAction: CONTROL — the healthy and recoverable paths are NOT blocked", () => {
+  assert.deepEqual(
+    { action: "create", attach: false, prune: false },
+    (({ action, attach, prune }) => ({ action, attach, prune }))(d2742Plan({ pathState: "absent" })),
+  );
+  // git itself accepts an existing EMPTY directory, so refusing one would block a normal retry.
+  assert.equal(d2742Plan({ pathState: "empty-dir" }).action, "create");
+  // An existing branch is ATTACHED (`add -b` would abort, and the branch may hold committed lead work).
+  assert.deepEqual(
+    { action: "create", attach: true, prune: false },
+    (({ action, attach, prune }) => ({ action, attach, prune }))(d2742Plan({ pathState: "absent", branchExists: true })),
+  );
+  // Registered but the directory is GONE: prune (which can only drop a stale admin file) then re-create.
+  const stale = d2742Plan({
+    pathState: "absent", branchExists: true,
+    entries: [D2742_MAIN, { path: "/wt/R1/DER-9", head: "b", branch: "der-9-work", prunable: true }],
+  });
+  assert.equal(stale.action, "create");
+  assert.equal(stale.prune, true);
+  assert.equal(stale.attach, true);
+});
+
+test("worktreeAddArgs / remoteWorktreeAddCommand: attach reuses the branch, plain creates it", () => {
+  assert.deepEqual(WR.worktreeAddArgs({ repo: "/r", path: "/w", branch: "b" }), ["-C", "/r", "worktree", "add", "-b", "b", "/w", "origin/main"]);
+  assert.deepEqual(WR.worktreeAddArgs({ repo: "/r", path: "/w", branch: "b", attach: true }), ["-C", "/r", "worktree", "add", "/w", "b"]);
+  const plain = WR.remoteWorktreeAddCommand({ repo: "/r", path: "/w", branch: "b" });
+  assert.match(plain, /^git -C \/r fetch --quiet origin && git -C \/r worktree add -b b \/w origin\/main$/);
+  assert.match(WR.remoteWorktreeAddCommand({ repo: "/r", path: "/w", branch: "b", prune: true, attach: true }), /worktree prune && git -C \/r worktree add \/w b$/);
+  // Injection stays quoted (DER-2737's lesson applied to the new command builders).
+  const inj = WR.remoteWorktreeAddCommand({ repo: "/r", path: "/w; touch /tmp/pwned; #", branch: "b" });
+  assert.match(inj, /'\/w; touch \/tmp\/pwned; #'/);
+});
+
+test("parseRemoteWorktreeProbe: splits the porcelain listing from the three facts", () => {
+  const stdout = [
+    "worktree /home/repo", "HEAD aaa", "branch refs/heads/main", "",
+    "worktree /private/tmp/aw/R1/DER-9", "HEAD bbb", "branch refs/heads/der-9-work", "",
+    "WT-PROBE path-state occupied-dir",
+    "WT-PROBE real-path /private/tmp/aw/R1/DER-9",
+    "WT-PROBE real-parent /private/tmp/aw/R1/DER-9",
+    "WT-PROBE branch-exists yes",
+  ].join("\n");
+  const f = WR.parseRemoteWorktreeProbe(stdout);
+  assert.equal(f.entries.length, 2);
+  assert.equal(f.pathState, "occupied-dir");
+  assert.equal(f.branchExists, true);
+  assert.deepEqual(f.realPath, ["/private/tmp/aw/R1/DER-9"]);
+  assert.equal(WR.planWorktreeAction({ path: "/tmp/aw/R1/DER-9", branch: "der-9-work", repo: "/home/repo", ...f }).action, "resume");
+  // A probe that reported nothing usable is a REFUSAL, not an assumption of an empty path.
+  const blind = WR.parseRemoteWorktreeProbe("garbage from a broken shell");
+  assert.equal(blind.pathState, null);
+  assert.equal(WR.planWorktreeAction({ path: "/tmp/x", branch: "b", repo: "/r", ...blind }).action, "refuse");
+  // The probe command itself only READS — safe to run before any decision.
+  const cmd = WR.remoteWorktreeProbeCommand({ repo: "/home/repo", path: "/tmp/aw/R1/DER-9", branch: "der-9-work" });
+  assert.match(cmd, /worktree list --porcelain/);
+  assert.ok(!/\brm\b|worktree add|worktree prune|worktree remove/.test(cmd), "the probe must not mutate anything");
+});
+
+// The REMOTE call site, end to end, through a fake `ssh` on PATH: DER-2742 asked for the class to be
+// fixed, not just the local call site, and "the remote path also resumes/refuses" is otherwise a claim.
+async function withFakeSsh(body) {
+  const dir = await mkdtemp(join(tmpdir(), "wr-d2742-ssh-"));
+  const log = join(dir, "ssh.log");
+  const probeOut = join(dir, "probe.out");
+  const bin = join(dir, "bin");
+  await mkdir(bin, { recursive: true });
+  await writeFile(join(bin, "ssh"), [
+    "#!/bin/sh",
+    `printf '%s\\n' "$*" >> ${JSON.stringify(log)}`,
+    `case "$*" in *WT-PROBE*) cat ${JSON.stringify(probeOut)} ;; esac`,
+    "exit 0",
+  ].join("\n"), { mode: 0o755 });
+  const prevPath = process.env.PATH;
+  process.env.PATH = `${bin}:${prevPath}`;
+  try {
+    return await body({ dir, log, probeOut, setProbe: (t) => writeFile(probeOut, t, "utf8"), reads: async () => (await readFile(log, "utf8").catch(() => "")).trim().split("\n").filter(Boolean) });
+  } finally {
+    process.env.PATH = prevPath;
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+test("DER-2742: create-worktree --host mini RESUMES a registered remote worktree without re-adding", async () => {
+  const repoDir = await mkRepoWithHosts();
+  const runsRoot = await mkdtemp(join(tmpdir(), "wr-d2742-runs-"));
+  try {
+    const { runId } = await runSubcommand(["init-run", "--project", "sandbox", "--runs-root", runsRoot, "--repo-root", repoDir]);
+    const wt = `/Users/example/agent-work/${runId}/DER-9`;
+    await withFakeSsh(async ({ setProbe, reads }) => {
+      await setProbe([
+        "worktree /Users/example/your-repo", "HEAD aaa", "branch refs/heads/main", "",
+        `worktree ${wt}`, "HEAD bbb", "branch refs/heads/der-9-work", "",
+        "WT-PROBE path-state occupied-dir",
+        `WT-PROBE real-path ${wt}`,
+        `WT-PROBE real-parent ${wt}`,
+        "WT-PROBE branch-exists yes",
+      ].join("\n"));
+      const res = await runSubcommand(["create-worktree", "--run", runId, "DER-9", "--host", "mini", "--runs-root", runsRoot, "--repo-root", repoDir]);
+      assert.equal(res.resumed, true);
+      assert.equal(res.worktree, wt);
+      const calls = await reads();
+      assert.equal(calls.length, 1, "a resume must issue the read-only probe and nothing else");
+      assert.match(calls[0], /worktree list --porcelain/);
+      assert.ok(!/worktree add/.test(calls[0]));
+    });
+  } finally {
+    await applyRepoConfig("/nonexistent-reset");
+    await rm(repoDir, { recursive: true, force: true });
+    await rm(runsRoot, { recursive: true, force: true });
+  }
+});
+
+test("DER-2742: create-worktree --host mini REFUSES an occupied remote path and runs no add", async () => {
+  const repoDir = await mkRepoWithHosts();
+  const runsRoot = await mkdtemp(join(tmpdir(), "wr-d2742-runs-"));
+  try {
+    const { runId } = await runSubcommand(["init-run", "--project", "sandbox", "--runs-root", runsRoot, "--repo-root", repoDir]);
+    await withFakeSsh(async ({ setProbe, reads }) => {
+      await setProbe([
+        "worktree /Users/example/your-repo", "HEAD aaa", "branch refs/heads/main", "",
+        "WT-PROBE path-state occupied-dir",
+        "WT-PROBE real-path ",
+        "WT-PROBE real-parent ",
+        "WT-PROBE branch-exists no",
+      ].join("\n"));
+      await assert.rejects(
+        () => runSubcommand(["create-worktree", "--run", runId, "DER-9", "--host", "mini", "--runs-root", runsRoot, "--repo-root", repoDir]),
+        /REFUSED[\s\S]*Nothing was deleted/,
+      );
+      const calls = await reads();
+      assert.equal(calls.length, 1, "the refusal must happen BEFORE any mutating ssh");
+      const evs = await readEvents(join(runsRoot, runId));
+      assert.ok(!evs.some((e) => e.type === "worktree_created"), "a refusal records no worktree");
+    });
+  } finally {
+    await applyRepoConfig("/nonexistent-reset");
+    await rm(repoDir, { recursive: true, force: true });
+    await rm(runsRoot, { recursive: true, force: true });
+  }
+});
+
+test("DER-2742 CONTROL: --host mini still creates on a FREE remote path (fetch && add -b)", async () => {
+  const repoDir = await mkRepoWithHosts();
+  const runsRoot = await mkdtemp(join(tmpdir(), "wr-d2742-runs-"));
+  try {
+    const { runId } = await runSubcommand(["init-run", "--project", "sandbox", "--runs-root", runsRoot, "--repo-root", repoDir]);
+    await withFakeSsh(async ({ setProbe, reads }) => {
+      await setProbe([
+        "worktree /Users/example/your-repo", "HEAD aaa", "branch refs/heads/main", "",
+        "WT-PROBE path-state absent",
+        "WT-PROBE real-path ",
+        `WT-PROBE real-parent /Users/example/agent-work/${runId}/DER-9`,
+        "WT-PROBE branch-exists no",
+      ].join("\n"));
+      const res = await runSubcommand(["create-worktree", "--run", runId, "DER-9", "--host", "mini", "--runs-root", runsRoot, "--repo-root", repoDir]);
+      assert.equal(res.resumed, undefined);
+      const calls = await reads();
+      assert.equal(calls.length, 2, "probe, then add");
+      assert.match(calls[1], /fetch --quiet origin && git -C \/Users\/example\/your-repo worktree add -b der-9-work/);
+      assert.ok(!/worktree prune/.test(calls[1]), "nothing to prune on a free path");
+      const evs = await readEvents(join(runsRoot, runId));
+      assert.equal(evs.filter((e) => e.type === "worktree_created").length, 1);
+    });
+  } finally {
+    await applyRepoConfig("/nonexistent-reset");
+    await rm(repoDir, { recursive: true, force: true });
+    await rm(runsRoot, { recursive: true, force: true });
+  }
+});
+
+// ---- preflight `token-reporter`: the reporter the SessionEnd hook shells out to (DER-2745 follow-up) ----
+//
+// telemetry-hooks says the hooks are REGISTERED. Nothing said the script they call is present, current, or
+// honest — so a stale ~/.claude (work-runner.mjs copied on its own) reported PREFLIGHT GREEN while every
+// session's spend became a telemetry_gap. Each control below drives checkTokenReporter's seams: the RED it
+// must return, and the healthy case it must NOT block.
+
+const SKILLS_DIR = fileURLToPath(new URL(".", import.meta.url));
+const legByName = (legs, name) => legs.find((l) => l.name === name);
+
+// A throwaway "reporter" on disk, so `source` and behaviour can be varied independently.
+async function fakeReporter(dir, body) {
+  const p = join(dir, "session-token-report.mjs");
+  await writeFile(p, `#!/usr/bin/env node\n${body}\n`, "utf8");
+  return p;
+}
+
+test("token-reporter: a reporter-less install is RED and names every path it searched", async () => {
+  const legs = await WR.checkTokenReporter({
+    skillsDir: SKILLS_DIR,
+    resolveReporter: () => ({ path: null, source: "unresolved", searched: ["/repo/scripts/session-token-report.mjs", "/home/u/.claude/skills/work/session-token-report.mjs"] }),
+  });
+  const leg = legByName(legs, "token-reporter");
+  assert.equal(leg.ok, false, "no reporter must never read as green");
+  assert.match(leg.detail, /\/repo\/scripts\/session-token-report\.mjs, \/home\/u\/\.claude\/skills\/work\/session-token-report\.mjs/, "the searched list must be verbatim");
+  assert.match(leg.detail, /telemetry_gap, never as a number/);
+  assert.match(leg.detail, /install\.sh/);
+});
+
+test("token-reporter: the SHIPPED reporter is smoke-run against a known sum (present-but-broken is RED)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "wr-tokrep-"));
+  try {
+    const fx = WR.tokenReporterSmokeFixture();
+    assert.equal(fx.total, 362, "the fixture's sum is the whole assertion — pin it");
+    // 1. A reporter that prints a plausible-but-wrong total (e.g. summing transcript LINES, so the
+    //    duplicated message.id is counted twice) is BROKEN, not green.
+    const inflating = await fakeReporter(dir, `console.log('WORK-EVENT ' + JSON.stringify({ type: "token_usage", total_tokens: 494 }));`);
+    const broken = legByName(await WR.checkTokenReporter({ skillsDir: SKILLS_DIR, resolveReporter: () => ({ path: inflating, source: "shipped", searched: [inflating] }) }), "token-reporter");
+    assert.equal(broken.ok, false);
+    assert.match(broken.detail, /present but BROKEN/);
+    assert.match(broken.detail, /494 on a fixture whose measured sum is 362/);
+    assert.match(broken.detail, /re-run install\.sh/);
+    // 2. A reporter that crashes.
+    const crashing = await fakeReporter(join(dir), `process.stderr.write("boom\\n"); process.exit(7);`);
+    const crashed = legByName(await WR.checkTokenReporter({ skillsDir: SKILLS_DIR, resolveReporter: () => ({ path: crashing, source: "shipped", searched: [crashing] }) }), "token-reporter");
+    assert.equal(crashed.ok, false);
+    assert.match(crashed.detail, /exit 7/);
+    // 3. A reporter that exits 0 and prints nothing — silence is not success.
+    const silent = await fakeReporter(dir, `process.exit(0);`);
+    const quiet = legByName(await WR.checkTokenReporter({ skillsDir: SKILLS_DIR, resolveReporter: () => ({ path: silent, source: "shipped", searched: [silent] }) }), "token-reporter");
+    assert.equal(quiet.ok, false);
+    assert.match(quiet.detail, /no WORK-EVENT line/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("token-reporter CONTROL: the REAL shipped reporter measures the fixture exactly and passes", async () => {
+  // The healthy case, through the real resolveReporter and the real session-token-report.mjs — if this
+  // ever reds, preflight is right and this repo's install is broken.
+  const legs = await WR.checkTokenReporter({ skillsDir: SKILLS_DIR, cwd: SKILLS_DIR });
+  const leg = legByName(legs, "token-reporter");
+  assert.equal(leg.ok, true, `the shipped reporter must pass its own smoke run: ${leg.detail}`);
+  assert.match(leg.detail, /362-token fixture exactly/);
+  assert.equal(legByName(legs, "token-reporter-shipped").ok, true);
+});
+
+test("token-reporter: a foreign reporter that FABRICATES ZEROS is RED; one that refuses is green", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "wr-tokrep-foreign-"));
+  try {
+    for (const source of ["repo", "override"]) {
+      // Exits 0 with a token_usage for a session id that cannot exist ⇒ it invented the number.
+      const liar = await fakeReporter(dir, `console.log('WORK-EVENT ' + JSON.stringify({ type: "token_usage", total_tokens: 0 }));`);
+      const bad = legByName(await WR.checkTokenReporter({ skillsDir: SKILLS_DIR, resolveReporter: () => ({ path: liar, source, searched: [liar] }) }), "token-reporter");
+      assert.equal(bad.ok, false, `a fabricating ${source} reporter must be RED`);
+      assert.match(bad.detail, /FABRICATES ZEROS/);
+      assert.match(bad.detail, /cannot exist/);
+      // A foreign reporter is never handed --transcript (unknown flag ⇒ we would break a working script).
+      const flags = await fakeReporter(dir, `if (process.argv.includes("--transcript")) { console.error("unknown flag"); process.exit(64); } process.stderr.write("no transcript for that session\\n"); process.exit(2);`);
+      const good = legByName(await WR.checkTokenReporter({ skillsDir: SKILLS_DIR, resolveReporter: () => ({ path: flags, source, searched: [flags] }) }), "token-reporter");
+      assert.equal(good.ok, true, `an honest ${source} reporter must NOT be blocked: ${good.detail}`);
+      assert.match(good.detail, /refuses an unknown session/);
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("token-reporter-shipped: a stale ~/.claude (work-runner.mjs only) is RED on its own leg", async () => {
+  const stale = await mkdtemp(join(tmpdir(), "wr-stale-skills-"));
+  try {
+    await writeFile(join(stale, "work-runner.mjs"), "// copied by hand\n", "utf8");
+    // The resolve leg is stubbed healthy on purpose: this leg must fail INDEPENDENTLY, because that is
+    // exactly the upgrade case — a reporter resolvable from somewhere else, none in the skills dir.
+    const legs = await WR.checkTokenReporter({ skillsDir: stale, resolveReporter: () => ({ path: null, source: "unresolved", searched: [join(stale, "session-token-report.mjs")] }) });
+    const leg = legByName(legs, "token-reporter-shipped");
+    assert.equal(leg.ok, false);
+    assert.match(leg.detail, /stale ~\/\.claude — re-run install\.sh \(DER-2745 added session-token-report\.mjs\)/);
+    assert.equal(legs.length, 2, "both legs are always reported");
+    // The same stale install through the REAL resolveReporter (no stub): checkTokenReporter must answer for
+    // the install it was pointed at, so BOTH legs red — which is precisely the state in which the SessionEnd
+    // hook writes a telemetry_gap for every session while the rest of preflight is green.
+    const emptyCwd = join(stale, "cwd");
+    await mkdir(emptyCwd, { recursive: true });
+    const real = await WR.checkTokenReporter({ skillsDir: stale, cwd: emptyCwd });
+    assert.equal(legByName(real, "token-reporter").ok, false, "a reporter-less install must not read as green");
+    assert.match(legByName(real, "token-reporter").detail, new RegExp(`${join(stale, "session-token-report.mjs").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`), "the searched list must include the install we asked about");
+    assert.equal(legByName(real, "token-reporter-shipped").ok, false);
+    // CONTROL: with the file present the same leg passes.
+    await writeFile(join(stale, "session-token-report.mjs"), "// installed\n", "utf8");
+    const after = await WR.checkTokenReporter({ skillsDir: stale, resolveReporter: () => ({ path: null, source: "unresolved", searched: [] }) });
+    assert.equal(legByName(after, "token-reporter-shipped").ok, true);
+  } finally {
+    await rm(stale, { recursive: true, force: true });
+  }
+});
+
+test("token-reporter: the check never throws, and preflight registers both legs", async () => {
+  // A resolver that explodes must become a RED leg, not a dead preflight.
+  const legs = await WR.checkTokenReporter({ skillsDir: SKILLS_DIR, resolveReporter: () => { throw new Error("resolver exploded"); } });
+  assert.equal(legByName(legs, "token-reporter").ok, false);
+  assert.match(legByName(legs, "token-reporter").detail, /resolver exploded/);
+  // Wiring: preflight must actually ask (the check is next to telemetry-hooks and uses the add() idiom).
+  const src = await readFile(new URL("./work-runner.mjs", import.meta.url), "utf8");
+  assert.match(src, /for \(const leg of await checkTokenReporter\(\{ skillsDir, cwd: process\.cwd\(\) \}\)\) add\(leg\.name, leg\.ok, leg\.detail\);/);
+  // …and it must be a DYNAMIC import: a static one makes work-runner ↔ session-end-telemetry circular.
+  assert.ok(!/^import .*session-end-telemetry/m.test(src), "session-end-telemetry must never be statically imported here");
+  assert.match(src, /await import\("\.\/session-end-telemetry\.mjs"\)/);
+});
+
+test("skills-sync: the host hash covers session-token-report.mjs, and a missing file yields NO hash", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "wr-skills-hash-"));
+  try {
+    assert.deepEqual(WR.SKILLS_SYNC_FILES, ["work-runner.mjs", "session-token-report.mjs"]);
+    const a = join(dir, "work-runner.mjs");
+    const b = join(dir, "session-token-report.mjs");
+    await writeFile(a, "AAA\n", "utf8");
+    await writeFile(b, "BBB\n", "utf8");
+    const run = (paths) => String(spawnSync("sh", ["-c", WR.skillsHashCommand(paths)], { encoding: "utf8" }).stdout ?? "").trim();
+    const both = run([a, b]);
+    assert.match(both, /^[0-9a-f]{32}$/, "a healthy pair hashes");
+    assert.equal(both, createHash("md5").update("AAA\nBBB\n").digest("hex"), "it is the md5 of the concatenation, in order");
+    // The point of the change: a drifted reporter changes the answer, so the mini can no longer read as
+    // "in sync" on work-runner.mjs alone.
+    await writeFile(b, "BBB-drifted\n", "utf8");
+    assert.notEqual(run([a, b]), both);
+    // A MISSING file yields nothing at all — two equally broken installs must not hash equal.
+    await rm(b);
+    const missing = spawnSync("sh", ["-c", WR.skillsHashCommand([a, b])], { encoding: "utf8" });
+    assert.equal(String(missing.stdout ?? "").trim(), "", "no partial hash when a file is absent");
+    assert.notEqual(missing.status, 0);
+    // Remote form keeps `~` expandable (quoting it would make every remote hash empty ⇒ permanent SKEW).
+    const remote = WR.skillsHashCommand(WR.SKILLS_SYNC_FILES.map((f) => `~/.claude/skills/work/${f}`), { quote: false });
+    assert.match(remote, /~\/\.claude\/skills\/work\/session-token-report\.mjs/);
+    assert.ok(!/'~/.test(remote));
+  } finally {
     await rm(dir, { recursive: true, force: true });
   }
 });

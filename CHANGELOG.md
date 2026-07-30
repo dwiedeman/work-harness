@@ -28,6 +28,20 @@ Each fix below landed with a regression test that was **observed failing on the 
   payloads may not carry `worktree`/`branch`/`host`, `pr`/`host`/`actor` are stamped by the reader rather
   than read from the body, the run-scope filter applies to the singular `issue` as well as `issues[]`, and
   both `reap` interpolations are `shellQuote`d.
+- **#19 — evidence queries are validated read-only before a shell runs them.** `prep-runner`'s
+  `query-check` passed `evidenceQueries[].query` to `spawnSync(…, {shell: true})` behind only a *shape*
+  check, and a plan is often assembled from issue text and lead output — so plan content could execute
+  anything in the repo root. Validated now by an allowlist over a parsed query (not a metacharacter
+  blocklist, because pipelines are the feature), applied both in `validate` and immediately before the
+  `spawnSync`. Unrecognised is refused rather than run.
+- **DER-2742 — `create-worktree` no longer deletes anything.** It called
+  `rm(wt, {recursive:true, force:true})` unconditionally *before* `git worktree add`, with no check
+  whether the path was a registered worktree or held uncommitted files. Because the path is deterministic
+  per run+issue, a retry erased a lead's uncommitted work **and then failed anyway** (`add -b` aborts on
+  an existing branch). Replaced by a pure planner with exactly three outcomes — resume, create, refuse —
+  and **no delete outcome at all**. A registered worktree on the requested branch resumes idempotently; a
+  branch that exists is *attached* rather than recreated; anything else is refused with numbered recovery
+  steps. Symlinks are inspected with `lstat` and never followed.
 
 ### Fixed
 
@@ -35,6 +49,39 @@ Each fix below landed with a regression test that was **observed failing on the 
   `|| true`, which nullifies `set -o pipefail`: a red suite, a missing `node`, or a broken test file all
   still exited 0 while the script printed "Verifying (the harness tests itself)". The installer captures
   each suite's real exit status, names the suite that failed, and exits nonzero.
+- **The installer verified 3 of the 5 suites it shipped.** `install.sh` copies `skills/` and `hooks/`
+  wholesale but named its self-test suites by hand, so `session-end-telemetry.test.mjs` and
+  `hooks/context-wrap-nudge.test.mjs` were installed and never run — a broken hook installed reporting
+  "clean". `repo-contract.test.mjs` now enforces both directions: every shipped suite appears in
+  `install.sh`, and `install.sh` never names a suite it doesn't ship.
+- **`install.sh` did not ship `VERSION`.** The runner reads `<skillsDir>/../../VERSION`, which resolves to
+  `$DEST/VERSION` once installed, so an installed host reported `harness_version: "unknown"` — and two such
+  hosts looked *same-version to each other*, exactly the skew DER-2748 exists to detect. The suite also
+  passed in a checkout and failed only from `~/.claude`, the copy that actually runs. A real-repo install
+  control now covers that class, since the fixture-based tests structurally cannot.
+- **DER-2747 — the SessionEnd hook attributes `SPEC-<slug>-U<n>` units.** Its id regex matched only classic
+  Linear ids, so every spec-mode run silently lost all per-unit token attribution; a `token_usage` event
+  that folds to nothing is indistinguishable from one never emitted. Now derived through the shared
+  exported grammar. The hook body also ran at module top level with `process.exit(0)` on every early-out,
+  so importing it to test the parser killed the test process — now behind a `main()` guard.
+- **DER-2581 — window resolution no longer under-reports a 1M-token model as 200K.** Every resolver tested
+  for the `[1m]` marker alone, but that marker is a deployment identifier, not what grants the window:
+  Opus 5, Fable 5, Sonnet 5 and Opus 4.6/4.7/4.8 are natively 1M. Fixed as a class in all three copies of
+  the predicate, with a test asserting they agree. Explicitly an allow-list, not default-to-1M, so the
+  inverse error (a 270K lead judged against 1M) stays out. **Partial:** the ~1.8× discrepancy this issue
+  originally measured is probably a second, still-open defect in token accounting — for a rotation
+  decision, trust `state.session_context`, not the banner.
+- **DER-2745 — the token reporter is shipped, and its absence is loud.** The SessionEnd hook resolved
+  `<cwd>/scripts/session-token-report.mjs`, a path the harness never shipped, then `exit(0)`'d — so on a
+  fresh install every token number was an undercount by omission, and a session that recorded nothing
+  looked identical to one that spent nothing. The reporter now ships, and all six no-number paths append a
+  durable `telemetry_gap` event. It never prints a number it did not measure: no transcript means exit 2,
+  not a fabricated `0`. `preflight` gained a `token-reporter` check that smoke-runs the reporter against a
+  known-sum fixture (catching one that inflates by summing transcript lines) and a separate leg that
+  catches a stale `~/.claude`; `skills-sync:<host>` now hashes the reporter too.
+- **`work-metrics.mjs` disagreed with the runner about the same ledger** — a duplicated line reported 165
+  tokens against the runner's correct 110. Its dedup rule is deliberately duplicated (that module is
+  standalone by contract) and pinned by an agreement test over six ledgers.
 
 ### Added
 
@@ -44,6 +91,23 @@ Each fix below landed with a regression test that was **observed failing on the 
   **fails when zero DER-2737 controls match** rather than passing on an empty pattern. Adds `VERSION`,
   this changelog, `install.test.mjs`, `repo-contract.test.mjs`, and `.github/REPO-SETUP.md` (the
   branch-protection settings, as a one-paste `gh api` call).
+- **DER-2753 — direct-merge mode, for repos with no merge queue.** The harness could only merge through a
+  GitHub merge queue, so a queue-less repo (this one, and most public adopters) had no supported merge path
+  at all. `repo.mergeMode` (`queue`/`direct`, omit to auto-detect), `repo.mergeStrategy`, and
+  `repo.allowMergeWithoutChecks` (default `false`, compared `=== true` so a truthy string cannot loosen a
+  gate). Fails closed throughout: an unresolved mode holds and names the config key, a *failed* queue probe
+  is UNKNOWN rather than "no queue", and the checks waiver applies only to a wholly absent check surface —
+  red and pending still block, and the verdict names the waiver so it stays auditable.
+- **DER-2748 — ledger wire protocol.** Every line now carries `schema_version`, a uuid-v7 `event_id` minted
+  at origin, `(source_id, seq)` identifying the writing *process*, and `received_at`; `run_started` and
+  `host_heartbeat` additionally carry `harness_version`. A relay preserves origin identity and re-stamps
+  only `received_at`. Reads are exactly-once on identity collision only — a lower-but-unseen `seq` is a
+  late arrival, not a duplicate, because `readEvents` sorts by ts and discarding it would delete a real
+  event on a backwards clock step. Mixed harness versions refuse a dispatch (`--allow-version-skew` to
+  override) and a foreign `schema_version` fails closed. Legacy ledgers with neither field keep working,
+  which matters because the two SessionEnd hooks still append unstamped lines. Run `heartbeat --host <name>`
+  once per host at dispatch, or skew detection stays dormant for every host except the one that ran
+  `init-run`.
 
 ### Known follow-ups
 
