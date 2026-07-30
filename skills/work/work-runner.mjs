@@ -2903,45 +2903,421 @@ export function sortEventsByTs(events = []) {
   return keyed.map((k) => k.e);
 }
 
-export async function readEvents(runDir) {
-  let body;
+// ---------------------------------------------------------------------------
+// Tolerant ledger reads (DER-2738) — a torn line must not brick the recovery surface
+// ---------------------------------------------------------------------------
+// `readEvents` used to be `body.split("\n").filter(trim).map(JSON.parse)`. It is the SINGLE choke point
+// every consumer reads through, so ONE torn final append — a writer killed mid-line — threw out of
+// `state`, `watch`, `reap` and every reconciliation at exactly the moment the ledger is needed for
+// crash recovery. A `--pull-hosts` backfill or a killed writer is routine, not exotic.
+//
+// Tolerance here is deliberately NOT "wrap JSON.parse in try/catch and move on". A torn line is the
+// SIGNATURE OF A CONCURRENT WRITER and a malformed complete record is real content that did not fold —
+// silently dropping either is data loss nobody can see. So every dropped line is:
+//   1. classified — an unterminated TAIL line is a writer mid-append (retried once), a terminated
+//      malformed line is a corrupt RECORD (quarantined);
+//   2. preserved — its RAW BYTES go to `<runDir>/ledger-quarantine.jsonl` so it stays hand-repairable;
+//   3. surfaced — `state.ledger` (durable, in state.json), `watch`'s `pending.ledger_damage` on EVERY
+//      wake, and one stderr line per newly-seen damage signature.
+// This is the DER-2745 `telemetry_gap` precedent ("record the gap, don't swallow it") and the DER-2748
+// `state.protocol` precedent (ledger health is data a successor can read) applied to bad bytes.
+//
+// The quarantine is a SIDECAR, never an appended `ledger_damage` event: appending to a ledger whose last
+// line is torn would glue the new line onto the partial one, i.e. the damage report would itself create
+// a second damaged line. (That is also why the damage is contained to one line and no further: the next
+// append merges into the torn line and every line after it is clean.)
+export const LEDGER_QUARANTINE_FILE = "ledger-quarantine.jsonl";
+// Enough of the line to repair it by hand; a runaway line can't blow up the sidecar.
+export const LEDGER_RAW_KEEP = 4096;
+// One re-read for an unterminated tail: it may still be being written. Short on purpose — a torn tail
+// that outlives this is reported (transiently) rather than waited on, and clears itself on the next read.
+const LEDGER_TORN_RETRY_MS = 25;
+
+// The work-done seam (DER-2741 #16). Counters, not wall-clock: the review benchmark was a 100k-event /
+// 9.8 MB ledger at ~310 ms/read, ~120× over a 5-minute idle watch, and the property that has to hold is
+// "work per poll scales with NEW activity, not with total history" — which is a count, not a duration.
+// `fullReads`/`fullBytes` are whole-ledger parses; `tailReads`/`tailBytes` are incremental tail reads.
+export const LEDGER_READ_STATS = { fullReads: 0, fullBytes: 0, tailReads: 0, tailBytes: 0, statCalls: 0, polls: 0, linesParsed: 0, badLines: 0 };
+export function resetLedgerReadStats() {
+  for (const k of Object.keys(LEDGER_READ_STATS)) LEDGER_READ_STATS[k] = 0;
+  return LEDGER_READ_STATS;
+}
+
+// What "a bad line" MEANS, in one place. work-metrics.mjs carries a byte-identical copy (it is standalone
+// by contract and imports nothing from here) pinned by an agreement test in work-metrics.test.mjs — two
+// instruments that disagree about the same ledger is the DER-2581 defect class.
+//
+// `no_type` is a bad line, not a kept one: an event with no `type` can never fold into state, and the
+// second reader has always dropped it. Making both readers drop it — visibly, into quarantine — is what
+// keeps the two honest about one ledger.
+export function classifyLedgerLine(line) {
+  const trimmed = String(line ?? "").trim();
+  if (!trimmed) return { ok: false, reason: "blank" };
+  let d;
   try {
-    body = await readFile(join(runDir, "events.jsonl"), "utf8");
+    d = JSON.parse(trimmed);
+  } catch (err) {
+    return { ok: false, reason: "malformed_json", detail: String(err?.message ?? err).slice(0, 200) };
+  }
+  if (!d || typeof d !== "object" || Array.isArray(d)) return { ok: false, reason: "not_an_object" };
+  if (!d.type) return { ok: false, reason: "no_type" };
+  return { ok: true, event: d };
+}
+
+// Pure. Splits a ledger body into accepted events and located damage. `terminated:false` means the body
+// does NOT end in a newline, so its last line is UNTERMINATED — a writer caught mid-append, reported as
+// `torn_tail` rather than as a corrupt record. Offsets are BYTE offsets from `baseOffset`, so the
+// reported location is the one an operator can seek to.
+export function parseLedgerLines(text, { baseOffset = 0, terminated = true } = {}) {
+  const events = [];
+  const bad = [];
+  const parts = String(text ?? "").split("\n");
+  let offset = baseOffset;
+  for (let i = 0; i < parts.length; i += 1) {
+    const part = parts[i];
+    const lineOffset = offset;
+    offset += Buffer.byteLength(part) + 1; // + the "\n" that split() removed
+    if (!part.trim()) continue; // blank lines are not damage — a trailing newline is normal
+    LEDGER_READ_STATS.linesParsed += 1;
+    const v = classifyLedgerLine(part);
+    if (v.ok) {
+      events.push(v.event);
+      continue;
+    }
+    LEDGER_READ_STATS.badLines += 1;
+    const isLast = i === parts.length - 1;
+    bad.push({
+      reason: isLast && !terminated ? "torn_tail" : v.reason,
+      offset: lineOffset,
+      line: i + 1,
+      bytes: Buffer.byteLength(part),
+      raw: part.slice(0, LEDGER_RAW_KEEP),
+      raw_truncated: part.length > LEDGER_RAW_KEEP,
+      ...(v.detail ? { detail: v.detail } : {}),
+    });
+  }
+  return { events, bad };
+}
+
+// A torn tail is TRANSIENT by nature (the writer may simply not be done), so it is recorded but never
+// latches the durable banner. A malformed COMPLETE record is permanent damage and does latch, until an
+// operator clears the sidecar.
+const TRANSIENT_DAMAGE_REASONS = new Set(["torn_tail"]);
+
+const LEDGER_HEALTH = new Map(); // ledger path -> the last read's damage, in-process
+const LEDGER_DAMAGE_SEEN = new Map(); // ledger path -> Set of signatures already recorded/warned by THIS process
+
+// Identity of one piece of damage, so re-reading a damaged ledger 200 times records it once.
+export function ledgerDamageSignature(rec) {
+  return `${rec.reason}:${rec.offset ?? "-"}:${createHash("sha256").update(String(rec.raw ?? "")).digest("hex").slice(0, 16)}`;
+}
+
+function quarantinePathFor(ledgerFile) {
+  return join(dirname(ledgerFile), LEDGER_QUARANTINE_FILE);
+}
+
+// Best-effort by design: a read-only run dir must still be READABLE. The health record lands in-process
+// regardless, so `state`/`watch` surface the damage even when the sidecar cannot be written.
+async function recordLedgerDamage(ledgerFile, bad, extra = {}) {
+  LEDGER_HEALTH.set(ledgerFile, {
+    quarantined: bad.filter((b) => !TRANSIENT_DAMAGE_REASONS.has(b.reason)).length,
+    torn_tail: bad.filter((b) => TRANSIENT_DAMAGE_REASONS.has(b.reason)).length,
+    first_bad_offset: bad.length ? (bad[0].offset ?? null) : null,
+    reasons: [...new Set(bad.map((b) => b.reason))],
+    at: new Date().toISOString(),
+  });
+  if (!bad.length) return;
+  const seen = LEDGER_DAMAGE_SEEN.get(ledgerFile) ?? new Set();
+  LEDGER_DAMAGE_SEEN.set(ledgerFile, seen);
+  const sidecar = quarantinePathFor(ledgerFile);
+  let onDisk = new Set();
+  try {
+    const body = await readFile(sidecar, "utf8");
+    for (const l of body.split("\n")) {
+      if (!l.trim()) continue;
+      try { onDisk.add(ledgerDamageSignature(JSON.parse(l))); } catch { /* a torn quarantine line: re-record */ }
+    }
+  } catch { /* no sidecar yet */ }
+  const fresh = bad.filter((b) => {
+    const sig = ledgerDamageSignature(b);
+    return !seen.has(sig) && !onDisk.has(sig);
+  });
+  if (!fresh.length) return;
+  const detectedAt = new Date().toISOString();
+  for (const b of fresh) seen.add(ledgerDamageSignature(b));
+  try {
+    await appendFile(
+      sidecar,
+      fresh.map((b) => `${JSON.stringify({ ...extra, ...b, ledger: ledgerFile, detected_at: detectedAt, transient: TRANSIENT_DAMAGE_REASONS.has(b.reason) })}\n`).join(""),
+      "utf8",
+    );
+  } catch { /* unwritable run dir — the in-process health record above still surfaces it */ }
+  // LOUD, once per signature per process: the operator running the command that hit the damage sees it
+  // without having to go looking for state.json.
+  try {
+    process.stderr.write(
+      `WARNING: ledger ${ledgerFile} — ${fresh.length} line(s) did NOT fold into state ` +
+      `(${[...new Set(fresh.map((b) => b.reason))].join(", ")}; first at byte ${fresh[0].offset ?? "?"}). ` +
+      `Raw bytes kept in ${sidecar} — repair or acknowledge them there.\n`,
+    );
+  } catch { /* stderr closed */ }
+}
+
+// Ledger health as data, for `state.ledger` and `watch`'s wake banner. Combines THIS process's last read
+// with the durable sidecar, so damage recorded by an earlier process is still visible after the fact.
+// `ok:false` latches on permanent (non-transient) damage until the sidecar is cleared — an unacknowledged
+// line that never folded is a standing fact about the run, not a one-shot message.
+export async function readLedgerHealth(runDir) {
+  const ledgerFile = join(runDir, "events.jsonl");
+  const sidecar = quarantinePathFor(ledgerFile);
+  const last = LEDGER_HEALTH.get(ledgerFile) ?? { quarantined: 0, torn_tail: 0, first_bad_offset: null, reasons: [], at: null };
+  let recorded = 0;
+  let recordedPermanent = 0;
+  let firstRecordedOffset = null;
+  try {
+    const body = await readFile(sidecar, "utf8");
+    for (const l of body.split("\n")) {
+      if (!l.trim()) continue;
+      recorded += 1;
+      let rec = null;
+      try { rec = JSON.parse(l); } catch { /* count it, can't classify it */ }
+      if (rec && !TRANSIENT_DAMAGE_REASONS.has(rec.reason)) {
+        recordedPermanent += 1;
+        if (firstRecordedOffset == null) firstRecordedOffset = rec.offset ?? null;
+      }
+    }
+  } catch { /* no sidecar ⇒ nothing was ever quarantined */ }
+  return {
+    ok: last.quarantined === 0 && last.torn_tail === 0 && recordedPermanent === 0,
+    quarantined: last.quarantined,
+    torn_tail: last.torn_tail,
+    first_bad_offset: last.first_bad_offset ?? firstRecordedOffset,
+    reasons: last.reasons,
+    quarantined_recorded: recorded,
+    quarantined_unacknowledged: recordedPermanent,
+    quarantine_file: recorded ? sidecar : null,
+    last_read_at: last.at,
+    note: recordedPermanent
+      ? `${recordedPermanent} ledger line(s) never folded into state; raw bytes are in ${sidecar}. Repair the ledger or delete that file to acknowledge.`
+      : null,
+  };
+}
+
+export async function readEvents(runDir, { retryTorn = true } = {}) {
+  const ledgerFile = join(runDir, "events.jsonl");
+  const readOnce = async () => {
+    const body = await readFile(ledgerFile, "utf8");
+    LEDGER_READ_STATS.fullReads += 1;
+    LEDGER_READ_STATS.fullBytes += Buffer.byteLength(body);
+    return parseLedgerLines(body, { terminated: body === "" || body.endsWith("\n") });
+  };
+  let parsed;
+  try {
+    parsed = await readOnce();
   } catch (err) {
     if (err && err.code === "ENOENT") return [];
     throw err;
   }
+  // One retry for an unterminated tail — the writer may be mid-append, and a line that completes in the
+  // meantime is a real event we would otherwise report as damage.
+  if (retryTorn && parsed.bad.some((b) => b.reason === "torn_tail")) {
+    await sleep(LEDGER_TORN_RETRY_MS);
+    try { parsed = await readOnce(); } catch { /* keep the first parse */ }
+  }
+  await recordLedgerDamage(ledgerFile, parsed.bad);
   // Sorted at the single choke point every consumer reads through, so the fold, the derived-event
   // suppression set, and "latest kickback" queries all see event-time order (DER-2520).
   //
   // Then deduped by IDENTITY (DER-2748), at the same choke point and for the same reason: a duplicate
   // delivery is not news, and doing it here means every consumer — the fold, `derivedEventSeen`,
-  // `kickbackDossier`, `watch` — sees each event once without each re-deriving the rule. Sort BEFORE
-  // dedup so the surviving copy is the earliest by event time. Legacy lines carry no identity and are
-  // never dropped, so this cannot shrink a pre-0.2.0 ledger.
+  // `kickbackDossier` — sees each event once without each re-deriving the rule. Sort BEFORE dedup so
+  // the surviving copy is the earliest by event time. Legacy lines carry no identity and are never
+  // dropped, so this cannot shrink a pre-0.2.0 ledger.
   //
-  // Cursor contract (DER-2520/DER-2741): appends only ever ADD lines and dedup is deterministic on
-  // content, so the returned length is monotonic NON-DECREASING — `watch --since <count>` still works,
-  // and a pure re-pull correctly fails to advance it.
-  return dedupeLedgerEvents(sortEventsByTs(
-    body
-      .split("\n")
-      .filter((line) => line.trim())
-      .map((line) => JSON.parse(line)),
-  ));
+  // The returned length is still monotonic NON-DECREASING for a healthy ledger, which is what a legacy
+  // `watch --since <count>` cursor relies on — but `watch` NO LONGER cursors on it (DER-2741): position
+  // in this ts-sorted array is not a delivery cursor, because a backfilled historical event lands at an
+  // EARLY index. See `createLedgerTail` / `resolveWatchCursor`.
+  return dedupeLedgerEvents(sortEventsByTs(parsed.events));
+}
+
+// ---------------------------------------------------------------------------
+// The watch cursor (DER-2741) — a BYTE OFFSET into the append-only file
+// ---------------------------------------------------------------------------
+// DER-2520 made `readEvents` fold in event-time order; `watch` then cursored on the SORTED array's
+// LENGTH. A `--pull-hosts` backfill appends a remote host's HISTORICAL events at the tail (observed:
+// ~100 mini events from 13:17–17:03Z appended at 17:29Z), and after the sort they land at their EARLY
+// timestamp positions — index < the cursor. So `slice(since)` returned the already-seen recent tail and
+// the backfilled events could never appear in any future slice: a pending-work signal consumed without
+// ever being delivered. Length-preservation does not preserve the positional identity a cursor needs.
+//
+// The fix separates the two questions the old cursor conflated:
+//   - WHAT ORDER DOES STATE FOLD IN?   event time (ts sort) — unchanged, `readEvents`.
+//   - WHAT HAVE I NOT YET SEEN?        file position. Appends are ARRIVAL order, which is exactly what a
+//                                      watcher wants: a backfilled line is new BYTES, so it is fresh
+//                                      regardless of how early its ts is.
+// So the cursor is a byte offset (exact, monotonic, unaffected by sorting), carried across processes as
+// the `event_id` of the last delivered line (uuid v7 — time-sortable, so "everything after id X" is a
+// range query, per DER-2748) and reported alongside the legacy `events` count.
+const DEFAULT_LEDGER_IO = {
+  async size(path) {
+    try {
+      return (await stat(path)).size;
+    } catch (err) {
+      if (err && err.code === "ENOENT") return -1;
+      throw err;
+    }
+  },
+  async readRange(path, offset, length) {
+    const fh = await open(path, "r");
+    try {
+      const buf = Buffer.alloc(length);
+      const { bytesRead } = await fh.read(buf, 0, length, offset);
+      return buf.subarray(0, bytesRead);
+    } finally {
+      await fh.close();
+    }
+  },
+};
+
+// Stateful tail reader. `poll()` stats the file and reads ONLY the bytes past the cursor, so an idle poll
+// costs one stat and zero parsing however large the ledger is (#16). The offset advances only past
+// COMPLETE lines, so a torn tail is simply "not an event yet" — it is re-read (a few bytes) next poll and
+// delivered exactly once when the writer finishes. `io` is injectable for tests.
+export function createLedgerTail(filePath, { offset = 0, io = DEFAULT_LEDGER_IO } = {}) {
+  let cursorOffset = Math.max(0, Number(offset) || 0);
+  let lastEventId = null;
+  return {
+    get offset() { return cursorOffset; },
+    get lastEventId() { return lastEventId; },
+    async poll() {
+      LEDGER_READ_STATS.polls += 1;
+      LEDGER_READ_STATS.statCalls += 1;
+      const size = await io.size(filePath);
+      const nothing = { events: [], bad: [], bytes: 0, partial: false, rebuilt: false, unchanged: true };
+      if (size < 0) return nothing; // no ledger yet
+      let rebuilt = false;
+      // A file that SHRANK was rotated or replaced. Rebuilding from 0 REPLAYS; keeping the old offset
+      // would skip everything in the new file forever, and a cursor that can miss an event is worse
+      // than one that replays (this cursor drives dispatch).
+      if (size < cursorOffset) {
+        cursorOffset = 0;
+        rebuilt = true;
+      }
+      if (size === cursorOffset) return { ...nothing, rebuilt };
+      const buf = await io.readRange(filePath, cursorOffset, size - cursorOffset);
+      LEDGER_READ_STATS.tailReads += 1;
+      LEDGER_READ_STATS.tailBytes += buf.length;
+      const lastNl = buf.lastIndexOf(0x0a);
+      // Nothing complete yet: do NOT advance. The cursor always sits on a line boundary, which is also
+      // what makes reading a byte RANGE safe for multi-byte UTF-8.
+      if (lastNl < 0) return { events: [], bad: [], bytes: buf.length, partial: true, rebuilt, unchanged: false };
+      const parsed = parseLedgerLines(buf.subarray(0, lastNl + 1).toString("utf8"), { baseOffset: cursorOffset, terminated: true });
+      cursorOffset += lastNl + 1;
+      for (let i = parsed.events.length - 1; i >= 0; i -= 1) {
+        const id = parsed.events[i].event_id;
+        if (typeof id === "string" && id) { lastEventId = id; break; }
+      }
+      return { events: parsed.events, bad: parsed.bad, bytes: buf.length, partial: lastNl + 1 < buf.length, rebuilt, unchanged: false };
+    },
+  };
+}
+
+// Resolve a caller's `--since` into a byte offset. Three accepted forms, and every ambiguous case rounds
+// toward REPLAY (idempotent consumers) rather than skip:
+//   absent          start at EOF — only lines appended after this call wake us (today's default).
+//   <event_id>      EXACT: resume immediately after the line bearing that id. An id this ledger does not
+//                   contain replays from the start rather than guess.
+//   <count>         LEGACY, preserved for callers already passing the payload's `events`. Resolved by
+//                   counting parse-accepted LINES in file order. This can only err toward replay: the
+//                   Nth event of the DEDUPED, ts-sorted array is always at line >= N, so stopping after
+//                   line N stops at or before the caller's true position.
+export async function resolveWatchCursor(runDir, since) {
+  const ledgerFile = join(runDir, "events.jsonl");
+  LEDGER_READ_STATS.statCalls += 1;
+  const eof = Math.max(0, await DEFAULT_LEDGER_IO.size(ledgerFile));
+  const raw = since == null ? "" : String(since).trim();
+  if (!raw) return { offset: eof, mode: "eof", lastEventId: null, note: null };
+  const isCount = /^\d+$/.test(raw);
+  if (isCount && Number(raw) <= 0) return { offset: 0, mode: "count", lastEventId: null, note: null };
+  let body;
+  try {
+    body = await readFile(ledgerFile, "utf8");
+    LEDGER_READ_STATS.fullReads += 1;
+    LEDGER_READ_STATS.fullBytes += Buffer.byteLength(body);
+  } catch (err) {
+    if (err && err.code === "ENOENT") return { offset: 0, mode: "empty", lastEventId: null, note: null };
+    throw err;
+  }
+  const want = isCount ? Number(raw) : null;
+  const parts = body.split("\n");
+  let offset = 0;
+  let accepted = 0;
+  let lastId = null;
+  for (let i = 0; i < parts.length; i += 1) {
+    const part = parts[i];
+    const end = offset + Buffer.byteLength(part) + 1;
+    if (part.trim()) {
+      const v = classifyLedgerLine(part);
+      if (v.ok) {
+        accepted += 1;
+        if (typeof v.event.event_id === "string" && v.event.event_id) lastId = v.event.event_id;
+        if (isCount && accepted >= want) return { offset: Math.min(end, eof), mode: "count", lastEventId: lastId, note: null };
+        if (!isCount && v.event.event_id === raw) return { offset: Math.min(end, eof), mode: "event_id", lastEventId: raw, note: null };
+      }
+    }
+    offset = end;
+  }
+  if (isCount) {
+    return {
+      offset: eof, mode: "count", lastEventId: lastId,
+      note: want > accepted ? `--since ${want} is past the end of this ledger (${accepted} lines) — starting at EOF` : null,
+    };
+  }
+  return {
+    offset: 0, mode: "event_id_unknown", lastEventId: null,
+    note: `--since ${raw} is not an event_id in this ledger — REPLAYING from the start. A cursor that can MISS an event is worse than one that replays, because watch drives dispatch.`,
+  };
+}
+
+// Idle poll interval. `WORK_WATCH_POLL_MS` exists so the loop's tick rate is a tunable rather than a
+// magic number frozen in a hot loop (and so the #16 idle-cost control can drive many ticks without
+// asserting on wall-clock, which is flaky in CI). Clamped: a 0ms tick is a spin loop.
+export function watchPollMs() {
+  const raw = Number(process.env.WORK_WATCH_POLL_MS);
+  if (!Number.isFinite(raw)) return 2500;
+  return Math.min(60000, Math.max(5, Math.floor(raw)));
 }
 
 // Parse raw ledger lines pulled from a remote host's local events.jsonl (the mini), tagging each with
 // its host if the remote append didn't. Pure — the pull-host subcommand appends the result to the
 // canonical ledger. Blank lines are skipped so a trailing newline doesn't create an empty event.
-export function mergeRemoteEvents({ remoteLines = [], host } = {}) {
-  return remoteLines
-    .filter((l) => l && l.trim())
-    .map((l) => {
-      const e = JSON.parse(l);
-      if (host && !e.host) e.host = host;
-      return e;
-    });
+//
+// DER-2738: a malformed remote line is now SKIPPED AND RECORDED instead of throwing the whole pull away.
+// The remote tail is the likeliest place to meet a torn line — `tail -n +N` of a file the mini is
+// actively appending to. Pass `damage` to collect what was dropped (pull-host quarantines it); omit it
+// and the tolerance is still there, which is the point: no consumer can crash on one bad remote line.
+export function mergeRemoteEvents({ remoteLines = [], host, damage } = {}) {
+  const out = [];
+  for (let i = 0; i < remoteLines.length; i += 1) {
+    const l = remoteLines[i];
+    if (!l || !l.trim()) continue;
+    const v = classifyLedgerLine(l);
+    if (!v.ok) {
+      if (damage) {
+        damage.push({
+          reason: `remote_${v.reason}`, host: host ?? null, offset: null, line: i + 1,
+          bytes: Buffer.byteLength(String(l)), raw: String(l).slice(0, LEDGER_RAW_KEEP),
+          raw_truncated: String(l).length > LEDGER_RAW_KEEP, ...(v.detail ? { detail: v.detail } : {}),
+        });
+      }
+      continue;
+    }
+    const e = v.event;
+    if (host && !e.host) e.host = host;
+    out.push(e);
+  }
+  return out;
 }
 
 const ACTIVE_STATUSES = new Set(["in_progress", "pr_open", "kickback"]);
@@ -3373,6 +3749,10 @@ export function materializeState(rawEvents, meta = {}) {
     // that this ledger holds a foreign schema or two harness versions WITHOUT having to hit the dispatch
     // refusal to find out. `ok:false` is what the dispatch gate blocks on.
     protocol: ledgerProtocolVerdict(rawEvents ?? events),
+    // Byte-level ledger health (DER-2738), alongside the wire-protocol verdict above and for the same
+    // reason: a successor reading only state.json must learn that lines of this ledger NEVER FOLDED.
+    // `null` means "not measured by this caller" — never "clean". `state` and `watch` always measure.
+    ledger: meta.ledger ?? null,
     session_context: (() => {
       const m = {};
       for (const e of events) {
@@ -3699,10 +4079,15 @@ async function pullHostInto(runDir, hostName, runId) {
   const remote = `tail -n +${cursor + 1} ${remotePath} 2>/dev/null || true`;
   const res = await runCommand({ command: "ssh", args: [host.ssh, remote] });
   const lines = res.stdout.split("\n").filter((l) => l.trim());
-  const events = mergeRemoteEvents({ remoteLines: lines, host: hostName });
+  // DER-2738: one torn line in the mini's tail used to throw the whole pull (and the watch cycle that
+  // called it). Dropped lines are quarantined with their raw bytes so a lost remote event is VISIBLE —
+  // the per-host cursor still advances past them, so an invisible drop here would be permanent.
+  const damage = [];
+  const events = mergeRemoteEvents({ remoteLines: lines, host: hostName, damage });
   for (const e of events) await appendEvent(runDir, e);
+  if (damage.length) await recordLedgerDamage(join(runDir, "events.jsonl"), damage, { pulled_from: hostName });
   await writeFile(join(runDir, `sync-cursor.${hostName}`), String(cursor + lines.length), "utf8");
-  return { host: hostName, pulled: events.length, cursor: cursor + lines.length };
+  return { host: hostName, pulled: events.length, quarantined: damage.length, cursor: cursor + lines.length };
 }
 
 // Reconcile the ledger against `gh` truth (B3): list merged PRs, append a `pr_merged` for any in-flight
@@ -4877,7 +5262,8 @@ export async function runSubcommand(argv) {
     }
     case "state": {
       const events = await readEvents(runDir);
-      const state = materializeState(events, { run_id: o.runId, project: o.project });
+      // readEvents FIRST, then health: the health record describes the read that just happened.
+      const state = materializeState(events, { run_id: o.runId, project: o.project, ledger: await readLedgerHealth(runDir) });
       const out = `${JSON.stringify(state, null, 2)}\n`;
       await writeFile(join(runDir, "state.json"), out, "utf8");
       return { stdout: out.trimEnd(), state };
@@ -5630,13 +6016,20 @@ export async function runSubcommand(argv) {
       //                            separate reconcile-pr-events call (item 1/7, 2026-07-15 turnover).
       // All go through the canonical ledger, so a pulled/reconciled event then trips the wake below.
       const timeoutMs = clampWatchTimeout(o.timeout) * 1000;
-      let since = o.since != null ? Number(o.since) : (await readEvents(runDir)).length;
+      // DER-2741: the cursor is a BYTE OFFSET, resolved once from --since (absent ⇒ EOF, an event_id ⇒
+      // exact, a count ⇒ the preserved legacy form). Fresh events are then the NEW LINES of the
+      // append-only file — arrival order — so a `--pull-hosts` backfill of historical events is
+      // delivered even though the ts-sorted fold places it at an early index.
+      const cursor = await resolveWatchCursor(runDir, o.since);
+      const tail = createLedgerTail(join(runDir, "events.jsonl"), { offset: cursor.offset });
+      let cursorId = cursor.lastEventId;
       const nudgeBaseline = o["nudge-since"] != null ? Number(o["nudge-since"]) : await readNudge(runDir);
       const wakeSet = parseWakeOn(o.wakeOn);
       const pullHostNames = hostsToPull({ hosts: getHosts(), spec: o.pullHosts });
       const reconcileMerged = !!o.reconcileMerged;
       const reconcilePrEvents = !!o.reconcilePrEvents;
       const repoRoot = o.repoRoot ?? process.cwd();
+      const pollMs = watchPollMs();
       const PULL_INTERVAL_MS = 45000;
       const started = Date.now();
       let lastSideEffect = 0; // 0 ⇒ run pull/reconcile immediately on entry, then every ~45s
@@ -5659,9 +6052,17 @@ export async function runSubcommand(argv) {
         // re-surfaces everything still outstanding, every time, until it is actioned.
         const wakePayload = async (wake, extra = {}) => {
           const evs = await readEvents(runDir);
-          const st = materializeState(evs, { run_id: o.runId });
+          const st = materializeState(evs, { run_id: o.runId, ledger: await readLedgerHealth(runDir) });
           return JSON.stringify({
-            wake, events: evs.length, ...extra,
+            wake, events: evs.length,
+            // The RESUMABLE cursor. `offset` is exact; `cursor` is the portable form (`--since <id>`);
+            // `events` is the legacy count, still accepted by --since and still what old callers feed
+            // back. Prefer `cursor`: a count cannot express "after this event" once a backfill has
+            // shuffled the ts-sorted array.
+            cursor: tail.lastEventId ?? cursorId ?? null,
+            offset: tail.offset,
+            ...(cursor.note ? { cursor_note: cursor.note } : {}),
+            ...extra,
             pending: {
               kickbacks: st.kickbacks_pending ?? [],
               lead_rotate: (st.lead_rotate_pending ?? []).map((r) => r.issue),
@@ -5673,22 +6074,38 @@ export async function runSubcommand(argv) {
               // happens to run `state`. It already blocks dispatch; this is how the operator learns why
               // before they hit the refusal. `state.protocol.reasons` names the hosts.
               protocol_skew: !(st.protocol?.ok ?? true),
+              // DER-2738: lines of this ledger that never folded into state. Surfaced on EVERY wake for
+              // the same reason as protocol_skew — an operator must not have to run `state` to find out
+              // that the run's source of truth has holes in it. `state.ledger` names the file.
+              ledger_damage: !(st.ledger?.ok ?? true),
             },
           });
         };
         if ((await readNudge(runDir)) > nudgeBaseline) {
           return { stdout: await wakePayload("nudge") };
         }
-        const events = await readEvents(runDir);
-        if (events.length > since) {
-          const fresh = events.slice(since);
+        // One stat when idle; only the NEW bytes when something was appended (#16). Work per poll scales
+        // with new activity, not with total history.
+        const step = await tail.poll();
+        if (step.bad.length) await recordLedgerDamage(join(runDir, "events.jsonl"), step.bad);
+        if (step.events.length) {
+          const fresh = dedupeLedgerEvents(step.events);
+          if (fresh.length) cursorId = tail.lastEventId ?? cursorId;
           if (!wakeSet || fresh.some((e) => wakeSet.has(e.type))) {
-            return { stdout: await wakePayload("event", { since }) };
+            return {
+              stdout: await wakePayload("event", {
+                // Echo the cursor the caller GAVE US, in the type they gave it (a legacy count stays a
+                // number), so an existing consumer of this field sees no change of shape.
+                since: o.since == null ? null : (/^\d+$/.test(String(o.since).trim()) ? Number(o.since) : String(o.since)),
+                fresh: fresh.length,
+                fresh_types: fresh.slice(0, 50).map((e) => e.type),
+              }),
+            };
           }
-          since = events.length; // consume noise: advance past it and keep blocking (don't re-scan)
+          // Consume noise: the offset has already advanced past it, so we keep blocking without re-scan.
         }
         if (Date.now() - started >= timeoutMs) return { stdout: await wakePayload("timeout") };
-        await sleep(2500);
+        await sleep(pollMs);
       }
     }
     default:
@@ -5775,7 +6192,10 @@ Design: the README's context-rotation section.
   pull-host --run <r> --host <h>              merge host <h>'s mini-local ledger into the canonical one
   reconcile-pr-events --run <r>               fold cloud leads' draft-PR lifecycle + WORK-EVENT comments in; refresh links.md (DER-1834)
   links --run <r>                             write <run-dir>/links.md — per-lead claude.ai/code monitor URLs (item 7)
-  watch --run <r> [--since n] [--timeout 240, max 300] block until a new ledger event / nudge file / timeout; prints {wake,events}
+  watch --run <r> [--since <event_id|count>] [--timeout 240, max 300] block until a new ledger event / nudge / timeout
+                          prints {wake,events,cursor,offset,fresh_types,pending}. PREFER --since <cursor> (the
+                          event_id echoed back): a count cannot say "after this event" once a --pull-hosts
+                          backfill has shuffled the ts-sorted fold (DER-2741). A count still works.
         [--wake-on actionable|<csv>]          only wake on these event types (default: any new event)
         [--pull-hosts auto|<csv>]             each ~45s, tail these mini hosts' ledgers into the canonical one
         [--reconcile-merged]                  each ~45s, fold 'gh pr list --state merged' truth in (reap out-of-band merges)

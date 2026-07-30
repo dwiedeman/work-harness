@@ -82,6 +82,24 @@ Each fix below landed with a regression test that was **observed failing on the 
 - **`work-metrics.mjs` disagreed with the runner about the same ledger** — a duplicated line reported 165
   tokens against the runner's correct 110. Its dedup rule is deliberately duplicated (that module is
   standalone by contract) and pinned by an agreement test over six ledgers.
+- **DER-2738 — one torn or malformed ledger line no longer crashes every consumer.** `readEvents` did a raw
+  `JSON.parse` per line, so a writer interrupted mid-append (the signature of a concurrent writer) threw
+  `SyntaxError` out of `state`, `watch`, and every other consumer. Parsing is now tolerant at the single
+  choke point — but **never silent**, because an invisible dropped line is data loss you cannot see. Every
+  dropped line is preserved with its **raw bytes** in `<runDir>/ledger-quarantine.jsonl`, warned once per
+  signature on stderr, surfaced as `state.ledger`, raised as `pending.ledger_damage` on every `watch` wake,
+  and labelled in the `work-metrics` report so a number over a holed ledger reads as a lower bound. A torn
+  *tail* does not latch (it is usually a live writer and clears on the next clean read); a malformed
+  *complete* record latches until acknowledged. The damage report is a **sidecar, never an appended event** —
+  appending to a ledger whose last line is torn would glue the new line onto the partial one.
+- **DER-2741 — the watch cursor no longer misses backfilled events, and idle watch stops re-reading the
+  whole ledger.** The cursor was an event *count* over a ts-sorted array, so a historical event appended at
+  the tail by `--pull-hosts` sorted behind the watcher's position and was **silently skipped** — a dropped
+  dispatch signal. The cursor is now a byte offset carried across processes as the last delivered
+  `event_id`, and fresh events are the lines appended since, in arrival order. `--since <count>` still works
+  and can only round toward *replay*, never skip; `--since <garbage>` used to become `NaN` and never wake at
+  all, and now replays. Idle ticks stat an unchanged file instead of re-parsing it (`WORK_WATCH_POLL_MS`
+  tunes the interval).
 
 ### Added
 

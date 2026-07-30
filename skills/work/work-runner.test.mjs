@@ -2,6 +2,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, mkdir, rm, readFile, symlink, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
@@ -5040,5 +5041,277 @@ test("skills-sync: the host hash covers session-token-report.mjs, and a missing 
     assert.ok(!/'~/.test(remote));
   } finally {
     await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// DER-2738 — one torn/malformed ledger line must not crash every consumer
+// ---------------------------------------------------------------------------
+// The crash shape is a writer INTERRUPTED MID-APPEND: the file's last line is truncated mid-JSON with no
+// newline. `readEvents` is the single choke point every consumer reads through (`state`, `watch`, `reap`,
+// reconciliation), so one such line took down the ledger at exactly the moment it is needed for recovery.
+//
+// Tolerance here is NOT "wrap JSON.parse in try/catch and move on": a torn line is the signature of a
+// concurrent writer, and silently dropping it is data loss nobody can see. Every control below therefore
+// asserts BOTH halves — the read survives, AND the damage is recorded somewhere an operator looks.
+
+// Write a ledger BYTE-EXACTLY (no trailing newline unless `text` has one), bypassing appendEvent.
+async function rawRunDir(lines, { terminate = true } = {}) {
+  const root = await mkdtemp(join(tmpdir(), "wr-torn-"));
+  const runId = "20260730T000000Z-torn";
+  const dir = join(root, runId);
+  await mkdir(dir, { recursive: true });
+  await writeFile(join(dir, "events.jsonl"), lines.join("\n") + (terminate ? "\n" : ""), "utf8");
+  return { root, runId, dir };
+}
+
+const L = (o) => JSON.stringify(o);
+const HEALTHY_LINES = [
+  L({ actor: "orch", type: "run_started", project: "sandbox", ts: "2026-07-30T10:00:00.000Z" }),
+  L({ actor: "orch", type: "lead_spawned", issue: "DER-1", ts: "2026-07-30T10:01:00.000Z" }),
+];
+
+test("DER-2738: a ledger whose LAST line is truncated mid-JSON does not crash any consumer, and the survivors still fold", async () => {
+  // The real crash shape: `{"type":"pr_opened","issue":"DER-1","pr":  ← process killed mid-append.
+  const torn = '{"actor":"lead:DER-1","type":"pr_opened","issue":"DER-1","pr":';
+  const { root, runId, dir } = await rawRunDir([...HEALTHY_LINES, torn], { terminate: false });
+  try {
+    const events = await readEvents(dir);
+    assert.deepEqual(events.map((e) => e.type), ["run_started", "lead_spawned"], "the valid PREFIX must survive a torn tail");
+    // …and the consumer every recovery path goes through must still answer.
+    const st = await runSubcommand(["state", "--run", runId, "--runs-root", root]);
+    assert.equal(st.state.issues["DER-1"].status, "in_progress", "the fold must still see the events that ARE intact");
+    // VISIBLE, not swallowed.
+    assert.equal(st.state.ledger.ok, false, "a damaged ledger must not report clean");
+    assert.equal(st.state.ledger.torn_tail, 1);
+    assert.equal(typeof st.state.ledger.first_bad_offset, "number");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("DER-2738: a malformed COMPLETE record mid-file is quarantined with its raw bytes, and named in state", async () => {
+  const badMiddle = '{"actor":"lead:DER-1","type":"kickback",,,}';
+  const torn = '{"type":"pr_merged","issue":"DER-1","pr":7';
+  const { root, runId, dir } = await rawRunDir(
+    [HEALTHY_LINES[0], badMiddle, HEALTHY_LINES[1], torn],
+    { terminate: false },
+  );
+  try {
+    const st = await runSubcommand(["state", "--run", runId, "--runs-root", root]);
+    const led = st.state.ledger;
+    assert.equal(led.ok, false);
+    assert.equal(led.quarantined, 1, "the malformed COMPLETE record is quarantined");
+    assert.equal(led.torn_tail, 1, "the unterminated tail is reported separately — it may still be being written");
+    // The bad offset must be the byte offset of the malformed middle line, i.e. just past line 1.
+    assert.equal(led.first_bad_offset, Buffer.byteLength(HEALTHY_LINES[0]) + 1);
+    // DURABLE and RECOVERABLE: the raw bytes of every dropped line are kept in a sidecar, so a dropped
+    // line is repairable by hand rather than lost.
+    const q = await readFile(join(dir, "ledger-quarantine.jsonl"), "utf8");
+    const recs = q.trim().split("\n").map((l) => JSON.parse(l));
+    assert.equal(recs.length, 2, `both bad lines recorded, got ${q}`);
+    assert.ok(recs.some((r) => r.reason === "malformed_json" && r.raw === badMiddle), `raw bytes of the malformed record kept: ${q}`);
+    assert.ok(recs.some((r) => r.reason === "torn_tail" && r.raw === torn), `raw bytes of the torn tail kept: ${q}`);
+    assert.ok(recs.every((r) => typeof r.offset === "number" && r.detected_at), "each record locates the damage in the file and in time");
+    assert.equal(led.quarantine_file, join(dir, "ledger-quarantine.jsonl"), "state points the operator at the file");
+    // A second read must not re-record the same damage forever.
+    await runSubcommand(["state", "--run", runId, "--runs-root", root]);
+    const again = (await readFile(join(dir, "ledger-quarantine.jsonl"), "utf8")).trim().split("\n");
+    assert.equal(again.length, 2, "quarantine records are deduped by signature across reads");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("DER-2738 CONTROL: a HEALTHY ledger reports clean, writes no quarantine file, and raises no banner", async () => {
+  // The control that proves the gate does not fire on the healthy case (a warning that is always on is
+  // not a warning). Same code path, undamaged input.
+  const { root, runId, dir } = await rawRunDir(HEALTHY_LINES);
+  try {
+    const st = await runSubcommand(["state", "--run", runId, "--runs-root", root]);
+    assert.equal(st.state.ledger.ok, true);
+    assert.equal(st.state.ledger.quarantined, 0);
+    assert.equal(st.state.ledger.torn_tail, 0);
+    assert.equal(st.state.ledger.first_bad_offset, null);
+    assert.equal(existsSync(join(dir, "ledger-quarantine.jsonl")), false, "no damage ⇒ no sidecar");
+    const w = JSON.parse((await runSubcommand(["watch", "--run", runId, "--runs-root", root, "--timeout", "1"])).stdout);
+    assert.equal(w.pending.ledger_damage, false, "a clean ledger must not raise the damage banner");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("DER-2738: `watch` survives a damaged ledger and raises ledger_damage on EVERY wake", async () => {
+  const { root, runId } = await rawRunDir([...HEALTHY_LINES, '{"type":"pr_opened"'], { terminate: false });
+  try {
+    const w = JSON.parse((await runSubcommand(["watch", "--run", runId, "--runs-root", root, "--timeout", "1"])).stdout);
+    assert.equal(w.wake, "timeout");
+    assert.equal(w.pending.ledger_damage, true, "the operator learns about ledger damage at the next wake, not at the post-mortem");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("DER-2738: mergeRemoteEvents tolerates a torn/malformed remote line, records it, and keeps the rest", async () => {
+  const damage = [];
+  const good = L({ type: "pr_opened", issue: "DER-9", ts: "2026-07-30T10:00:00.000Z" });
+  const out = mergeRemoteEvents({ remoteLines: [good, "{truncated", "42", ""], host: "mini", damage });
+  assert.deepEqual(out.map((e) => e.type), ["pr_opened"], "a bad remote line must not kill the whole pull");
+  assert.equal(out[0].host, "mini");
+  assert.equal(damage.length, 2, `both bad remote lines recorded, got ${JSON.stringify(damage)}`);
+  assert.ok(damage.every((d) => d.raw && d.reason), "each recorded with its raw bytes and a reason");
+  // CONTROL: an all-good pull records NOTHING (an always-on warning is not a warning).
+  const clean = [];
+  assert.equal(mergeRemoteEvents({ remoteLines: [good, good], host: "mini", damage: clean }).length, 2);
+  assert.equal(clean.length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// DER-2741 — the watch cursor must not MISS a backfilled event
+// ---------------------------------------------------------------------------
+// DER-2520 made `readEvents` sort by effective ts so the fold sees event-time order. `watch` cursored on
+// the sorted array's LENGTH, so a `--pull-hosts` backfill (a remote host's HISTORICAL events appended at
+// the tail) sorted to EARLY indices — below the cursor — and could never appear in a future slice. A
+// cursor that can MISS an event is worse than one that replays: `watch` drives dispatch.
+
+test("DER-2741: a BACKFILLED historical event appended at the tail is delivered to a watcher already past its ts", async () => {
+  const root = await mkdtemp(join(tmpdir(), "wr-backfill-"));
+  try {
+    const { runId } = await runSubcommand(["init-run", "--project", "sandbox", "--runs-root", root]);
+    const dir = join(root, runId);
+    // A RECENT, non-actionable event the watcher has already consumed.
+    await appendEvent(dir, { actor: "orch", type: "token_usage", total_tokens: 5, ts: "2026-07-30T17:00:00.000Z" });
+    const cursor = (await readEvents(dir)).length;
+    // The backfill: `pull-host` appends a mini's HISTORICAL pr_opened (13:17Z) at the file tail at 17:29Z.
+    await appendEvent(dir, { actor: "lead:DER-1", type: "pr_opened", issue: "DER-1", pr: 11, host: "mini", ts: "2026-07-30T13:17:00.000Z" });
+    // ts-sort puts it BELOW the cursor, so today's `events.slice(since)` hands back the recent noise
+    // instead and the actionable backfill is consumed without ever being delivered.
+    const w = JSON.parse((await runSubcommand([
+      "watch", "--run", runId, "--runs-root", root, "--wake-on", "actionable",
+      "--since", String(cursor), "--nudge-since", "0", "--timeout", "1",
+    ])).stdout);
+    assert.equal(w.wake, "event", "the backfilled pr_opened must WAKE the watcher — a missed dispatch signal is the defect");
+    assert.deepEqual(w.fresh_types, ["pr_opened"], "and it must be the event delivered, not the already-seen recent noise");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("DER-2741: the cursor is an event_id range, and --since <event_id> resumes exactly after that line", async () => {
+  const root = await mkdtemp(join(tmpdir(), "wr-cursor-id-"));
+  try {
+    const { runId } = await runSubcommand(["init-run", "--project", "sandbox", "--runs-root", root]);
+    const dir = join(root, runId);
+    const a = await appendEvent(dir, { actor: "orch", type: "lead_spawned", issue: "DER-1", ts: "2026-07-30T10:00:00.000Z" });
+    await appendEvent(dir, { actor: "orch", type: "pr_opened", issue: "DER-1", pr: 3, ts: "2026-07-30T10:05:00.000Z" });
+    const w = JSON.parse((await runSubcommand([
+      "watch", "--run", runId, "--runs-root", root, "--since", a.event_id, "--nudge-since", "0", "--timeout", "1",
+    ])).stdout);
+    assert.equal(w.wake, "event");
+    assert.deepEqual(w.fresh_types, ["pr_opened"], "exactly the lines after the cursor id, no replay of the cursor line itself");
+    assert.equal(typeof w.cursor, "string", "the payload hands back a resumable cursor");
+    assert.match(w.cursor, /^[0-9a-f-]{36}$/);
+    // An UNKNOWN cursor id must REPLAY, never silently skip.
+    const r = JSON.parse((await runSubcommand([
+      "watch", "--run", runId, "--runs-root", root, "--since", "00000000-0000-7000-8000-000000000000",
+      "--nudge-since", "0", "--timeout", "1",
+    ])).stdout);
+    assert.equal(r.wake, "event");
+    assert.ok(r.fresh_types.length >= 3, `an unresolvable cursor replays from the start, got ${JSON.stringify(r.fresh_types)}`);
+    assert.match(String(r.cursor_note ?? ""), /replay/i, "and says so");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("DER-2741: `watch --since <count>` still works for callers that already pass one", async () => {
+  const root = await mkdtemp(join(tmpdir(), "wr-cursor-count-"));
+  try {
+    const { runId } = await runSubcommand(["init-run", "--project", "sandbox", "--runs-root", root]);
+    const dir = join(root, runId);
+    await appendEvent(dir, { actor: "orch", type: "lead_spawned", issue: "DER-1", ts: "2026-07-30T10:00:00.000Z" });
+    // 2 events on the ledger; a caller holding the count 1 must be told about the 2nd, exactly once.
+    const w = JSON.parse((await runSubcommand(["watch", "--run", runId, "--runs-root", root, "--since", "1", "--nudge-since", "0", "--timeout", "1"])).stdout);
+    assert.equal(w.wake, "event");
+    assert.equal(w.events, 2, "the `events` count in the payload is unchanged — it is what callers feed back");
+    assert.deepEqual(w.fresh_types, ["lead_spawned"]);
+    // A count AT the end of the ledger does not spuriously wake…
+    assert.equal(JSON.parse((await runSubcommand(["watch", "--run", runId, "--runs-root", root, "--since", "2", "--nudge-since", "0", "--timeout", "1"])).stdout).wake, "timeout");
+    // …and a count PAST the end (an over-large --since) does not wake either.
+    assert.equal(JSON.parse((await runSubcommand(["watch", "--run", runId, "--runs-root", root, "--since", "99", "--nudge-since", "0", "--timeout", "1"])).stdout).wake, "timeout");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("DER-2741 (#16): idle watch does not re-parse the whole ledger every tick", async () => {
+  // Work done, not wall-clock (which is flaky in CI): LEDGER_READ_STATS counts whole-ledger reads and the
+  // bytes each parse consumed. The review benchmark was a 100k-event/9.8 MB ledger at ~310 ms/read, ~120×
+  // over a 5-minute idle watch — i.e. work per poll scaling with total history instead of new activity.
+  assert.ok(WR.LEDGER_READ_STATS, "expected an injected seam LEDGER_READ_STATS that counts ledger read work");
+  assert.equal(typeof WR.resetLedgerReadStats, "function");
+  const root = await mkdtemp(join(tmpdir(), "wr-idle-"));
+  const prevPoll = process.env.WORK_WATCH_POLL_MS;
+  try {
+    const { runId } = await runSubcommand(["init-run", "--project", "sandbox", "--runs-root", root]);
+    const dir = join(root, runId);
+    for (let i = 0; i < 200; i += 1) {
+      await appendEvent(dir, { actor: "orch", type: "token_usage", total_tokens: i, ts: new Date(Date.UTC(2026, 6, 30, 10, 0, i)).toISOString() });
+    }
+    const size = (await readFile(join(dir, "events.jsonl"), "utf8")).length;
+    process.env.WORK_WATCH_POLL_MS = "5"; // many ticks inside a 1s watch, without wall-clock assertions
+    WR.resetLedgerReadStats();
+    await runSubcommand(["watch", "--run", runId, "--runs-root", root, "--nudge-since", "0", "--timeout", "1"]);
+    const s = { ...WR.LEDGER_READ_STATS };
+    // ANTI-VACUITY: the loop must actually have ticked many times, or this asserts nothing at all.
+    assert.ok(s.polls >= 20, `expected the idle loop to poll many times, got ${s.polls}`);
+    // THE GATE: idle work is bounded by a constant number of whole-ledger parses (cursor resolution at
+    // entry + the one state fold in the wake payload), NOT by the number of polls.
+    assert.ok(s.fullReads <= 2, `whole-ledger reads must not scale with polls: ${s.fullReads} reads over ${s.polls} polls`);
+    assert.ok(s.fullBytes <= size * 2 + 4096, `bytes parsed must not scale with polls: ${s.fullBytes} over a ${size}-byte ledger`);
+    // CONTROL that the instrument can move (a counter that never rises would make the gate unfailable):
+    // one explicit whole-ledger read registers one whole-ledger read.
+    WR.resetLedgerReadStats();
+    await readEvents(dir);
+    assert.equal(WR.LEDGER_READ_STATS.fullReads, 1);
+    assert.ok(WR.LEDGER_READ_STATS.fullBytes >= size, `a real full read is counted: ${WR.LEDGER_READ_STATS.fullBytes}`);
+  } finally {
+    if (prevPoll === undefined) delete process.env.WORK_WATCH_POLL_MS; else process.env.WORK_WATCH_POLL_MS = prevPoll;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("DER-2741: the ledger tail reads only NEW bytes, buffers a torn partial line, and rebuilds if the file shrinks", async () => {
+  assert.equal(typeof WR.createLedgerTail, "function", "expected an offset-cursored tail reader");
+  const root = await mkdtemp(join(tmpdir(), "wr-tail-"));
+  try {
+    const file = join(root, "events.jsonl");
+    await writeFile(file, `${HEALTHY_LINES.join("\n")}\n`, "utf8");
+    const tail = WR.createLedgerTail(file);
+    const first = await tail.poll();
+    assert.deepEqual(first.events.map((e) => e.type), ["run_started", "lead_spawned"]);
+    assert.equal(tail.offset, Buffer.byteLength(`${HEALTHY_LINES.join("\n")}\n`));
+    // Idle poll: nothing new ⇒ nothing read.
+    const idle = await tail.poll();
+    assert.deepEqual(idle.events, []);
+    assert.equal(idle.bytes, 0, "an unchanged file must cost zero bytes read");
+    // A torn append: the partial line is NOT delivered and NOT consumed…
+    const partial = '{"type":"pr_opened","issue":"DER-2"';
+    await writeFile(file, `${HEALTHY_LINES.join("\n")}\n${partial}`, "utf8");
+    const torn = await tail.poll();
+    assert.deepEqual(torn.events, [], "a half-written line is not an event yet");
+    assert.equal(torn.partial, true);
+    // …so when the writer finishes, it is delivered exactly once.
+    await writeFile(file, `${HEALTHY_LINES.join("\n")}\n${partial},"pr":4}\n`, "utf8");
+    const done = await tail.poll();
+    assert.deepEqual(done.events.map((e) => e.pr), [4]);
+    assert.deepEqual((await tail.poll()).events, [], "and never again");
+    // A file that SHRINKS (rotated/replaced) is a new file: rebuild from 0 rather than skip forever.
+    await writeFile(file, `${HEALTHY_LINES[0]}\n`, "utf8");
+    const reset = await tail.poll();
+    assert.deepEqual(reset.events.map((e) => e.type), ["run_started"]);
+    assert.equal(reset.rebuilt, true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
 });

@@ -46,23 +46,60 @@ export function parseArgs(argv) {
 // ignored rather than raising).
 // ---------------------------------------------------------------------------
 
+// What "a bad line" MEANS. MUST stay behaviourally identical to work-runner.mjs's `classifyLedgerLine`
+// (DER-2738): the runner now QUARANTINES the lines it cannot fold instead of throwing on them, and if the
+// two readers disagreed about which lines those are they would report different histories for one ledger —
+// the DER-2581 defect class, measured once already (a duplicated `token_usage` reported 165 tokens here
+// against the runner's correct 110).
+//
+// Deliberately DUPLICATED rather than imported: this module's contract (see the header) is that it is
+// standalone and imports nothing from work-runner.mjs. The duplication is made safe by the agreement test
+// in work-metrics.test.mjs, which runs BOTH implementations over one table of lines and ledgers — including
+// a truncated tail line and a malformed complete record — and asserts identical output. Drift fails CI.
+//
+// A `no_type` object is a bad line, not a kept one: it can never fold into a run's state or metrics.
+export function classifyLedgerLine(line) {
+  const trimmed = String(line ?? "").trim();
+  if (!trimmed) return { ok: false, reason: "blank" };
+  let d;
+  try {
+    d = JSON.parse(trimmed);
+  } catch (err) {
+    return { ok: false, reason: "malformed_json", detail: String(err?.message ?? err).slice(0, 200) };
+  }
+  if (!d || typeof d !== "object" || Array.isArray(d)) return { ok: false, reason: "not_an_object" };
+  if (!d.type) return { ok: false, reason: "no_type" };
+  return { ok: true, event: d };
+}
+
+// Tolerant read: a torn tail line (a writer killed mid-append) or one malformed record must not fail the
+// whole report. The runner's `readEvents` additionally QUARANTINES what it skipped, with the raw bytes, so
+// the drop is visible to an operator (`state.ledger`, `<runDir>/ledger-quarantine.jsonl`). This reader
+// stays read-only by design — it is a reporting tool that may run over archived runs — so it skips the
+// same lines and reports the count on the metrics record instead.
 export function readEvents(runDir) {
   const file = join(runDir, "events.jsonl");
   const raw = readFileSync(file, "utf8");
   const events = [];
+  let skipped = 0;
   for (const line of raw.split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    let d;
-    try {
-      d = JSON.parse(trimmed);
-    } catch {
-      continue; // malformed line — skip, don't fail the whole report
+    if (!line.trim()) continue; // a trailing newline is not damage
+    const v = classifyLedgerLine(line);
+    if (!v.ok) {
+      skipped += 1;
+      continue;
     }
-    if (!d || typeof d !== "object" || !d.type) continue;
-    events.push(d);
+    events.push(v.event);
   }
+  LAST_READ_SKIPPED.set(file, skipped);
   return dedupeLedgerEvents(events);
+}
+
+// Lines the last read of a given ledger could not fold. Read by computeRunMetrics so a damaged ledger
+// cannot report as a complete history — a metrics report over a ledger with holes in it must say so.
+const LAST_READ_SKIPPED = new Map();
+export function lastReadSkipped(runDir) {
+  return LAST_READ_SKIPPED.get(join(runDir, "events.jsonl")) ?? 0;
 }
 
 // Exactly-once read (DER-2748). MUST stay behaviourally identical to work-runner.mjs's
@@ -288,7 +325,7 @@ export function computeLeadTypeBreakdown(events) {
     .sort((a, b) => (a.leadType === "claude" ? -1 : b.leadType === "claude" ? 1 : a.leadType.localeCompare(b.leadType)));
 }
 
-export function computeMetricsFromEvents(events, { run, runDir = null, usageJson = null } = {}) {
+export function computeMetricsFromEvents(events, { run, runDir = null, usageJson = null, ledgerSkipped = 0 } = {}) {
   let runStartedTs = null;
   // Spec mode (2026-07-29): recorded so a spec-mode run and an issue-mode run can be compared on the
   // SAME metrics. Without it the two modes are indistinguishable in the trend table and the A/B this
@@ -459,6 +496,10 @@ export function computeMetricsFromEvents(events, { run, runDir = null, usageJson
     mode: runMode,
     tracking: runTracking,
     eventCount: events.length,
+    // DER-2738: lines the reader could not fold. A metrics report over a ledger with holes in it must say
+    // so — every number below is computed over `eventCount` events out of `eventCount + ledgerSkipped`
+    // lines, and a silent skip is the difference between "this run was cheap" and "we lost the receipts".
+    ledgerSkipped,
     prsMerged: mergedPrs.length,
     issuesClosed: issuesClosedSet.size,
     issuesClosedList: [...issuesClosedSet].sort(),
@@ -483,7 +524,7 @@ export function computeMetricsFromEvents(events, { run, runDir = null, usageJson
 export function computeRunMetrics(runDir) {
   const events = readEvents(runDir);
   const usageJson = loadUsageJson(runDir);
-  return computeMetricsFromEvents(events, { run: basename(runDir), runDir, usageJson });
+  return computeMetricsFromEvents(events, { run: basename(runDir), runDir, usageJson, ledgerSkipped: lastReadSkipped(runDir) });
 }
 
 // ---------------------------------------------------------------------------
@@ -612,6 +653,16 @@ export function renderRunMarkdown(m) {
   if (m.tokens.discrepancyNote) {
     lines.push("");
     lines.push(`> Data-quality note: ${m.tokens.discrepancyNote}`);
+  }
+  // DER-2738: a report over a ledger with unreadable lines must SAY it had holes. Silently reporting
+  // fewer merges / fewer tokens is exactly the invisible data loss the tolerance is not allowed to cause.
+  if (m.ledgerSkipped) {
+    lines.push("");
+    lines.push(
+      `> LEDGER DAMAGE: ${m.ledgerSkipped} line(s) of this run's events.jsonl could not be read (torn or ` +
+      `malformed) and are NOT counted above. The runner quarantines their raw bytes in ` +
+      `\`<runDir>/ledger-quarantine.jsonl\` — treat every number in this report as a lower bound.`,
+    );
   }
   return lines.join("\n");
 }
