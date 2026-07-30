@@ -136,6 +136,33 @@ Each fix below landed with a regression test that was **observed failing on the 
   `state.reap_failures` with per-step remediation, raises `pending.reap_failures`, and is actionable so it
   wakes the loop. Note the original framing was backwards about panes: appending `reaped` is precisely what
   enqueues an issue's refs into `sweepPlan`, and `sweep-workspaces` re-closes them *and* checks exit codes.
+- **DER-2603 — `ready` no longer prints a go-ahead word for a PR whose pre-PR review gate never ran.**
+  `gateEvidenceVerdict` treated an ABSENT `review_findings` event as non-blocking, so a PR that skipped the
+  gate was indistinguishable from one that passed it — three PRs skipped it in one shift and one merged. Both
+  go-ahead words are gated now (`*** ENQUEUEABLE ***` and DER-2753's `*** MERGEABLE (direct) ***`; a direct
+  merge that skipped the gate is strictly worse, since no queue will catch it), and `readyVerdict` refuses
+  when handed no gate verdict at all — previously *omitting* it read as a pass. MISSING and UNKNOWN both fail
+  closed but name different jobs: "you skipped it" versus "I could not read the evidence" (no `--run`, PR not
+  tracked, or a pre-stamp ledger, discriminated mechanically by DER-2748's `harness_version` on
+  `run_started`). `UNSTAMPED` still passes deliberately — the event's existence proves the gate ran, and
+  blocking it would refuse work over the runner's age. Surfaced as `state.gate_missing` +
+  `pending.gate_missing`.
+  Two further defects fell out of this. A **live** one: `latestGateEvent`'s filter is
+  `if (issueId && e.issue !== issueId)`, so an `undefined` issue matched **every** issue — an untracked PR
+  could read `gate=CURRENT` off a *sibling unit's* evidence and print the go-ahead word. And the test pinning
+  this behaviour asserted only `.state` beneath a comment claiming "neither is silently a pass"; `absent`
+  **was** silently a pass, and nothing checked the claim. That comment/assertion gap is what the merge went
+  through, so the test now asserts `blocks`.
+- **DER-2746 — `init-run` runs the canonical plan validator.** It applied only two cheap local checks, so it
+  accepted plans `prep-runner validate` rejects: two doors onto one plan file at different strictness, which
+  makes the weaker one the only one that matters. It now calls the same exported `validatePlan` with the same
+  options, via a dynamic cross-skill import (work-runner.mjs is copied to hosts where the prep skill isn't
+  installed, so a static import would break every subcommand to protect one). Validation also moved **before**
+  `mkdir`: a refused `init-run` previously still created the run directory, and `assertExistingRunDir`
+  (DER-2570) treats a run directory as proof the run exists — so every later subcommand would operate on a
+  ledger with no `run_started`. This legitimately refuses plan shapes that used to reach dispatch (missing
+  plan review, unresolved gates, unrecorded symbol/evidence checks, a risk lane on a weak lead type); the
+  escape is the documented `planReviewSkipped:{why}`, not a `--force`.
 
 ### Added
 

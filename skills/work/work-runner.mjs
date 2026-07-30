@@ -1109,9 +1109,28 @@ export function parseChecksOutput(text = "") {
 //   - gate sha != head, blockers > 0      → STALE-DIRTY. BLOCK. The only record of this PR's local gate
 //                                            says it had open blockers, and no evidence covers the tree
 //                                            that would merge. This is exactly DER-2513's shape.
-//   - no gate event at all                → ABSENT. Report; the cloud bot is the gate of record.
-export function gateEvidenceVerdict({ head, gate } = {}) {
-  if (!gate) return { state: "absent", blocks: false, label: "gate=ABSENT" };
+//   - no gate event at all                → MISSING. BLOCK (DER-2603, below).
+//
+// DER-2603 (three PRs in one shift, #1081 MERGED): ABSENT used to be `blocks: false` — "report; the cloud
+// bot is the gate of record". That made the ONE documented pre-enqueue check unable to return the failing
+// answer, so `ready` printed the go-ahead word on PRs nothing established had ever been locally reviewed.
+// Both the shepherd and the orchestrator read that instrument and both acted on it, which is why this is a
+// harness defect rather than either role's mistake. A missing gate now BLOCKS, in BOTH merge modes — a
+// direct merge that skipped the gate is strictly worse than an enqueue that did, since no queue catches it.
+//
+// UNKNOWN vs ABSENT is the distinction that keeps this gate switched on. "You skipped it" and "I could not
+// tell" both fail closed, but they oblige the operator to do DIFFERENT things (run the gate vs. make the
+// evidence readable), and a gate that cannot say which one it means is a gate operators learn to wave past.
+// `unknown` carries the reason; see gateEvidenceLookup for the four cases that produce it.
+export function gateEvidenceVerdict({ head, gate, unknown = null } = {}) {
+  if (unknown) return { state: "unknown", blocks: true, label: `gate=UNKNOWN (${unknown})` };
+  if (!gate) {
+    return {
+      state: "absent",
+      blocks: true,
+      label: "gate=MISSING (no review_findings event — the pre-PR review gate never ran for this PR)",
+    };
+  }
   const sha = gate.sha ?? null;
   const blockers = Number(gate.blockers ?? 0);
   if (!sha) return { state: "unstamped", blocks: false, label: "gate=UNSTAMPED (older review-usage — re-run to stamp a sha)" };
@@ -1133,6 +1152,39 @@ export function latestGateEvent(events, issueId) {
   return out;
 }
 
+// DER-2603 — what the ledger LETS US SAY about one PR's pre-PR gate, separated from what the gate said.
+// Pure. Returns `{ gate, unknown }`: `unknown` non-null means the evidence is unreadable, NOT absent.
+//
+// The four unknown cases, each a real read this instrument can hit at 3am:
+//   1. no ledger was read at all — `ready` invoked without `--run`; there is nothing to attribute.
+//   2. the PR maps to no issue in this run's state. This one was also a live BUG: the caller passed the
+//      un-mapped `undefined` straight to latestGateEvent, whose `if (issueId && …)` filter then MATCHES
+//      EVERY ISSUE — so an untracked PR could read `gate=CURRENT` off a SIBLING's evidence and enqueue.
+//   3. the ledger predates the DER-2748 version stamp: with no `harness_version` on `run_started` we
+//      cannot tell "the lead skipped the gate" from "this run's runner never recorded gates at all".
+//   4. no `run_started` at all — a partial fold; the same reasoning as 3.
+// Anything else with no `review_findings` for the issue is genuinely ABSENT: the run COULD have recorded
+// one, this unit is tracked, and it did not. That is "you skipped it", and it is a different sentence.
+export function gateEvidenceLookup({ events = null, issueId = null, ledgerRead = true } = {}) {
+  if (!ledgerRead) {
+    return { gate: null, unknown: "`ready` ran without --run <id> — no ledger to attribute gate evidence from" };
+  }
+  const evs = Array.isArray(events) ? events : [];
+  if (!issueId) {
+    return { gate: null, unknown: "PR not tracked by this run's ledger — no unit owns it, so no unit's gate evidence may be attributed to it" };
+  }
+  const gate = latestGateEvent(evs, issueId);
+  if (gate) return { gate, unknown: null };
+  const runStarted = evs.find((e) => e?.type === "run_started") ?? null;
+  if (!runStarted) {
+    return { gate: null, unknown: `no run_started in this ledger — whether the run could record a gate for ${issueId} is unreadable` };
+  }
+  if (!runStarted.harness_version) {
+    return { gate: null, unknown: "pre-stamp ledger (no harness_version on run_started) — a missing gate event is indistinguishable from a runner that never recorded one" };
+  }
+  return { gate: null, unknown: null }; // genuinely ABSENT — the run could have recorded one and did not
+}
+
 // DER-2753 `allowMergeWithoutChecks`: a PUBLIC adopter repo often has NO required checks at all, so
 // `gh pr checks` reports nothing, `checks` reads UNKNOWN, and this verdict never passes — which in
 // direct-merge mode means the shepherd can never merge anything. The opt-in loosens EXACTLY that one
@@ -1148,7 +1200,11 @@ export function readyVerdict({ draft, threads, onHead, checks, shardsPass, shard
   if (checks !== "pass" && !checksWaived) return { ready: false, why: `checks=${checks ?? "UNKNOWN"}` };
   if (shardsTotal > 0 && shardsPass !== shardsTotal) return { ready: false, why: `db shards ${shardsPass}/${shardsTotal}` };
   if (shardsPass > shardsTotal) return { ready: false, why: "INCONSISTENT shard read — re-run" };
-  if (gate?.blocks) return { ready: false, why: gate.label };
+  // DER-2603 — a caller that never COMPUTED a gate verdict must not pass either. `gate` was optional, so
+  // omitting it was indistinguishable from a passing gate, and that is the same class of hole as reading a
+  // throttled thread count as 0. `ready` computes this from the ledger via gateEvidenceLookup.
+  if (!gate) return { ready: false, why: "gate UNKNOWN (no pre-PR review evidence was read for this PR — `ready` derives it from the run ledger; pass --run <id>)" };
+  if (gate.blocks) return { ready: false, why: gate.label };
   return { ready: true, why: checksWaived ? "all gates pass (checks UNKNOWN — WAIVED by repo.allowMergeWithoutChecks)" : "all gates pass" };
 }
 
@@ -1224,7 +1280,11 @@ export function readyLine(r = {}) {
   else if (act?.action === "merge") tail = `*** MERGEABLE (direct) *** → gh ${act.args.join(" ")}`;
   else if (act?.action === "enqueue") tail = `*** ENQUEUEABLE *** → gh ${act.args.join(" ")}`;
   else tail = `hold (gates pass but ${act?.why ?? "no merge mode resolved"})`;
-  return `#${r.pr} head=${(r.head ?? "?").slice(0, 10)} draft=${r.draft} thr=${r.threads ?? "UNKNOWN"} codex-on-head=${r.onHead ? "YES" : "NO"} (rev=${(r.reviewSha ?? "").slice(0, 10)} cmt=${(r.commentSha ?? "").slice(0, 10)}) checks=${r.checks ?? "?"} shards=${r.shards} behind-main=${r.behind ?? "?"}${r.behind > 0 ? " ⚠" : ""} push=${r.push ?? "?"} ${r.gateLabel}  ${tail}${r.note ?? ""}`;
+  // When the GATE is what holds the PR, its label and the hold reason are the same sentence — print it
+  // once. The gate column stays greppable either way; the pre-DER-2603 line printed it twice, which for
+  // the longer MISSING/UNKNOWN labels is the kind of noise operators learn to skim past.
+  const gateCol = !r.ready && r.why === r.gateLabel ? "" : `${r.gateLabel}  `;
+  return `#${r.pr} head=${(r.head ?? "?").slice(0, 10)} draft=${r.draft} thr=${r.threads ?? "UNKNOWN"} codex-on-head=${r.onHead ? "YES" : "NO"} (rev=${(r.reviewSha ?? "").slice(0, 10)} cmt=${(r.commentSha ?? "").slice(0, 10)}) checks=${r.checks ?? "?"} shards=${r.shards} behind-main=${r.behind ?? "?"}${r.behind > 0 ? " ⚠" : ""} push=${r.push ?? "?"} ${gateCol}${tail}${r.note ?? ""}`;
 }
 
 export function scoreReviewFidelity({ local = [], cloud = [], slack = 25 } = {}) {
@@ -2457,6 +2517,45 @@ export function getBudget() { return BUDGET; }
 // work-runner is copied onto the mini and cloud hosts where the prep skill is not installed, and a
 // brief that silently loses its budget because an import failed is worse than no budget at all.
 // Keep the two in sync — prep-runner's `budgetFor` is the source of truth for the semantics.
+// DER-2746 — the CANONICAL plan validator, loaded across the skill boundary.
+//
+// `validatePlan` in prep-for-work/prep-runner.mjs calls itself "the gate between 'we thought about it' and
+// 'the run may start'", and `init-run` never called it: the validator was named only inside an error string
+// ("run `prep-runner validate` before init-run") while the mechanical path waved the plan through. Proven
+// by execution on 2c3ecbe — a plan with a dependency cycle, a NEGATIVE budget, a 98-file/11,537-addition
+// over-cap unit, an unresolved founder gate and no plan review failed `prep-runner validate` with 11 errors
+// and then passed `init-run` with exit 0. `write-brief` then stamped 98 files / ~11,537 additions into the
+// lead's brief as its ASSIGNED budget — the exact size that brief's own copy names as the worst case the
+// harness ever shipped. The weak local check that DID run only tested numeric presence, and
+// `Number.isFinite(-5)` is `true`, which is how the negative budget passed.
+//
+// DYNAMIC, not static, for the reason spelled out on assignedBudgetFor below: work-runner.mjs is copied to
+// mini and cloud hosts where the prep skill is not installed, and a static cross-skill import would fail at
+// MODULE LOAD there — breaking every subcommand to protect one. `init-run` is async and orchestrator-only
+// (it is the command that creates the run, so it necessarily runs where /prep-for-work ran), so the load
+// happens exactly where the file exists. Same reasoning as preflight's dynamic session-end-telemetry load,
+// which exists to avoid a cycle; here prep-runner imports Node builtins only, so there is no cycle to break.
+//
+// A load FAILURE throws rather than skipping the check: the same install ships both skills (install.sh
+// copies skills/ wholesale and runs both suites), so an unloadable validator means a broken install, and a
+// gate that silently skips itself when it cannot load is exactly the shape this issue is about.
+export async function loadPlanValidator({ specifier = "../prep-for-work/prep-runner.mjs" } = {}) {
+  let mod;
+  try {
+    mod = await import(specifier);
+  } catch (err) {
+    throw new Error(
+      `the canonical plan validator (${specifier}, prep-for-work/prep-runner.mjs) could not be loaded: ` +
+      `${err instanceof Error ? err.message : String(err)}. The same install ships both skills — re-run install.sh. ` +
+      `Refusing to start a run on a plan nothing validated.`,
+    );
+  }
+  if (typeof mod.validatePlan !== "function") {
+    throw new Error(`the canonical plan validator (${specifier}) exports no validatePlan — this install's skills are skewed; re-run install.sh`);
+  }
+  return mod.validatePlan;
+}
+
 export function assignedBudgetFor(plan, issueId, extraBundle = []) {
   const issues = plan?.issues ?? [];
   if (!issues.length || !issueId) return null;
@@ -3434,7 +3533,7 @@ export function materializeState(rawEvents, meta = {}) {
       // `spawn_failed*` (DER-2739) and `transcripts_forced` (DER-2744) are both TRI-STATE-ish on purpose:
       // `transcripts_forced: null` means UNKNOWN — a spawn event that carried no attestation — and unknown
       // is never the same as ok. See the transcripts_unverified banner.
-      issues[id] = { status: "queued", pr: null, worktree: null, branch: null, workspace_ref: null, kickback_count: 0, kickback_unactioned: false, kickback_sha: null, fileScope: [], host: null, bundle: null, tokens: 0, plan_scope_seen: false, budget: "ok", leadType: null, rotations: 0, rotate_pending: false, rotate_pct: null, rotate_disposition: null, spawn_failed: false, spawn_failed_count: 0, spawn_failed_note: null, spawn_failed_exit_code: null, transcripts_forced: null, reap_cleanup_ok: null, reap_failed: false, reap_leaks: [], reap_failed_note: null, _reports: {}, _kb_uncounted: false };
+      issues[id] = { status: "queued", pr: null, worktree: null, branch: null, workspace_ref: null, kickback_count: 0, kickback_unactioned: false, kickback_sha: null, fileScope: [], host: null, bundle: null, tokens: 0, plan_scope_seen: false, gate_seen: false, gate_sha: null, gate_blockers: null, gate_round: null, gate_engine: null, budget: "ok", leadType: null, rotations: 0, rotate_pending: false, rotate_pct: null, rotate_disposition: null, spawn_failed: false, spawn_failed_count: 0, spawn_failed_note: null, spawn_failed_exit_code: null, transcripts_forced: null, reap_cleanup_ok: null, reap_failed: false, reap_leaks: [], reap_failed_note: null, _reports: {}, _kb_uncounted: false };
     }
     return issues[id];
   };
@@ -3589,6 +3688,16 @@ export function materializeState(rawEvents, meta = {}) {
         it._reports[key] = Math.max(Number(e.total_tokens ?? 0) || 0, seen);
         break;
       }
+      case "review_findings":
+        // DER-2603 — the pre-PR review gate, folded so a MISSING one is visible on the board and not only
+        // at enqueue time. Deliberately records what the evidence COVERS (`sha`) rather than just that it
+        // exists: an event from round 1 says nothing about the round-3 head (see gateEvidenceVerdict).
+        it.gate_seen = true;
+        it.gate_sha = e.sha ?? null;
+        it.gate_blockers = Number(e.blockers ?? 0) || 0;
+        it.gate_round = Number.isFinite(Number(e.round)) ? Number(e.round) : it.gate_round ?? null;
+        it.gate_engine = e.engine ?? e.model ?? it.gate_engine ?? null;
+        break;
       case "pr_opened":
         it.status = "pr_open";
         if (e.pr != null) it.pr = e.pr;
@@ -3902,6 +4011,20 @@ export function materializeState(rawEvents, meta = {}) {
       .filter(([, v]) => v.budget && v.budget !== "ok")
       .sort((a, b) => (b[1].budget === "tripped" ? 1 : 0) - (a[1].budget === "tripped" ? 1 : 0) || b[1].tokens - a[1].tokens)
       .map(([k, v]) => ({ issue: k, level: v.budget, tokens: v.tokens, rounds: v.kickback_count, rotations: v.rotations, pr: v.pr, reason: v.budget_reason })),
+    // Missing-pre-PR-gate banner (DER-2603). Units the shepherd now OWNS (`pr_open`/`kickback` — the PR
+    // is handed off) that carry no `review_findings` event at all. `ready` refuses the go-ahead word for
+    // these, but the refusal is only met at enqueue time, and on 2026-07-27 three PRs reached that moment
+    // ungated in one shift. Surfaced here so the orchestrator sees it while the round is still cheap.
+    //
+    // Scoped to handed-off units on purpose: the gate is a PRE-PR check, so an in-flight lead that has not
+    // handed off yet is not late — listing every open draft would make this permanently non-empty, and a
+    // banner that is always red is a banner nobody reads (the DER-2744 lesson, applied here).
+    gate_missing: Object.entries(issues)
+      .filter(([, v]) => !v.gate_seen && v.pr != null && (v.status === "pr_open" || v.status === "kickback"))
+      .map(([k, v]) => ({
+        issue: k, pr: v.pr, status: v.status, host: v.host,
+        note: "no review_findings event — the pre-PR adversarial review gate never ran for this PR. `ready` will refuse it; gate it now (or record why codex is unavailable, WITH the probe output) rather than at enqueue time.",
+      })),
     // Issues with an OPEN PR that never declared a file scope. DER-2161 shipped 98 files / +11,537
     // lines / 5 rounds having emitted no plan_scope at all — an unbounded unit nobody could have
     // caught in flight. A missing scope is itself the finding.
@@ -5071,6 +5194,45 @@ export async function runSubcommand(argv) {
           : (listed && listed.length ? listed.slice(0, 3).join("-").toLowerCase() : "work"));
       const runId = o.runId ?? buildRunId(new Date(), label);
       const dir = join(runsRoot, runId);
+      // Run plan from /prep-for-work (2026-07-25): every subsequent `write-brief` reads the issue's
+      // ASSIGNED budget from here, so the lead's plan_scope is checked rather than self-graded.
+      // Validated NOW — BEFORE the run dir exists (DER-2746). Ordering is load-bearing twice over: an
+      // invalid plan must fail at init rather than silently at the first dispatch, and a refusal must leave
+      // NO run directory behind, because `assertExistingRunDir` (DER-2570) treats a run DIR as proof the run
+      // exists — so a half-created run would let every other subcommand operate on a ledger with no
+      // run_started in it.
+      const planPathToCheck = o.plan ? resolvePath(o.plan) : specPlanPath;
+      let planWarnings = [];
+      if (planPathToCheck) {
+        let plan = specPlan;
+        if (!plan) {
+          try { plan = JSON.parse(await readFile(planPathToCheck, "utf8")); }
+          catch (err) { throw new Error(`--plan ${planPathToCheck}: ${err instanceof Error ? err.message : String(err)}`); }
+        }
+        if (!plan.issues?.length) throw new Error(`--plan ${planPathToCheck} has no issues[]`);
+        // The cheap, specific checks first, so their wording survives for the operator; the canonical
+        // validator below re-states them among its own errors. Identical in both modes ON PURPOSE — an
+        // un-budgeted unit is an unbounded one whether it is called DER-1234 or SPEC-foo-U3, and dropping
+        // this in spec mode would discard the one lever the data actually supports.
+        const unbudgeted = (plan.issues ?? []).filter((i) => !Number.isFinite(i?.budget?.files) || !Number.isFinite(i?.budget?.additions)).map((i) => i?.id);
+        if (unbudgeted.length) throw new Error(`--plan ${planPathToCheck}: no assigned budget for ${unbudgeted.join(", ")} — run \`prep-runner validate\` before init-run`);
+        // DER-2746 — and now the CANONICAL gate, with the SAME strictness `prep-runner validate` applies
+        // (that command calls validatePlan with no opts, so this passes none either: two doors onto one
+        // plan file must not differ, or the weaker one is the only one that matters). Errors refuse;
+        // warnings are advisory and returned to the caller — init-run's stdout is the run id and consumers
+        // parse it, so nothing else may be printed there.
+        const validatePlan = await loadPlanValidator();
+        const verdict = validatePlan(plan);
+        planWarnings = verdict.warnings ?? [];
+        if (!verdict.ok) {
+          throw new Error(
+            `--plan ${planPathToCheck} is NOT dispatchable — ${verdict.errors.length} error(s) from the canonical validator ` +
+            `(the same gate as \`prep-runner validate ${planPathToCheck}\`):\n` +
+            verdict.errors.map((e) => `  - ${e}`).join("\n") +
+            `\nFix the plan and re-run \`prep-runner validate\` until it exits 0. A plan nothing validated is a run nobody sized.`,
+          );
+        }
+      }
       await mkdir(join(dir, "briefs"), { recursive: true });
       await mkdir(join(dir, "logs"), { recursive: true });
       const started = { run_id: runId, actor: "orch", type: "run_started", project: o.project ?? null, mode };
@@ -5093,28 +5255,14 @@ export async function runSubcommand(argv) {
       // and a probe that silently no-ops in an unauthenticated shell is worse than an honest "auto").
       started.mergeMode = getMergePolicy().mergeMode ?? "auto";
       if (getMergePolicy().allowMergeWithoutChecks) started.allowMergeWithoutChecks = true;
-      // Run plan from /prep-for-work (2026-07-25): every subsequent `write-brief` reads the issue's
-      // ASSIGNED budget from here, so the lead's plan_scope is checked rather than self-graded.
-      // Validate it NOW — an invalid plan must fail at init, not silently at the first dispatch.
-      const planPathToCheck = o.plan ? resolvePath(o.plan) : specPlanPath;
-      if (planPathToCheck) {
-        let plan = specPlan;
-        if (!plan) {
-          try { plan = JSON.parse(await readFile(planPathToCheck, "utf8")); }
-          catch (err) { throw new Error(`--plan ${planPathToCheck}: ${err instanceof Error ? err.message : String(err)}`); }
-        }
-        const unbudgeted = (plan.issues ?? []).filter((i) => !Number.isFinite(i?.budget?.files) || !Number.isFinite(i?.budget?.additions)).map((i) => i?.id);
-        if (!plan.issues?.length) throw new Error(`--plan ${planPathToCheck} has no issues[]`);
-        // Identical in both modes ON PURPOSE — an un-budgeted unit is an unbounded one whether it is
-        // called DER-1234 or SPEC-foo-U3, and dropping this in spec mode would discard the one lever
-        // the data actually supports.
-        if (unbudgeted.length) throw new Error(`--plan ${planPathToCheck}: no assigned budget for ${unbudgeted.join(", ")} — run \`prep-runner validate\` before init-run`);
-        started.plan = planPathToCheck;
-      }
+      if (planPathToCheck) started.plan = planPathToCheck;
       await appendEvent(dir, started);
       return {
         runId, runDir: dir, mode, issues: listed ?? undefined,
         ...(specPlan ? { specRef: specPlan.specRef, tracking: specPlan.tracking } : {}),
+        // DER-2746 — the canonical validator's WARNINGS, advisory: they must not refuse a run, and they must
+        // not reach stdout (consumers parse the run id from it), but they must not vanish either.
+        ...(planWarnings.length ? { planWarnings } : {}),
         stdout: runId,
       };
     }
@@ -6124,7 +6272,10 @@ export async function runSubcommand(argv) {
           if (cRes.exitCode === 0 && /^\d+$/.test(v)) behind = Number(v);
         }
         // DER-2588: does this PR's OWN local gate evidence cover the tree that would merge?
-        const gate = gateEvidenceVerdict({ head, gate: latestGateEvent(readyEvents, issueByPr.get(n)) });
+        // DER-2603: and did that gate ever RUN? A missing event now blocks, and an UNREADABLE ledger
+        // (no --run, an untracked PR, a pre-stamp ledger) blocks with a different sentence — the lookup
+        // decides which, so `ready` never attributes a sibling unit's evidence to this PR.
+        const gate = gateEvidenceVerdict({ head, ...gateEvidenceLookup({ events: readyEvents, issueId: issueByPr.get(n) ?? null, ledgerRead: !!runDir }) });
         const verdict = readyVerdict({
           draft, threads, onHead, checks: chk.checks, shardsPass: chk.shardsPass, shardsTotal: chk.shardsTotal, gate,
           allowMergeWithoutChecks: mergePolicy.allowMergeWithoutChecks,
@@ -6427,6 +6578,10 @@ export async function runSubcommand(argv) {
               // transcript-reading instrument is blind for these, and a blind lane looks exactly like a
               // dead one — so it belongs next to leads_dead, not in a report nobody runs.
               transcripts_unverified: (st.transcripts_unverified ?? []).map((r) => r.issue),
+              // DER-2603: a handed-off PR with no pre-PR gate event. It re-surfaces every wake because the
+              // alternative — the old behaviour — was that it surfaced nowhere and `ready` called it
+              // enqueueable. Cleared only by the gate actually running (a `review_findings` event).
+              gate_missing: (st.gate_missing ?? []).map((r) => r.issue),
               budget_tripped: (st.budget_trips ?? []).filter((t) => t.level === "tripped").map((t) => t.issue),
               // DER-2748: a version-skewed ledger surfaces on EVERY wake, not only when the orchestrator
               // happens to run `state`. It already blocks dispatch; this is how the operator learns why
@@ -6509,6 +6664,11 @@ Run plan (2026-07-25): /prep-for-work sizes each issue against the real codebase
 it; every "write-brief" then stamps that issue's ASSIGNED budget into the brief, so the lead's plan_scope
 is CHECKED against a number instead of self-graded — and "budget" flags any unit whose own declaration
 already busts it (over plan), which is the cheapest moment to split. Runs with no plan are unchanged.
+DER-2746: "init-run --plan/--spec" now runs the CANONICAL validator (prep-for-work/prep-runner.mjs
+validatePlan) at exactly the strictness "prep-runner validate" applies — errors REFUSE the run and leave no
+run dir, warnings are advisory (returned as result.planWarnings, never on stdout). A plan that "prep-runner
+validate" rejects can no longer start a run: before this, a poison plan failed validate with 11 errors and
+then init-run'd with exit 0, and write-brief stamped its 98-file / 11,537-addition budget into the brief.
   spawn-shepherd --run <r> [--project p] [--dry-run]
   spawn-orch --run <r> [--project p] [--model m] [--dry-run]   boot a SUCCESSOR orchestrator (/work resume <r>) — routine rotation
   append --run <r> '<event-json>'             atomic append to events.jsonl
@@ -6540,7 +6700,11 @@ Design: the README's context-rotation section.
                                               merge mode once (repo.mergeMode, else a queue probe) and prints the exact
                                               command: *** ENQUEUEABLE *** → gh pr merge <n> --auto on a queue repo,
                                               *** MERGEABLE (direct) *** → gh pr merge <n> --<strategy> --delete-branch
-                                              on a queue-less one. No go-ahead word ⇒ do not land the PR (DER-2753)
+                                              on a queue-less one. No go-ahead word ⇒ do not land the PR (DER-2753).
+                                              PRE-PR GATE (DER-2603): NEITHER word is printed without a review_findings
+                                              event for the PR's unit. gate=MISSING = the gate never ran (run it);
+                                              gate=UNKNOWN = the evidence was UNREADABLE (no --run, PR not in the
+                                              ledger, pre-stamp ledger) — both hold, and they are different jobs.
   preflight [--skip-probes]                   test the DEPLOYED harness before a run: unit suite, cmux, gh identity,
                                               disk, transcript persistence, telemetry hooks, skills sync per host,
                                               stale runner copies, 1-token Claude probe per account, codex gate probe.
