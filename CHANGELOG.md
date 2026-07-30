@@ -23,6 +23,35 @@ places this file and its neighbors described those gaps as still open after they
 
 ### Security
 
+- **DER-2837 (P1) — an UNDER-counted `blockers` field authorized a merge.** `gateEvidenceVerdict` read
+  the `review_findings` event's `blockers` number and never asked whether it described that event's own
+  `findings` list. The one consistency check that existed — in `gateAdjudicationVerdict` — compared
+  `recorded > actual`, so it caught an over-count and let an under-count through. Measured at `c477ee9`:
+  `{blockers: 0, findings: [{priority: 1}]}` on the head returned `{"blocks":false,"state":"current"}`
+  (MERGEABLE), against the control `{blockers: 1, …}` returning `{"blocks":true,"state":"current-dirty"}`.
+  A gate event carrying a live P1 while recording zero blockers was therefore indistinguishable from a
+  clean gate — and, because `stale-clean` and `unstamped` also pass on a zero count, it read as a pass on
+  three separate branches, not one. DER-2782 had made a recorded blocker *block*; nothing had made the
+  record *true*.
+  **The count must now EXACTLY equal the number of priority-≤1 entries in the same event's findings
+  list**, via one shared predicate (`gateBlockerCountVerdict`) applied at every boundary: derived from
+  those findings at the producer (`reviewFindingsEvent`), refused at the write boundary (`append`, the
+  second event type it validates), and re-checked at all three reads — the merge verdict (new blocking
+  state `gate=INCONSISTENT`, evaluated ahead of every sha branch), the `materializeState` fold (the unit
+  now reaches `state.gate_blocked` as `blockers: "INCONSISTENT"` with its own instruction, where before
+  the board agreed with the lie), and the waiver contract, whose `>` became `!==` so a waiver can no
+  longer cover findings the count denies. **Both directions block**, because a one-directional check is
+  exactly the shape that let the harmful direction through; an over-count merely holds work that should
+  ship, while an under-count ships an open blocker and looks clean. A count that is not a number — now
+  including the *string* `"0"` — remains the distinct `gate=UNREADABLE`, since "not a count" and
+  "contradicts your own findings" oblige different actions. Legacy events with no findings list and a
+  zero count still read clean: there is nothing to contradict, and blocking them would strand every
+  pre-`findings` ledger. Verified by fault injection in `e2e.test.mjs` (the write boundary refuses the
+  lying event; a forged *relayed* line that bypasses `append` is still refused by the read side) with
+  controls proving an honest dirty gate, an honest clean gate and a valid adjudication all still behave
+  as before. **This is consistency, not authentication** — see `SECURITY.md`; anything that can write the
+  run directory can still write a self-consistent event, and `adjudicated_by` remains an unauthenticated
+  string by recorded decision.
 - **DER-2836 (P0) — the evidence-query policy was decorative, because a shell re-expanded the query
   AFTER it was validated.** `query-check` handed the raw text to `spawnSync(…, {shell: true})`, so the
   arguments a command finally received were not the arguments any rule had read. `find . $(printf --

@@ -236,6 +236,57 @@ test("ORDERING: the fold reads EVENT time, not file order — a backfilled histo
     "a backfilled historical pr_opened sorts BEFORE the merge and must not regress the unit");
 });
 
+// A gate event whose `blockers` count agrees with its own findings list. The count is what authorizes a
+// merge, so every fixture below deviates from this ONE honest shape in exactly one way.
+const GATE_P1 = { title: "Tenant filter dropped", priority: 1, file: "b.ts", line_start: 3, line_end: 3 };
+const GATE_P3 = { title: "nit: rename this", priority: 3, file: "c.ts", line_start: 1, line_end: 1 };
+const gateEvent = (over = {}) => ({ actor: "lead:DER-1", type: "review_findings", issue: "DER-1", reviewer: "codex", round: 1, sha: "c0ffee1234".repeat(4), blockers: 1, findings: [GATE_P1, GATE_P3], ...over });
+
+test("FAULT a gate event that UNDER-reports its own blockers: refused at the write boundary (DER-2837)", async (t) => {
+  const R = await newRun(t);
+  await seedUnit(R);
+  const gateLines = async () => (await R.events()).filter((l) => l.includes('"review_findings"'));
+
+  // The exploit shape: a live P1 in `findings`, `blockers: 0` in the count that `ready` reads.
+  const lying = await R.run(["append", "--run", R.runId, JSON.stringify(gateEvent({ blockers: 0 }))]);
+  refused(lying);
+  assert.match(lying.out, /records 0 blocker\(s\) but its findings list holds 1/, "the refusal must print BOTH numbers, or the operator cannot tell what to re-run");
+  assert.match(lying.out, /UNDER-count/, "…and name the direction, since only one direction ships a blocker");
+  assert.equal((await gateLines()).length, 0, "a refused gate event must leave NOTHING behind");
+
+  // The over-count and the non-count are refused too — one rule, both directions.
+  refused(await R.run(["append", "--run", R.runId, JSON.stringify(gateEvent({ blockers: 4 }))]));
+  refused(await R.run(["append", "--run", R.runId, JSON.stringify(gateEvent({ blockers: "1" }))]));
+  assert.equal((await gateLines()).length, 0);
+
+  // CONTROL — the HONEST event is accepted, and so is a genuinely clean one. Without this pair the
+  // refusals above would be indistinguishable from an `append` that refuses every gate event.
+  succeeded(await R.run(["append", "--run", R.runId, JSON.stringify(gateEvent())]));
+  succeeded(await R.run(["append", "--run", R.runId, JSON.stringify(gateEvent({ blockers: 0, findings: [GATE_P3] }))]));
+  assert.equal((await gateLines()).length, 2, "the write gate must discriminate, not just refuse");
+});
+
+test("FAULT a FORGED under-counted gate event that bypasses `append`: the READ side still refuses it (DER-2837)", async (t) => {
+  const R = await newRun(t);
+  await seedUnit(R);
+  // CONTROL FIRST — an honest CLEAN gate leaves the unit off the blocked banner. Without it, the
+  // post-forgery reading proves nothing: the banner could always be non-empty.
+  await R.append(gateEvent({ blockers: 0, findings: [GATE_P3] }));
+  assert.deepEqual((await R.state()).gate_blocked, [], "the control must be a CLEAN board, or the assertion below is meaningless");
+
+  // appendRaw, and carrying an `event_id` so it reads as RELAYED: both are the real bypass routes. A
+  // relay deliberately skips write validation (refusing it would fork the ledger between hosts), and
+  // anyone who can write events.jsonl never needed the subcommand at all. This is precisely why the
+  // write check is an affordance and the READ is the enforcement.
+  await R.appendRaw(`${JSON.stringify({ ...gateEvent({ blockers: 0 }), event_id: "0197e000-0000-7000-8000-00000000e2e7", source_id: "mini", seq: 7, schema_version: 1, ts: new Date().toISOString() })}\n`);
+
+  const st = await R.state();
+  assert.deepEqual(st.gate_blocked.map((g) => [g.issue, g.blockers]), [["DER-1", "INCONSISTENT"]],
+    "a forged under-counted gate event must reach the board as INCONSISTENT — it authorized a merge at c477ee9");
+  assert.match(st.issues["DER-1"].gate_blockers_inconsistent, /records 0 blocker\(s\) but its findings list holds 1/);
+  assert.match(st.gate_blocked[0].note, /INCONSISTENT WITH ITSELF/, "the board must say what to do about it, not just flag it");
+});
+
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
 // DEFECT PINS — assert what is BROKEN today. RED here means the defect was fixed: invert the pin.
 // ─────────────────────────────────────────────────────────────────────────────────────────────────

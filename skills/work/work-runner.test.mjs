@@ -3600,8 +3600,13 @@ test("assertExistingRunDir (DER-2570): refuses a run dir that does not exist; th
 
 test("gateEvidenceVerdict (DER-2588): a stale gate with open blockers BLOCKS; stale-clean does not", () => {
   const head = "aaaaaaaaaa11";
+  // DER-2837 — every fixture below that records a blocker now SHOWS it. A `blockers: 1` event with no
+  // findings list is a shape `reviewFindingsEvent` cannot produce, and it now reads `inconsistent`
+  // (blocking, but for a different reason), which would let this test pass while proving nothing about
+  // the stale/current split it exists to pin.
+  const oneBlocker = [{ title: "Tenant filter dropped", priority: 1, file: "b.ts", line_start: 3, line_end: 3 }];
   // The DER-2513 shape: the last recorded gate says blockers:1 and describes a tree two commits back.
-  const staleDirty = gateEvidenceVerdict({ head, gate: { sha: "bbbbbbbbbb22", blockers: 1 } });
+  const staleDirty = gateEvidenceVerdict({ head, gate: { sha: "bbbbbbbbbb22", blockers: 1, findings: oneBlocker } });
   assert.equal(staleDirty.state, "stale-dirty");
   assert.equal(staleDirty.blocks, true, "an open blocker on a tree that is NOT head must hold the PR");
   // Control A — same staleness, zero blockers: reported, never blocking.
@@ -3614,7 +3619,7 @@ test("gateEvidenceVerdict (DER-2588): a stale gate with open blockers BLOCKS; st
   // would merge. Under the old pair of rules the only way to be BLOCKED by this instrument was to FIX
   // the findings (pushing commits moves the sha off head → STALE-DIRTY → blocks); ignoring them held the
   // sha at head and passed.
-  const current = gateEvidenceVerdict({ head, gate: { sha: head, blockers: 1 } });
+  const current = gateEvidenceVerdict({ head, gate: { sha: head, blockers: 1, findings: oneBlocker } });
   assert.equal(current.state, "current-dirty");
   assert.equal(current.blocks, true, "an open blocker on the tree that WOULD MERGE is the strongest possible reason to hold");
   // Control B′ — the actually-acted-on shape: the gate re-run at head with nothing left open.
@@ -3808,25 +3813,25 @@ const d2782Adj = (over = {}) => ({
 
 test("DER-2782: a CURRENT gate with OPEN blockers blocks; only an adjudication naming THAT tree clears it", () => {
   // (a) The defect, stated as the contract. Same sha as head, findings still open ⇒ BLOCK.
-  const open = gateEvidenceVerdict({ head: D2782_HEAD, gate: { sha: D2782_HEAD, blockers: 2 } });
+  const open = gateEvidenceVerdict({ head: D2782_HEAD, gate: { sha: D2782_HEAD, blockers: 2, findings: D2782_FINDINGS } });
   assert.equal(open.state, "current-dirty");
   assert.equal(open.blocks, true, "the tree that would merge has 2 open blockers — nothing about it being CURRENT makes that acceptable");
   assert.match(open.label, /OPEN blocker/);
   // (b) An adjudication covering the SAME tree clears the block — and says so loudly. `blocks: false`
   //     with a quiet `gate=CURRENT` label would just be the old defect with extra steps.
-  const waived = gateEvidenceVerdict({ head: D2782_HEAD, gate: { sha: D2782_HEAD, blockers: 2 }, adjudication: { sha: D2782_HEAD, findings: ["1", "2"], adjudicated_by: "derrek", rationale: "both wrong" } });
+  const waived = gateEvidenceVerdict({ head: D2782_HEAD, gate: { sha: D2782_HEAD, blockers: 2, findings: D2782_FINDINGS }, adjudication: { sha: D2782_HEAD, findings: ["1", "2"], adjudicated_by: "derrek", rationale: "both wrong" } });
   assert.equal(waived.state, "adjudicated");
   assert.equal(waived.blocks, false);
   assert.match(waived.label, /gate=ADJUDICATED \(2 findings waived by derrek/, "a waiver must NAME its author in the line an operator actually reads");
   assert.match(waived.label, /⚠/, "never fold an adjudication into a silent pass");
   // (c) An adjudication of a DIFFERENT tree is not an adjudication of this one — the same reasoning
   //     that makes STALE-DIRTY block, applied to the waiver instead of to the review.
-  const other = gateEvidenceVerdict({ head: D2782_HEAD, gate: { sha: D2782_HEAD, blockers: 2 }, adjudication: { sha: "f".repeat(40), findings: ["1", "2"], adjudicated_by: "derrek", rationale: "r" } });
+  const other = gateEvidenceVerdict({ head: D2782_HEAD, gate: { sha: D2782_HEAD, blockers: 2, findings: D2782_FINDINGS }, adjudication: { sha: "f".repeat(40), findings: ["1", "2"], adjudicated_by: "derrek", rationale: "r" } });
   assert.equal(other.blocks, true, "a waiver carried over from an earlier round describes findings on a tree that is no longer shipping");
   assert.equal(other.state, "current-dirty");
   // A REJECTED candidate is named in the label: an operator who just recorded one must be able to tell
   // "ignored" from "never arrived".
-  const withReason = gateEvidenceVerdict({ head: D2782_HEAD, gate: { sha: D2782_HEAD, blockers: 2 }, adjudicationRejected: "no `rationale`" });
+  const withReason = gateEvidenceVerdict({ head: D2782_HEAD, gate: { sha: D2782_HEAD, blockers: 2, findings: D2782_FINDINGS }, adjudicationRejected: "no `rationale`" });
   assert.match(withReason.label, /IGNORED: no `rationale`/);
   // An UNREADABLE count is not a zero count. `blockers > 0` is false for NaN, so without this a
   // corrupt event reads as a clean gate — the fail-open version of the very defect above.
@@ -3851,13 +3856,13 @@ test("DER-2782: the go-ahead word is what the shepherd greps — so the block, a
       mergeAction: WR.mergeAction({ mode: "direct", strategy: "squash", pr: 12, verdict, expectedHead: D2782_HEAD }),
     });
   };
-  const blocked = line(gateEvidenceVerdict({ head: D2782_HEAD, gate: { sha: D2782_HEAD, blockers: 2 } }));
+  const blocked = line(gateEvidenceVerdict({ head: D2782_HEAD, gate: { sha: D2782_HEAD, blockers: 2, findings: D2782_FINDINGS } }));
   assert.doesNotMatch(blocked, /ENQUEUEABLE|MERGEABLE/, "a PR with 2 open blockers on its head must show NO go-ahead word");
   assert.match(blocked, /hold \(gate=CURRENT .* with 2 OPEN blocker/);
 
   // The waived PR DOES get the go-ahead word — and the waiver rides the same line. A waiver that let the
   // line render identically to a clean gate would be the silent pass, just spelled differently.
-  const waived = line(gateEvidenceVerdict({ head: D2782_HEAD, gate: { sha: D2782_HEAD, blockers: 2 }, adjudication: { sha: D2782_HEAD, findings: ["1", "2"], adjudicated_by: "derrek", rationale: "both wrong" } }));
+  const waived = line(gateEvidenceVerdict({ head: D2782_HEAD, gate: { sha: D2782_HEAD, blockers: 2, findings: D2782_FINDINGS }, adjudication: { sha: D2782_HEAD, findings: ["1", "2"], adjudicated_by: "derrek", rationale: "both wrong" } }));
   assert.match(waived, /\*\*\* MERGEABLE \(direct\) \*\*\*/, "a valid waiver must still let the work through");
   assert.match(waived, /⚠ gate=ADJUDICATED \(2 findings waived by derrek/);
   const clean = line(gateEvidenceVerdict({ head: D2782_HEAD, gate: { sha: D2782_HEAD, blockers: 0 } }));
@@ -4076,6 +4081,200 @@ test("DER-2782: the lead brief and the shepherd skill state the rule the code no
   const v = WR.gateAdjudicationVerdict({ gate, adjudication: parsed });
   assert.equal(v.ok, true, `the documented shape must satisfy the contract it documents (got: ${v.reason})`);
   assert.equal(v.by, parsed.adjudicated_by);
+});
+
+// ---- DER-2837: an UNDER-counted `blockers` field must not authorize a merge ----
+// DER-2782 made a RECORDED `blockers > 0` block. Nothing checked that the recorded number was TRUE.
+// `gateEvidenceVerdict` read `gate.blockers` and never compared it against the event's own findings list;
+// the only consistency check in the codebase (`gateAdjudicationVerdict`) rejected an OVER-count and let an
+// UNDER-count through. Measured at c477ee9:
+//
+//   under-count (blockers:0, findings:[{priority:1}])  →  {"blocks":false,"state":"current"}   MERGEABLE
+//   CONTROL     (blockers:1, same findings)            →  {"blocks":true,"state":"current-dirty"}
+//
+// The direction is what makes this a P1: an OVER-count blocks work that should ship (annoying, visible,
+// self-correcting); an UNDER-count ships a P1 finding and looks exactly like a clean gate. The event does
+// not need to be forged for this to bite — it needs only to disagree with itself, which is why the count
+// is now DERIVED at the producer and CHECKED at every reader rather than trusted anywhere.
+const D2837_HEAD = "c0ffee1234".repeat(4);
+const D2837_P0 = { title: "guard is bypassable", priority: 0, file: "a.ts", line_start: 10, line_end: 12 };
+const D2837_P1 = { title: "Tenant filter dropped", priority: 1, file: "b.ts", line_start: 3, line_end: 3 };
+const D2837_P3 = { title: "nit: rename this", priority: 3, file: "c.ts", line_start: 1, line_end: 1 };
+// HONEST by default: 2 blockers recorded, 2 priority-≤1 findings present. Every case below deviates from
+// this fixture in ONE way, so the control is the fixture itself.
+const d2837Gate = (over = {}) => ({ type: "review_findings", issue: "DER-1", sha: D2837_HEAD, round: 1, blockers: 2, findings: [D2837_P0, D2837_P1, D2837_P3], ...over });
+
+test("DER-2837: an UNDER-counted gate event is not evidence — on EVERY read path, not just the current one", () => {
+  assert.equal(typeof WR.gateBlockerCountVerdict, "function", "the count contract must be a pure seam, or none of this is testable");
+
+  // (a) THE DEFECT. `blockers: 0` with a live P1 on the same event. This is the whole issue.
+  const under = gateEvidenceVerdict({ head: D2837_HEAD, gate: d2837Gate({ blockers: 0 }) });
+  assert.equal(under.blocks, true, "a gate event that under-reports its own blockers must NEVER authorize a merge");
+  assert.equal(under.state, "inconsistent", "…and it is its own state: 'clean' and 'lying about being clean' oblige the operator to do different things");
+  assert.match(under.label, /UNDER/, "the label must name the DIRECTION — an under-count is the one that ships a blocker");
+  assert.match(under.label, /records 0 blocker\(s\) but its findings list holds 2/, "…and both numbers, or the operator cannot tell what to re-run");
+
+  // (b) The check must sit AHEAD of every sha branch. `stale-clean` and `unstamped` both return
+  //     blocks:false, so a check placed after them would leave two more doors open. Measured: at
+  //     c477ee9 the same under-counted event read stale-clean (blocks:false) and unstamped (blocks:false).
+  assert.equal(gateEvidenceVerdict({ head: D2837_HEAD, gate: d2837Gate({ blockers: 0, sha: "b".repeat(40) }) }).blocks, true, "an under-count is not evidence on a STALE tree either");
+  assert.equal(gateEvidenceVerdict({ head: D2837_HEAD, gate: d2837Gate({ blockers: 0, sha: null }) }).blocks, true, "…nor on an UNSTAMPED event, which otherwise passes");
+
+  // (c) A PARTIAL under-count blocks for the right reason. `blockers: 1` with 2 open blockers already
+  //     blocked (1 > 0) — but as `current-dirty`, i.e. describing evidence the harness still believed.
+  const partial = gateEvidenceVerdict({ head: D2837_HEAD, gate: d2837Gate({ blockers: 1 }) });
+  assert.equal(partial.state, "inconsistent", "an event that miscounts by one is no more trustworthy than one that miscounts to zero");
+
+  // (d) OVER-counts are rejected too. Not exploitable, but "the count equals the list" is one rule; a
+  //     one-directional check is the shape that let the under-count through in the first place.
+  const over = gateEvidenceVerdict({ head: D2837_HEAD, gate: d2837Gate({ blockers: 5 }) });
+  assert.equal(over.state, "inconsistent");
+  assert.match(over.label, /OVER/);
+
+  // ── CONTROLS. A fix that refuses everything is not a fix; each of these must still pass. ──
+  const honest = gateEvidenceVerdict({ head: D2837_HEAD, gate: d2837Gate() });
+  assert.equal(honest.state, "current-dirty", "an HONEST dirty gate keeps its DER-2782 verdict — do not regress it into the new state");
+  assert.equal(honest.blocks, true);
+  const clean = gateEvidenceVerdict({ head: D2837_HEAD, gate: d2837Gate({ blockers: 0, findings: [D2837_P3] }) });
+  assert.equal(clean.state, "current", "0 recorded and 0 priority-≤1 findings is the clean gate this whole instrument exists to let through");
+  assert.equal(clean.blocks, false);
+  assert.equal(gateEvidenceVerdict({ head: D2837_HEAD, gate: d2837Gate({ blockers: 0, findings: [], sha: "b".repeat(40) }) }).state, "stale-clean");
+  assert.equal(gateEvidenceVerdict({ head: D2837_HEAD, gate: { sha: D2837_HEAD, blockers: 0 } }).state, "current",
+    "LEGACY COMPAT: an event with no findings list and a zero count still reads clean — there is nothing to contradict, and blocking it would strand every pre-findings ledger");
+  // The one DELIBERATE behaviour change for legacy events, pinned so it is a decision and not a
+  // surprise: a findings-less event RECORDING blockers used to read `current-dirty`/`stale-dirty`; it
+  // now reads `inconsistent`. The DECISION is identical — it blocked before and blocks now — only the
+  // sentence changes, and the new one is truer: an event claiming blockers it cannot show is not
+  // evidence about how many are open. `gateAdjudicationVerdict` has always refused this same shape
+  // ("blocker count with no findings list"), so this makes the two contracts agree.
+  const legacyDirty = gateEvidenceVerdict({ head: D2837_HEAD, gate: { sha: D2837_HEAD, blockers: 1 } });
+  assert.equal(legacyDirty.blocks, true, "the DECISION on a legacy dirty gate is unchanged — it blocked before and blocks now");
+  assert.equal(legacyDirty.state, "inconsistent");
+  // …and a valid waiver still clears an honest dirty gate. The fix must not make findings unwaivable.
+  const waived = gateEvidenceVerdict({
+    head: D2837_HEAD, gate: d2837Gate(),
+    adjudication: { sha: D2837_HEAD, findings: ["1", "2"], adjudicated_by: "derrek", rationale: "both misread the helper" },
+  });
+  assert.equal(waived.state, "adjudicated");
+  assert.equal(waived.blocks, false);
+
+  // An UNREADABLE count is still its own state, and is not silently absorbed into the new one.
+  for (const raw of ["two", -1, {}, 1.5, "0"]) {
+    const v = gateEvidenceVerdict({ head: D2837_HEAD, gate: d2837Gate({ blockers: raw, findings: [] }) });
+    assert.equal(v.state, "unreadable", `blockers=${JSON.stringify(raw)} is not a count — "0" the STRING is not the number 0 either`);
+    assert.equal(v.blocks, true);
+  }
+});
+
+test("DER-2837: the WAIVER path rejects an under-counted gate too (the count check was one-directional)", () => {
+  const adj = (over = {}) => ({ type: "gate_adjudication", issue: "DER-1", sha: D2837_HEAD, findings: ["1", "2"], rationale: "both misread the seat-scoped helper", adjudicated_by: "derrek", ...over });
+  // POSITIVE CONTROL FIRST — an honest gate + a complete waiver is still accepted.
+  const ok = WR.gateAdjudicationVerdict({ gate: d2837Gate(), adjudication: adj() });
+  assert.equal(ok.ok, true, `a well-formed waiver over honest evidence must be accepted (got: ${ok.reason})`);
+
+  // The defect: `recorded > blockers.length` never fired for an under-count, so an event claiming 0
+  // blockers while carrying 2 could be "waived" — and, worse, waived by a waiver naming only what the
+  // COUNT admitted to. The coverage clause below it was checking a list the count disagreed with.
+  const underCounted = WR.gateAdjudicationVerdict({ gate: d2837Gate({ blockers: 0 }), adjudication: adj() });
+  assert.equal(underCounted.ok, false, "an under-counted gate event cannot be verifiably waived");
+  assert.match(underCounted.reason, /inconsistent with itself/);
+  assert.match(underCounted.reason, /records 0 blocker\(s\) but its findings list holds 2/);
+  // DER-2782's over-count clause must survive verbatim — same message, same shape.
+  const overCounted = WR.gateAdjudicationVerdict({ gate: d2837Gate({ blockers: 5 }), adjudication: adj() });
+  assert.equal(overCounted.ok, false);
+  assert.match(overCounted.reason, /records 5 blocker\(s\) but its findings list holds 2/);
+});
+
+test("DER-2837: the PRODUCER derives the count from the findings it is about to write", () => {
+  // The read-side checks are worthless if the one thing that writes these events can emit a disagreement.
+  // `reviewFindingsEvent` counted blockers over the UNMAPPED review with its own inline predicate, while
+  // every reader counts them over the MAPPED event findings with `gateBlockerFindings` — two predicates,
+  // one comment claiming they were "kept in one place".
+  //
+  // WHAT THIS TEST CAN AND CANNOT FAIL ON, stated because the distinction decides how much it is worth.
+  // The producer change is DRIFT PREVENTION, not a behaviour fix: measured by mutation audit, reverting
+  // `gateBlockerFindings({ findings })` to the old inline predicate leaves this test GREEN, because the
+  // two predicates agree on every input either can receive today (the map is 1:1 and preserves
+  // `priority`; `f.priority <= 1` and `Number(f.priority) <= 1` coerce identically). So this is a FORWARD
+  // guard on the invariant — a future change to either side, or to the mapper's arity, fails here — and
+  // it is NOT evidence that the old producer could emit a lying event. It could not; the ways to get one
+  // are a hand-written event and a relay, which the `append` and read-side tests cover.
+  const review = { verdict: "patch is incorrect", confidence: 0.9, findings: [
+    { title: "a", priority: 0, confidence: 0.9, file: "x.ts", line_start: 1, line_end: 2, body: "dropped by the mapper" },
+    { title: "b", priority: 1, confidence: 0.9, file: "y.ts", line_start: 3, line_end: 4 },
+    { title: "c", priority: 3, confidence: 0.5, file: "z.ts", line_start: 5, line_end: 6 },
+    { title: "d", priority: null, confidence: 0.5, file: "w.ts", line_start: 7, line_end: 8 },
+  ] };
+  const ev = reviewFindingsEvent(review, { issueId: "DER-1", round: 1, reviewer: "codex", sha: D2837_HEAD });
+  assert.equal(ev.blockers, 2, "P0 + P1 are blockers; P3 and an unprioritized finding are not");
+  assert.equal(WR.gateBlockerCountVerdict(ev).ok, true, "the producer's own output must satisfy the readers' contract");
+  assert.equal(ev.blockers, WR.gateBlockerFindings(ev).length, "the count and the list are ONE derivation, not two agreeing ones");
+  // And the produced event survives the gate it is evidence for.
+  assert.equal(gateEvidenceVerdict({ head: D2837_HEAD, gate: ev }).state, "current-dirty");
+  const cleanEv = reviewFindingsEvent({ ...review, findings: [review.findings[2]] }, { issueId: "DER-1", sha: D2837_HEAD });
+  assert.equal(cleanEv.blockers, 0);
+  assert.equal(gateEvidenceVerdict({ head: D2837_HEAD, gate: cleanEv }).state, "current", "a genuinely clean gate still passes end to end");
+});
+
+test("DER-2837: an under-counted gate reaches the BOARD — the fold trusted the same number", () => {
+  const base = [D2603_STAMPED, { type: "lead_spawned", issue: "DER-1" }, { type: "pr_opened", issue: "DER-1", pr: 12 }];
+  // The fold read `Number(e.blockers ?? 0) || 0` and asked nothing else, so an under-counted unit was
+  // absent from `gate_blocked` — the operator's only pre-enqueue view of the same fact.
+  const s = materializeState([...base, d2837Gate({ blockers: 0 })], { run_id: "R" });
+  assert.deepEqual(s.gate_blocked.map((g) => [g.issue, g.blockers]), [["DER-1", "INCONSISTENT"]]);
+  assert.match(s.gate_blocked[0].note, /INCONSISTENT/, "the banner must say what is wrong, not just that something is");
+  assert.match(s.issues["DER-1"].gate_blockers_inconsistent, /records 0 blocker\(s\) but its findings list holds 2/);
+  assert.equal(s.issues["DER-1"].gate_blockers_unreadable, false, "an inconsistent count is READABLE — conflating the two loses the operator's next action");
+  // CONTROLS — an honest dirty unit still lands with its NUMBER, and an honest clean unit stays off.
+  const honest = materializeState([...base, d2837Gate()], { run_id: "R" });
+  assert.deepEqual(honest.gate_blocked.map((g) => [g.issue, g.blockers]), [["DER-1", 2]]);
+  assert.equal(honest.issues["DER-1"].gate_blockers_inconsistent, null);
+  const clean = materializeState([...base, d2837Gate({ blockers: 0, findings: [D2837_P3] })], { run_id: "R" });
+  assert.deepEqual(clean.gate_blocked, []);
+  assert.equal(clean.issues["DER-1"].gate_blockers_inconsistent, null);
+});
+
+test("DER-2837: `append` refuses a review_findings whose count disagrees with its own findings", async () => {
+  const root = await mkdtemp(join(tmpdir(), "work-d2837-append-"));
+  try {
+    const { runId } = await runSubcommand(["init-run", "--issues", "DER-1", "--runs-root", root]);
+    const dir = join(root, runId);
+    const append = (ev) => runSubcommand(["append", "--run", runId, "--runs-root", root, JSON.stringify(ev)]);
+    const gateEvents = async () => (await readEvents(dir)).filter((e) => e.type === "review_findings");
+    await append({ actor: "orch", type: "pr_opened", issue: "DER-1", pr: 12 }); // the board only lists handed-off units
+
+    await assert.rejects(() => append(d2837Gate({ blockers: 0 })), /UNDER-counts|records 0 blocker/, "the write boundary must refuse the lying event, not merely the read");
+    await assert.rejects(() => append(d2837Gate({ blockers: 5 })), /records 5 blocker/);
+    await assert.rejects(() => append(d2837Gate({ blockers: "two" })), /not a count/);
+    assert.deepEqual(await gateEvents(), [], "a refused gate event must leave NOTHING behind — a half-written gate is worse than none");
+
+    // CONTROL — the honest event is accepted, and so is a clean one. A write gate that refuses every
+    // gate event would be indistinguishable from a broken `append`.
+    assert.match((await append(d2837Gate())).stdout, /ok/);
+    assert.match((await append(d2837Gate({ blockers: 0, findings: [D2837_P3] }))).stdout, /ok/);
+    assert.equal((await gateEvents()).length, 2);
+    // CONTROL — an unrelated event type still relays untouched.
+    assert.equal((await append({ type: "orch_note", issue: "DER-1", note: "hi" })).stdout, "ok");
+
+    // A RELAYED line skips the write check by design (refusing it would fork the ledger) — and the READ
+    // side is where the enforcement lives. This is the same split DER-2782 documented for waivers.
+    await append({ ...d2837Gate({ blockers: 0, issue: "DER-1" }), event_id: "0192f000-0000-7000-8000-000000000002", source_id: "mini", seq: 1, schema_version: 1 });
+    const st = materializeState(await readEvents(dir), { run_id: runId });
+    assert.match(st.issues["DER-1"].gate_blockers_inconsistent, /records 0 blocker/, "a relayed but inconsistent gate event must still be refused by the fold");
+    assert.deepEqual(st.gate_blocked.map((g) => g.issue), ["DER-1"]);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("DER-2837: the lead brief and the shepherd skill describe the gate the code now enforces", async () => {
+  // Copy that describes the OLD contract is a defect this diff introduces: a lead reading "a `blockers: 0`
+  // event is the only clean state" would conclude that the NUMBER is what is checked.
+  const brief = renderBrief({ issueId: "DER-1", worktree: "/wt", runId: "r", runDir: "/run" });
+  assert.match(brief, /findings list/, "the brief must say the count is checked AGAINST the findings list, not taken on trust");
+  const skillsDir = fileURLToPath(new URL("..", import.meta.url));
+  const shepherd = await readFile(join(skillsDir, "work-shepherd", "SKILL.md"), "utf8");
+  assert.match(shepherd, /gate=INCONSISTENT/, "the shepherd's enumeration of gate failure states must include the one this unit added");
+  const lead = await readFile(join(skillsDir, "work-lead", "SKILL.md"), "utf8");
+  assert.match(lead, /findings list/, "the lead must know a hand-written `blockers: 0` no longer buys anything");
 });
 
 test("shaDescendsFrom (DER-2559): exit 0 = descendant, exit 1 = NOT, self is never a descendant", async () => {
@@ -4658,7 +4857,11 @@ test("DER-2753: mergeMode:direct + an unready PR ⇒ NO merge call (the gate can
     ["unreadable checks probe", { ...D2753_READY, checks: "unknown" }, /checks=UNKNOWN/],
     ["draft", { ...D2753_READY, draft: true }, /draft/],
     ["codex behind head", { ...D2753_READY, onHead: false }, /codex not on head/],
-    ["stale-dirty gate", { ...D2753_READY, gate: gateEvidenceVerdict({ head: "a".repeat(40), gate: { sha: "b".repeat(40), blockers: 1 } }) }, /STALE/],
+    // The gate event SHOWS the blocker it counts (DER-2837) — a count with no findings list is a shape
+    // no producer writes, and it would hold this PR as `INCONSISTENT` rather than as the STALE case
+    // this row exists to cover.
+    ["stale-dirty gate", { ...D2753_READY, gate: gateEvidenceVerdict({ head: "a".repeat(40), gate: { sha: "b".repeat(40), blockers: 1, findings: [{ title: "Tenant filter dropped", priority: 1 }] } }) }, /STALE/],
+    ["INCONSISTENT gate (DER-2837)", { ...D2753_READY, gate: gateEvidenceVerdict({ head: "a".repeat(40), gate: { sha: "a".repeat(40), blockers: 0, findings: [{ title: "Tenant filter dropped", priority: 1 }] } }) }, /INCONSISTENT/],
   ];
   for (const [label, inputs, whyRe] of cases) {
     const verdict = readyVerdict(inputs);

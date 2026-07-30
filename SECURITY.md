@@ -61,6 +61,27 @@ between hosts, which trades a trust problem for a correctness problem. So the ha
 authorized it**. If authorization matters in your setting, review the waivers — they are surfaced
 specifically so they can be reviewed.
 
+### Review-gate evidence must agree with itself
+
+A `review_findings` event carries both a `blockers` count and the `findings` list that count is about.
+Until DER-2837 the count was **believed**: `ready` asked whether it was greater than zero, never whether
+it was true, and the single consistency check in the codebase compared `recorded > actual` — catching an
+over-count and letting an under-count through. So an event recording `blockers: 0` while carrying a live
+priority-1 finding read as a **clean gate and authorized a merge**, with the blocker attached to the very
+event that authorized it.
+
+The count must now **exactly equal** the number of priority-≤1 entries in that same event's findings
+list. It is derived from those findings at the producer, refused at `append`, and re-checked at every
+read — the merge verdict, the board fold, and the waiver contract, which will not let an adjudication
+cover findings the count denies. Both directions block, because a one-directional check is precisely the
+shape that let the harmful direction through.
+
+**This is not authentication, and it is not a fix for the section above.** It makes an event's *internal*
+claims checkable against each other; it says nothing about **who** wrote the event. Anything that can
+write the run directory can still write a *self-consistent* gate event recording zero blockers and zero
+findings. What the check removes is the ability to record open findings and a clean verdict in the same
+breath — a lie that is now visible rather than one that reads as evidence.
+
 ### Evidence queries execute WITHOUT a shell, and read whatever you can read
 
 The pre-run planning tool (`prep-for-work`) validates operator-supplied evidence queries against a
@@ -99,10 +120,15 @@ There is no bounty. This is a personal tool published because it is useful, not 
 
 ## Hardening roadmap
 
-Current known gaps, in the order they are being addressed:
+Closed, in the order they were addressed:
 
-1. Remove dynamic shell-argument construction from evidence queries.
-2. Make review-gate evidence internally consistent, so malformed evidence cannot authorize a merge.
+1. ~~Remove dynamic shell-argument construction from evidence queries.~~ Closed by DER-2836 — see
+   *Evidence queries execute WITHOUT a shell* above.
+2. ~~Make review-gate evidence internally consistent, so malformed evidence cannot authorize a merge.~~
+   Closed by DER-2837 — see *Review-gate evidence must agree with itself* above.
+
+Current known gaps:
+
 3. Reserve and receipt the run-completion event so a terminal state cannot be claimed by generic append.
 4. Preserve remote-read failure state so an unreadable host cannot read as a clean, empty pull.
 5. Require exact repository identity — not owner equality — before deriving cloud lifecycle events.
