@@ -100,6 +100,28 @@ Each fix below landed with a regression test that was **observed failing on the 
   and can only round toward *replay*, never skip; `--since <garbage>` used to become `NaN` and never wake at
   all, and now replays. Idle ticks stat an unchanged file instead of re-parsing it (`WORK_WATCH_POLL_MS`
   tunes the interval).
+- **DER-2739 — a failed launch is no longer recorded as a lead.** `spawn-lead` appended `lead_spawned`
+  without checking the launcher's exit code or the returned workspace ref, so ONE failed `cmux` launch did
+  all of this at once: appended a phantom `lead_spawned`, **emptied `kickbacks_pending`**, **cleared
+  `leads_dead`**, retained the closed predecessor's `workspace:11` as if live, promoted the issue to
+  `in_progress`/`inflight`, and incremented `kickback_count` as though the round had been delivered. A launch
+  is now proven only by exit code 0 **and** a parsed `workspace:<n>` ref — neither alone suffices, since
+  `runCommand` never throws and the ref parser returns null on garbage. An unproven launch records
+  `lead_spawn_failed`/`shepherd_spawn_failed`/`orch_spawn_failed` **before** throwing (the throw reaches only
+  whoever typed the command; the ledger is what the next wake reads), leaves the issue queued, and keeps any
+  kickback pending. Surfaced as `state.spawn_failures` + `pending.spawn_failures` and added to the actionable
+  set, so a dispatch that *didn't* happen wakes the loop as loudly as one that did.
+- **DER-2744 — alt-model lanes wrote no transcript, undetectably.** The proxy branches of both lead boot
+  builders omitted `CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1`, so every non-Claude local and mini lead ran
+  without a transcript — and `lead-context`, the rotation bands, token telemetry and crash-recovery evidence
+  all read transcripts, which makes such a lane indistinguishable from a dead lead. One `claudeEnvPrefix`
+  now builds the env for every claude launch so no branch can drop it, and each builder asserts its own
+  finished launch string. The predicate checks the var's **position**, not merely its presence: `env` applies
+  only assignments that precede the binary, so a trailing occurrence is an argv word — a substring check
+  would have passed the broken form. Spawn events carry `transcripts_forced` **measured off the command
+  actually built**, folded tri-state (`null` = UNKNOWN, never assumed true) and surfaced as
+  `state.transcripts_unverified`. Cloud lanes are excluded by construction (RemoteTrigger, no locally
+  readable transcript), so the banner stays meaningful.
 
 ### Added
 

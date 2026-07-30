@@ -1,7 +1,7 @@
 // Unit tests for scripts/work-runner.mjs — run with: node --test scripts/work-runner.test.mjs
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm, readFile, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, readFile, symlink, writeFile, chmod } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -564,7 +564,9 @@ test("buildLeadBootCommand: proxy lead sets gateway env + --model leadModel; kee
   const proxyEnv = proxyEnvPairs({ proxy: true, leadModel: "kimi-k3", subagentModel: "kimi-k2.7-code" });
   const { args } = buildLeadBootCommand({ name: "l", worktree: "/wt", briefPath: "/b.md", runDir: "/run", model: "kimi-k3", proxyEnv });
   const command = args[args.indexOf("--command") + 1];
-  assert.match(command, /env -u ANTHROPIC_API_KEY ENABLE_CODE_SECURITY_REVIEW=0 ANTHROPIC_BASE_URL=/);
+  // DER-2744: the persistence var sits between the key clause and the gate on EVERY branch now — the
+  // proxy branch used to skip it, and that is what left the alt-model lanes transcript-less.
+  assert.match(command, /env -u ANTHROPIC_API_KEY CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 ENABLE_CODE_SECURITY_REVIEW=0 ANTHROPIC_BASE_URL=/);
   assert.match(command, /--model kimi-k3/);
   assert.match(command, /ANTHROPIC_DEFAULT_SONNET_MODEL=kimi-k2\.7-code/);
   assert.doesNotMatch(command, /-u ANTHROPIC_AUTH_TOKEN/, "proxy lead must NOT drop the auth token it just set");
@@ -654,7 +656,7 @@ test("proxyEnvPairs: authTokenExpr overrides the provider default; CLIProxyAPI t
 test("buildLeadBootCommand (openrouter): ANTHROPIC_API_KEY is EMPTY, never unset", () => {
   const { args } = buildLeadBootCommand({ name: "l", worktree: "/wt", briefPath: "/b.md", runDir: "/run", model: "deepseek/deepseek-v4-pro", proxyEnv: proxyEnvPairs(DSV4_CFG), provider: "openrouter" });
   const command = args[args.indexOf("--command") + 1];
-  assert.match(command, /^env ANTHROPIC_API_KEY= ENABLE_CODE_SECURITY_REVIEW=0 ANTHROPIC_BASE_URL=https:\/\/openrouter\.ai\/api /);
+  assert.match(command, /^env ANTHROPIC_API_KEY= CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 ENABLE_CODE_SECURITY_REVIEW=0 ANTHROPIC_BASE_URL=https:\/\/openrouter\.ai\/api /);
   // Unset (`-u`) would let Claude Code fall back to the keychain OAuth token and send it to OpenRouter.
   assert.doesNotMatch(command, /-u ANTHROPIC_API_KEY/, "must be empty, not unset");
   assert.doesNotMatch(command, /-u ANTHROPIC_AUTH_TOKEN/, "must not drop the token it just set");
@@ -668,7 +670,9 @@ test("buildLeadBootCommand: a CLIProxyAPI lead keeps `-u ANTHROPIC_API_KEY` byte
   const command = args[args.indexOf("--command") + 1];
   assert.equal(
     command,
-    `env -u ANTHROPIC_API_KEY ENABLE_CODE_SECURITY_REVIEW=0 ANTHROPIC_BASE_URL=http://127.0.0.1:8317 ANTHROPIC_AUTH_TOKEN=${PROXY_TOKEN_EXPR} ` +
+    // DER-2744: byte-for-byte INCLUDES the persistence var now. Its absence here is the whole defect —
+    // a kimi lead that writes no transcript reports no tokens and cannot be context-probed.
+    `env -u ANTHROPIC_API_KEY CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 ENABLE_CODE_SECURITY_REVIEW=0 ANTHROPIC_BASE_URL=http://127.0.0.1:8317 ANTHROPIC_AUTH_TOKEN=${PROXY_TOKEN_EXPR} ` +
       `ANTHROPIC_DEFAULT_OPUS_MODEL=kimi-k3 ANTHROPIC_DEFAULT_SONNET_MODEL=kimi-k2.7-code ` +
       `ANTHROPIC_DEFAULT_HAIKU_MODEL=kimi-k2.7-code-highspeed CLAUDE_CODE_MAX_CONTEXT_TOKENS=1000000 ` +
       // Context rotation (2026-07-25): a type with a known contextWindow also teaches the
@@ -5314,4 +5318,445 @@ test("DER-2741: the ledger tail reads only NEW bytes, buffers a torn partial lin
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+// ---------------------------------------------------------------------------
+// DER-2739 — a FAILED launch must never be recorded as a spawn
+// DER-2744 — no launch may omit CLAUDE_CODE_FORCE_SESSION_PERSISTENCE
+//
+// Both are the same class of defect: the harness believing a lead exists when it does not. DER-2739
+// records a phantom lead from a launch that never happened; DER-2744 launches a real lead that writes no
+// transcript, so every instrument that reads transcripts (lead-context, the rotation bands, the token
+// telemetry) sees nothing and cannot tell that lane apart from a corpse.
+// ---------------------------------------------------------------------------
+
+// A launcher stand-in. A launch is provable by exactly two facts — the launcher's exit code, and whether
+// its stdout named a workspace — so the stub is parameterised on precisely those two and nothing else.
+async function writeStubBin(path, { exit = 0, out = "", err = "" } = {}) {
+  const lines = ["#!/bin/sh"];
+  if (out) lines.push(`printf '%s\\n' ${JSON.stringify(out)}`);
+  if (err) lines.push(`printf '%s\\n' ${JSON.stringify(err)} >&2`);
+  lines.push(`exit ${exit}`);
+  await writeFile(path, `${lines.join("\n")}\n`, "utf8");
+  await chmod(path, 0o755);
+}
+
+async function withEnv(patch, fn) {
+  const prev = {};
+  for (const [k, v] of Object.entries(patch)) {
+    prev[k] = process.env[k];
+    if (v === undefined) delete process.env[k]; else process.env[k] = v;
+  }
+  try {
+    return await fn();
+  } finally {
+    for (const [k, v] of Object.entries(prev)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  }
+}
+
+// Boot a run, take DER-1 to an UN-ACTIONED kickback, and put a cmux stub with the given outcome on disk.
+// The kickback is the state that makes this a P1: `lead_spawned` is the SOLE delivery evidence for a
+// kickback round, so a phantom one empties kickbacks_pending and clears lead_process_dead.
+async function kickedBackRun({ exit = 0, out = "", err = "cmux: connection refused" } = {}) {
+  const root = await mkdtemp(join(tmpdir(), "wr-spawnfail-"));
+  const bin = join(root, "bin");
+  await mkdir(bin, { recursive: true });
+  await writeStubBin(join(bin, "cmux"), { exit, out, err });
+  const { runId } = await runSubcommand(["init-run", "--project", "s", "--runs-root", root, "--repo-root", root]);
+  const runDir = join(root, runId);
+  for (const ev of [
+    { actor: "orch", type: "worktree_created", issue: "DER-1", worktree: "/wt/DER-1", branch: "b1" },
+    { actor: "orch", type: "lead_spawned", issue: "DER-1", worktree: "/wt/DER-1", workspace_ref: "workspace:11" },
+    { actor: "lead", type: "pr_opened", issue: "DER-1", pr: 7 },
+    { actor: "shepherd", type: "kickback", issue: "DER-1", pr: 7, sha: "a".repeat(40), findings: "fix the thing" },
+    { actor: "orch", type: "lead_process_dead", issue: "DER-1", note: "pgrep found nothing" },
+  ]) await appendEvent(runDir, ev);
+  const spawnArgs = (extra = []) => [
+    "spawn-lead", "--run", runId, "DER-1", "--runs-root", root, "--repo-root", root,
+    "--worktree", "/wt/DER-1", "--title", "t", ...extra,
+  ];
+  return { root, runId, runDir, bin, cmux: join(bin, "cmux"), spawnArgs };
+}
+
+test("DER-2739: spawnOutcome — a launch is PROVEN only by exit 0 AND a parsed workspace ref", () => {
+  assert.equal(typeof WR.spawnOutcome, "function", "expected an exported launch-proof helper");
+  const ok = WR.spawnOutcome({ exitCode: 0, stdout: "created workspace:42" });
+  assert.equal(ok.ok, true);
+  assert.equal(ok.ref, "workspace:42");
+  assert.equal(ok.reason, null);
+  // runCommand NEVER throws: a spawn error resolves as 127 and a nonzero close resolves as the code, so
+  // the exit code is the only place a failed launcher shows up.
+  assert.equal(WR.spawnOutcome({ exitCode: 1, stdout: "created workspace:42" }).ok, false, "a nonzero exit is not a launch, whatever it printed");
+  assert.equal(WR.spawnOutcome({ exitCode: 127, stdout: "" }).ok, false, "ENOENT on the launcher resolves as 127, never as a throw");
+  const noRef = WR.spawnOutcome({ exitCode: 0, stdout: "usage: cmux …" });
+  assert.equal(noRef.ok, false, "exit 0 with unparseable stdout is not a launch either");
+  assert.equal(noRef.ref, null, "and it must not hand back a null ref as if it were one");
+  assert.match(String(WR.spawnOutcome({ exitCode: 3, stdout: "" }).reason), /3/, "the reason names the exit code");
+});
+
+test("DER-2739: a cmux launch that EXITS NONZERO appends NO lead_spawned — the kickback stays pending", async () => {
+  const { root, runId, runDir, cmux, spawnArgs } = await kickedBackRun({ exit: 1, out: "" });
+  try {
+    const before = materializeState(await readEvents(runDir), { run_id: runId });
+    assert.deepEqual(before.kickbacks_pending, ["DER-1"], "precondition: the kickback is un-actioned");
+    assert.deepEqual(before.leads_dead.map((r) => r.issue), ["DER-1"], "precondition: the process is believed dead");
+    await withEnv({ WORK_CMUX_BIN: cmux }, () =>
+      assert.rejects(
+        () => runSubcommand(spawnArgs(["--kickback", "1"])),
+        /did not succeed/,
+        "a launch the harness cannot prove must be a hard error, not a silent success",
+      ));
+    const evs = await readEvents(runDir);
+    assert.equal(
+      evs.filter((e) => e.type === "lead_spawned").length, 1,
+      "PHANTOM lead_spawned: a failed launch appended a spawn event (want only the 1 seeded predecessor)",
+    );
+    const fails = evs.filter((e) => e.type === "lead_spawn_failed");
+    assert.equal(fails.length, 1, "the failure must be RECORDED in the ledger, not merely thrown");
+    assert.equal(fails[0].issue, "DER-1");
+    assert.equal(fails[0].exit_code, 1);
+    assert.equal(fails[0].workspace_ref ?? null, null);
+    const st = materializeState(evs, { run_id: runId });
+    assert.deepEqual(st.kickbacks_pending, ["DER-1"], "a failed re-spawn is NOT delivery of the findings");
+    assert.equal(st.issues["DER-1"].status, "kickback", "not in_progress — nothing is running");
+    assert.ok(!st.inflight.includes("DER-1") || st.issues["DER-1"].status === "kickback");
+    assert.equal(st.issues["DER-1"].process_dead, true, "a failed spawn does not replace the dead process");
+    assert.deepEqual(st.leads_dead.map((r) => r.issue), ["DER-1"], "…so the dead-process banner must survive it");
+    assert.equal(st.issues["DER-1"].workspace_ref, null, "the predecessor's ref was CLOSED before the launch — retaining it reads as a live workspace");
+    assert.ok(Array.isArray(st.spawn_failures), "state must expose the failed launches");
+    assert.deepEqual(st.spawn_failures.map((f) => `${f.role}:${f.issue}`), ["lead:DER-1"]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("DER-2739: a cmux launch that EXITS 0 with no workspace ref is equally un-proven", async () => {
+  const { root, runId, runDir, cmux, spawnArgs } = await kickedBackRun({ exit: 0, out: "usage: cmux new-workspace [options]" });
+  try {
+    await withEnv({ WORK_CMUX_BIN: cmux }, () =>
+      assert.rejects(() => runSubcommand(spawnArgs(["--kickback", "1"])), /did not succeed/));
+    const evs = await readEvents(runDir);
+    assert.equal(evs.filter((e) => e.type === "lead_spawned").length, 1, "exit 0 + null ref must not append a spawn");
+    const fails = evs.filter((e) => e.type === "lead_spawn_failed");
+    assert.equal(fails.length, 1);
+    assert.equal(fails[0].exit_code, 0, "exit 0 is recorded verbatim — the missing ref is the failure");
+    assert.match(String(fails[0].reason), /workspace/i);
+    const st = materializeState(evs, { run_id: runId });
+    assert.deepEqual(st.kickbacks_pending, ["DER-1"]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// The control that proves the gate does NOT block the healthy case. A gate that refuses every launch
+// would pass every assertion above while breaking the harness outright.
+test("DER-2739 CONTROL: a launch that exits 0 AND prints a workspace ref still records lead_spawned and actions the kickback", async () => {
+  const { root, runId, runDir, cmux, spawnArgs } = await kickedBackRun({ exit: 0, out: "created workspace:42", err: "" });
+  try {
+    const res = await withEnv({ WORK_CMUX_BIN: cmux }, () => runSubcommand(spawnArgs(["--kickback", "1"])));
+    assert.equal(res.workspace_ref, "workspace:42");
+    const evs = await readEvents(runDir);
+    assert.equal(evs.filter((e) => e.type === "lead_spawned").length, 2, "the healthy launch IS recorded");
+    assert.equal(evs.filter((e) => e.type === "lead_spawn_failed").length, 0, "and no failure is invented");
+    const st = materializeState(evs, { run_id: runId });
+    assert.deepEqual(st.kickbacks_pending, [], "a proven re-spawn actions the kickback exactly as before");
+    assert.equal(st.issues["DER-1"].status, "in_progress");
+    assert.equal(st.issues["DER-1"].workspace_ref, "workspace:42");
+    assert.equal(st.issues["DER-1"].process_dead, false, "a proven spawn replaces the dead process (DER-2516)");
+    assert.deepEqual(st.spawn_failures, []);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("DER-2739: a failed FIRST dispatch leaves the issue un-dispatched (queued), never in flight", async () => {
+  const root = await mkdtemp(join(tmpdir(), "wr-spawnfail1-"));
+  const bin = join(root, "bin");
+  try {
+    await mkdir(bin, { recursive: true });
+    await writeStubBin(join(bin, "cmux"), { exit: 1, err: "cmux: no display" });
+    const { runId } = await runSubcommand(["init-run", "--project", "s", "--runs-root", root, "--repo-root", root, "--issues", "DER-1,DER-2"]);
+    const runDir = join(root, runId);
+    await appendEvent(runDir, { actor: "orch", type: "worktree_created", issue: "DER-1", worktree: "/wt/DER-1", branch: "b1" });
+    await withEnv({ WORK_CMUX_BIN: join(bin, "cmux") }, () =>
+      assert.rejects(
+        () => runSubcommand(["spawn-lead", "--run", runId, "DER-1", "--runs-root", root, "--repo-root", root, "--worktree", "/wt/DER-1", "--title", "t"]),
+        /did not succeed/,
+      ));
+    const st = materializeState(await readEvents(runDir), { run_id: runId, issues: [{ id: "DER-1" }, { id: "DER-2" }] });
+    assert.equal(st.issues["DER-1"].status, "queued", "no lead exists, so the unit is still queued");
+    assert.deepEqual(st.inflight, [], "a phantom lead would have shown here as in-flight work");
+    assert.deepEqual(st.queue.sort(), ["DER-1", "DER-2"], "the unit stays in the backlog so it gets re-dispatched");
+    assert.deepEqual(st.spawn_failures.map((f) => f.issue), ["DER-1"]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("DER-2739: spawn-shepherd and spawn-orch check the same two facts", async () => {
+  const root = await mkdtemp(join(tmpdir(), "wr-spawnfail2-"));
+  const bin = join(root, "bin");
+  try {
+    await mkdir(bin, { recursive: true });
+    await writeStubBin(join(bin, "cmux"), { exit: 0, out: "cmux: could not attach" }); // exit 0, no ref
+    await runSubcommand(["init-run", "--project", "s", "--run", "R1", "--runs-root", join(root, "runs"), "--repo-root", root]);
+    const runDir = join(root, "runs", "R1");
+    await withEnv({ WORK_CMUX_BIN: join(bin, "cmux") }, async () => {
+      await assert.rejects(
+        () => runSubcommand(["spawn-shepherd", "--run", "R1", "--project", "s", "--runs-root", join(root, "runs"), "--repo-root", root]),
+        /did not succeed/,
+      );
+      await assert.rejects(
+        () => runSubcommand(["spawn-orch", "--run", "R1", "--project", "s", "--runs-root", join(root, "runs"), "--repo-root", root]),
+        /did not succeed/,
+      );
+    });
+    const evs = await readEvents(runDir);
+    assert.equal(evs.filter((e) => e.type === "shepherd_spawned").length, 0, "no phantom shepherd");
+    assert.equal(evs.filter((e) => e.type === "orch_spawned").length, 0, "no phantom successor orchestrator");
+    assert.deepEqual(
+      evs.filter((e) => String(e.type).endsWith("_spawn_failed")).map((e) => e.type),
+      ["shepherd_spawn_failed", "orch_spawn_failed"],
+      "each role records its own failure",
+    );
+    const st = materializeState(evs, { run_id: "R1" });
+    assert.deepEqual(st.spawn_failures.map((f) => f.role).sort(), ["orch", "shepherd"]);
+    // A shepherd rotation request must NOT be cleared by a shepherd launch that failed.
+    const withReq = materializeState([
+      { type: "rotate_requested", actor: "shepherd" },
+      ...evs.filter((e) => e.type === "shepherd_spawn_failed"),
+    ], {});
+    assert.equal(withReq.shepherd_rotate_pending, true, "a failed rotation is not a rotation");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("DER-2739: the REMOTE lead launch is checked too (the scp already was; the cmux launch was not)", async () => {
+  const dir = await mkRepoWithHosts();
+  const bin = join(dir, "bin");
+  const runsRoot = join(dir, "runs");
+  try {
+    await mkdir(bin, { recursive: true });
+    await writeStubBin(join(bin, "ssh"), { exit: 0 });
+    await writeStubBin(join(bin, "scp"), { exit: 0 });
+    await writeStubBin(join(bin, "cmux"), { exit: 0, out: "cmux: ssh: could not resolve hostname" });
+    await runSubcommand(["init-run", "--project", "s", "--run", "R1", "--runs-root", runsRoot, "--repo-root", dir]);
+    const runDir = join(runsRoot, "R1");
+    await withEnv({ PATH: `${bin}:${process.env.PATH}`, WORK_CMUX_BIN: join(bin, "cmux") }, () =>
+      assert.rejects(
+        () => runSubcommand(["spawn-lead", "--run", "R1", "--host", "mini", "--worktree", "/Users/example/agent-work/R1/DER-9", "--title", "x", "--repo-root", dir, "--runs-root", runsRoot, "DER-9"]),
+        /did not succeed/,
+      ));
+    const evs = await readEvents(runDir);
+    assert.equal(evs.filter((e) => e.type === "lead_spawned").length, 0, "a remote launch nobody proved is not a remote lead");
+    const fails = evs.filter((e) => e.type === "lead_spawn_failed");
+    assert.equal(fails.length, 1);
+    assert.equal(fails[0].host, "mini", "the failure names the host it failed on");
+    const st = materializeState(evs, { run_id: "R1" });
+    assert.deepEqual(st.spawn_failures.map((f) => f.host), ["mini"]);
+  } finally {
+    await applyRepoConfig("/nonexistent-reset");
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("DER-2739: a failed spawn wakes a `--wake-on actionable` watcher (the failure is not silent)", () => {
+  const set = parseWakeOn("actionable");
+  for (const t of ["lead_spawn_failed", "shepherd_spawn_failed", "orch_spawn_failed"]) {
+    assert.ok(set.has(t), `${t} must wake the loop — a failed dispatch that nothing wakes on rots exactly like the 2026-07-16 kickbacks`);
+  }
+  assert.ok(!set.has("lead_spawned"), "a SUCCESSFUL spawn stays orchestration noise (unchanged)");
+});
+
+// ---- DER-2744 ----
+
+test("DER-2744: EVERY launch variant forces session persistence — local/remote × claude/cliproxy/openrouter, plus shepherd and orch", () => {
+  const KIMI = { proxy: true, leadModel: "kimi-k3", subagentModel: "kimi-k2.7-code" };
+  const localCmd = (a) => a.args[a.args.indexOf("--command") + 1];
+  const remoteCmd = (a) => a.args[a.args.length - 1];
+  const lead = { name: "l", worktree: "/wt", briefPath: "/b.md", runDir: "/run" };
+  const remote = { ...lead, ssh: "example-mini-host", ghTokenFile: "~/.work-mini.env" };
+  const variants = {
+    "local/claude": localCmd(buildLeadBootCommand({ ...lead, model: "opus" })),
+    "local/cliproxy": localCmd(buildLeadBootCommand({ ...lead, model: "kimi-k3", proxyEnv: proxyEnvPairs(KIMI), effort: "medium" })),
+    "local/openrouter": localCmd(buildLeadBootCommand({ ...lead, model: "deepseek/deepseek-v4-pro", proxyEnv: proxyEnvPairs(DSV4_CFG), provider: "openrouter" })),
+    "remote/claude": remoteCmd(buildRemoteLeadBootCommand({ ...remote, model: "opus" })),
+    "remote/cliproxy": remoteCmd(buildRemoteLeadBootCommand({ ...remote, model: "kimi-k3", proxyEnv: proxyEnvPairs(KIMI), effort: "medium" })),
+    "remote/openrouter": remoteCmd(buildRemoteLeadBootCommand({ ...remote, model: "deepseek/deepseek-v4-pro", proxyEnv: proxyEnvPairs(DSV4_CFG), provider: "openrouter" })),
+    shepherd: localCmd(buildShepherdBootCommand({ name: "s", cwd: "/repo", runId: "r1", runDir: "/run" })),
+    orch: localCmd(buildOrchBootCommand({ name: "o", cwd: "/repo", runId: "r1", runDir: "/run" })),
+  };
+  for (const [label, cmd] of Object.entries(variants)) {
+    const at = cmd.indexOf("CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1");
+    assert.ok(
+      at >= 0,
+      `${label}: this lane writes NO transcript. session-token-report, lead-context, the rotation bands and crash-recovery evidence all read the transcript, so the lane is indistinguishable from a dead one.`,
+    );
+    const binAt = cmd.search(/\bclaude\s+--/);
+    assert.ok(binAt > 0, `${label}: expected a claude invocation`);
+    assert.ok(at < binAt, `${label}: the var must sit in the env prefix, before the claude binary`);
+  }
+});
+
+test("DER-2744: the persistence gate BLOCKS a launch that omits the var and PASSES one that carries it", () => {
+  assert.equal(typeof WR.launchForcesTranscripts, "function", "expected an exported predicate for the persistence guarantee");
+  assert.equal(typeof WR.assertForcesTranscripts, "function", "expected the un-omittable gate itself");
+  // The pre-fix proxy branch, verbatim. This is the mutation control: restore the old logic and the gate
+  // must fire. A gate that cannot refuse this string is not evidence of anything.
+  const preFix = 'env -u ANTHROPIC_API_KEY ENABLE_CODE_SECURITY_REVIEW=0 ANTHROPIC_BASE_URL=http://127.0.0.1:8317 claude --dangerously-skip-permissions --no-chrome --model kimi-k3 "/work-lead /b.md"';
+  assert.equal(WR.launchForcesTranscripts(preFix), false);
+  assert.throws(() => WR.assertForcesTranscripts(preFix, "proxy lead"), /CLAUDE_CODE_FORCE_SESSION_PERSISTENCE/);
+  assert.throws(() => WR.assertForcesTranscripts(preFix, "proxy lead"), /proxy lead/, "the refusal names the launcher that produced it");
+  // …and the control that it does NOT block the healthy case.
+  const healthy = preFix.replace("env -u ANTHROPIC_API_KEY ", "env -u ANTHROPIC_API_KEY CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 ");
+  assert.equal(WR.launchForcesTranscripts(healthy), true);
+  assert.doesNotThrow(() => WR.assertForcesTranscripts(healthy, "proxy lead"));
+  // An assignment AFTER the binary is not an env assignment at all — it is an argv word.
+  assert.equal(WR.launchForcesTranscripts(`${preFix} CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1`), false, "an env var placed after the binary never reaches the session");
+  assert.equal(WR.launchForcesTranscripts("CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=0 claude --x"), false, "=0 is not forcing anything");
+  assert.equal(WR.launchForcesTranscripts(""), false);
+  assert.equal(WR.launchForcesTranscripts(null), false);
+});
+
+test("DER-2744: every boot builder returns the launch string it built, and its own gate accepts it", () => {
+  const KIMI = { proxy: true, leadModel: "kimi-k3", subagentModel: "kimi-k2.7-code" };
+  const built = [
+    buildLeadBootCommand({ name: "l", worktree: "/wt", briefPath: "/b.md", runDir: "/run", model: "opus" }),
+    buildLeadBootCommand({ name: "l", worktree: "/wt", briefPath: "/b.md", runDir: "/run", model: "kimi-k3", proxyEnv: proxyEnvPairs(KIMI) }),
+    buildRemoteLeadBootCommand({ name: "l", worktree: "/wt", briefPath: "/b.md", runDir: "/run", ssh: "h", ghTokenFile: "~/.e", model: "kimi-k3", proxyEnv: proxyEnvPairs(KIMI) }),
+    buildShepherdBootCommand({ name: "s", cwd: "/repo", runId: "r1", runDir: "/run" }),
+    buildOrchBootCommand({ name: "o", cwd: "/repo", runId: "r1", runDir: "/run" }),
+  ];
+  for (const b of built) {
+    assert.equal(typeof b.launch, "string", "the builder must surface the launch string it built, so the spawn path can MEASURE the guarantee instead of assuming it");
+    assert.equal(WR.launchForcesTranscripts(b.launch), true);
+    assert.ok(b.args.join(" ").includes(b.launch), "the returned launch must be the one actually handed to cmux");
+  }
+});
+
+test("DER-2744: a lane whose transcript persistence was never PROVEN is visible in state", () => {
+  const proven = materializeState([{ type: "lead_spawned", issue: "DER-1", workspace_ref: "workspace:1", transcripts_forced: true }], {});
+  assert.ok(Array.isArray(proven.transcripts_unverified), "state must expose the transcript-persistence blind spot");
+  assert.deepEqual(proven.transcripts_unverified, [], "an attested launch must NOT be flagged (else the banner is noise and gets ignored)");
+  assert.equal(proven.issues["DER-1"].transcripts_forced, true);
+  // No attestation ⇒ UNKNOWN, and unknown is not ok. This is the live case: a host running older harness
+  // code, or a hand-appended recovery event, folds a lead_spawned that proves nothing.
+  const unproven = materializeState([{ type: "lead_spawned", issue: "DER-2", workspace_ref: "workspace:2", leadType: "kimi" }], {});
+  assert.deepEqual(unproven.transcripts_unverified.map((r) => r.issue), ["DER-2"]);
+  assert.equal(unproven.transcripts_unverified[0].leadType, "kimi", "the banner names the lane, since the alt-model lanes are the ones that were broken");
+  assert.equal(unproven.issues["DER-2"].transcripts_forced, null, "null means UNKNOWN — never `ok`");
+  // Explicitly measured as false is the loudest case of all.
+  const measuredFalse = materializeState([{ type: "lead_spawned", issue: "DER-3", workspace_ref: "workspace:3", transcripts_forced: false }], {});
+  assert.deepEqual(measuredFalse.transcripts_unverified.map((r) => r.issue), ["DER-3"]);
+  // A CLOUD lead has no locally readable transcript by construction (RemoteTrigger launch, no boot
+  // builder, reports by PR comment). Flagging it would make the banner permanently non-empty, which is
+  // how a banner stops being read — the exact failure this whole unit is about.
+  const cloud = materializeState([{ type: "lead_spawned", issue: "DER-C", host: "cloud" }], {});
+  assert.deepEqual(cloud.transcripts_unverified, [], "cloud lanes are out of scope, not silently mis-flagged");
+  // …but a LOCAL or mini lane must still be flagged, so the exclusion is narrow.
+  const mini = materializeState([{ type: "lead_spawned", issue: "DER-M", host: "mini" }], {});
+  assert.deepEqual(mini.transcripts_unverified.map((r) => r.issue), ["DER-M"]);
+  // A unit that already landed is not an actionable blind spot.
+  const done = materializeState([{ type: "lead_spawned", issue: "DER-4" }, { type: "pr_merged", issue: "DER-4", pr: 4 }], {});
+  assert.deepEqual(done.transcripts_unverified, []);
+  // A later PROVEN re-spawn clears it — the banner tracks the CURRENT lead, not the run's history.
+  const rotated = materializeState([
+    { type: "lead_spawned", issue: "DER-5", workspace_ref: "workspace:5" },
+    { type: "lead_spawned", issue: "DER-5", workspace_ref: "workspace:6", transcripts_forced: true, rotation: 1 },
+  ], {});
+  assert.deepEqual(rotated.transcripts_unverified, []);
+});
+
+test("DER-2744: a real spawn STAMPS the measured guarantee on the ledger event", async () => {
+  const { root, runId, runDir, cmux, spawnArgs } = await kickedBackRun({ exit: 0, out: "created workspace:77", err: "" });
+  try {
+    const res = await withEnv({ WORK_CMUX_BIN: cmux }, () => runSubcommand(spawnArgs()));
+    assert.equal(res.event.transcripts_forced, true);
+    const spawned = (await readEvents(runDir)).filter((e) => e.type === "lead_spawned").pop();
+    assert.equal(spawned.transcripts_forced, true, "the event records what the LAUNCH STRING actually said, not a hardcoded claim");
+    const st = materializeState(await readEvents(runDir), { run_id: runId });
+    assert.deepEqual(st.transcripts_unverified, []);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("DER-2744 + DER-2739: both blind spots reach the watch wake payload", async () => {
+  const root = await mkdtemp(join(tmpdir(), "wr-wake-"));
+  try {
+    const { runId } = await runSubcommand(["init-run", "--project", "s", "--runs-root", root, "--repo-root", root]);
+    const runDir = join(root, runId);
+    await appendEvent(runDir, { actor: "orch", type: "lead_spawned", issue: "DER-2", workspace_ref: "workspace:2" });
+    await appendEvent(runDir, { actor: "orch", type: "lead_spawn_failed", issue: "DER-3", exit_code: 1, reason: "cmux exited 1" });
+    const res = await runSubcommand(["watch", "--run", runId, "--runs-root", root, "--repo-root", root, "--since", "1", "--timeout", "1"]);
+    const payload = JSON.parse(res.stdout);
+    assert.deepEqual(payload.pending.spawn_failures, ["DER-3"], "a failed dispatch must re-surface on EVERY wake until it is re-dispatched");
+    assert.deepEqual(payload.pending.transcripts_unverified, ["DER-2"], "so must a lane nobody can read a transcript for");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// Dry-run purity (DER-2514) under the new gate. A preview must not consult the launcher AT ALL — so a
+// launcher rigged to fail cannot make a preview throw, record a failure, or record a spawn. This is the
+// control that the DER-2739 gate lives on the EXECUTION path and not on the preview path.
+test("DER-2739 + DER-2514: --dry-run never invokes the launcher, so a broken cmux cannot change a preview", async () => {
+  const root = await mkdtemp(join(tmpdir(), "wr-dryrun-gate-"));
+  const bin = join(root, "bin");
+  try {
+    await mkdir(bin, { recursive: true });
+    const marker = join(root, "invoked");
+    await writeFile(join(bin, "cmux"), `#!/bin/sh\ntouch ${JSON.stringify(marker)}\nexit 1\n`, "utf8");
+    await chmod(join(bin, "cmux"), 0o755);
+    const { runId } = await runSubcommand(["init-run", "--project", "s", "--runs-root", root, "--repo-root", root]);
+    const runDir = join(root, runId);
+    await runSubcommand(["write-brief", "--run", runId, "DER-1", "--runs-root", root, "--repo-root", root, "--worktree", "/wt/DER-1", "--title", "t"]);
+    const out = await withEnv({ WORK_CMUX_BIN: join(bin, "cmux") }, async () => {
+      const lead = await runSubcommand(["spawn-lead", "--run", runId, "DER-1", "--runs-root", root, "--repo-root", root, "--worktree", "/wt/DER-1", "--title", "t", "--dry-run"]);
+      await runSubcommand(["spawn-shepherd", "--run", runId, "--project", "s", "--runs-root", root, "--repo-root", root, "--dry-run"]);
+      await runSubcommand(["spawn-orch", "--run", runId, "--project", "s", "--runs-root", root, "--repo-root", root, "--dry-run"]);
+      return lead;
+    });
+    assert.equal(existsSync(marker), false, "a dry run must not run the launcher — that is what makes it a preview");
+    assert.equal(out.dryRun, true);
+    assert.equal(out.event.type, "lead_spawned", "the PREVIEW event is still returned, unchanged");
+    assert.equal(out.event.workspace_ref, null);
+    const types = (await readEvents(runDir)).map((e) => e.type);
+    assert.deepEqual(types, ["run_started"], `a dry run must write NOTHING: ${types.join(",")}`);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// DER-2737 boundary check for the two fields these units introduce. A PR comment is UNTRUSTED input, and
+// both new fields are load-bearing: `transcripts_forced:true` would let a comment silence the DER-2744
+// blind-spot banner, and a `lead_spawn_failed` from a comment would null a live lead's workspace_ref.
+test("DER-2739/DER-2744 fields are NOT reachable from a PR comment", () => {
+  // Neither new type may be reported by a cloud lead at all.
+  for (const type of ["lead_spawn_failed", "shepherd_spawn_failed", "orch_spawn_failed", "lead_spawned"]) {
+    assert.equal(WR.sanitizeCommentEvent({ type, issue: "DER-1" }, { pr: 5 }), null, `${type} must not be comment-sourced`);
+  }
+  // And the attestation field is dropped from every type a comment MAY report.
+  for (const type of ["pr_opened", "lead_online", "plan_scope", "handed_off", "rotate_requested", "kickback_ack", "token_usage"]) {
+    const out = WR.sanitizeCommentEvent({ type, issue: "DER-1", transcripts_forced: true, exit_code: 0, reason: "x", retryable: true, role: "orch" }, { pr: 5 });
+    assert.ok(out, `${type} is still accepted`);
+    assert.equal("transcripts_forced" in out, false, `${type}: a comment must not be able to attest transcript persistence`);
+    assert.equal("exit_code" in out, false);
+    assert.equal("retryable" in out, false);
+    // `role` is allowed on token_usage ONLY (it is how a cloud lead attributes its own spend) and on
+    // nothing else — spawnFailedEvent also carries a `role`, so this pins that it cannot arrive by comment.
+    assert.equal("role" in out, type === "token_usage", `${type}: role must not be a comment claim`);
+  }
+  // End to end: a forged comment cannot clear the blind-spot banner for a lane that never attested.
+  const forged = parsePrEventComments({
+    comments: [{ author: { login: "trusted" }, body: `${EVENT_MARKER}${JSON.stringify({ type: "pr_opened", issue: "DER-1", transcripts_forced: true })}` }],
+    pr: 5, trustedAuthors: ["trusted"],
+  });
+  assert.equal(forged.length, 1);
+  assert.equal("transcripts_forced" in forged[0], false);
+  const st = materializeState([{ type: "lead_spawned", issue: "DER-1", workspace_ref: "workspace:1" }, ...forged], {});
+  assert.deepEqual(st.transcripts_unverified.map((r) => r.issue), ["DER-1"], "the banner survives a forged attestation");
 });
