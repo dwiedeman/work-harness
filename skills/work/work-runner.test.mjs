@@ -2258,8 +2258,12 @@ test("clampWatchTimeout: default, ceiling, floor, junk", () => {
 // The missing half of the plan_scope contract: the plan ASSIGNS the number, the brief carries it, and
 // the lead is checked against it instead of grading itself.
 
-const planWith = (issues) => ({ issues });
-const pIssue = (id, over = {}) => ({ id, budget: { files: 9, additions: 500 }, surfaces: ["command"], riskLane: "mechanical", leadType: "claude", ...over });
+// DER-2746 — `init-run --plan` now runs the CANONICAL validator, so a fixture plan must be one
+// `prep-runner validate` accepts. `planReviewSkipped.why` and `decisions` are what that adds over the old
+// local check; both are shapes /prep-for-work already emits, and a plan lacking them was never dispatchable
+// (it just used to reach dispatch anyway). See the DER-2746 tests for the newly-refused shapes, named.
+const planWith = (issues) => ({ issues, decisions: [{ q: "anything blocking?", a: "no" }] });
+const pIssue = (id, over = {}) => ({ id, budget: { files: 9, additions: 500 }, surfaces: ["command"], riskLane: "mechanical", leadType: "claude", planReviewSkipped: { why: "fixture — no codex in the unit suite" }, ...over });
 
 test("assignedBudgetFor: solo unit returns its own budget", () => {
   const b = assignedBudgetFor(planWith([pIssue("DER-1")]), "DER-1");
@@ -2359,6 +2363,145 @@ test("init-run --plan: records a validated plan, refuses an un-budgeted one", as
       /ENOENT|no such file/,
     );
   } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+// ---- DER-2746: init-run runs the CANONICAL plan validator ----
+// `validatePlan` in prep-for-work/prep-runner.mjs calls itself "the gate between 'we thought about it'
+// and 'the run may start'", and `init-run` never called it. Proven by execution on 2c3ecbe: a poison plan
+// (dependency cycle + negative budget + 98-file/11,537-addition over-cap + unresolved founder gate + no
+// plan review) failed `prep-runner validate` with 11 errors and then passed `init-run` with exit 0 — and
+// `write-brief` stamped 98 files / ~11,537 additions into the lead's brief as its ASSIGNED budget, the
+// exact size the same brief's copy names as the worst case the harness ever shipped.
+const D2746_POISON = {
+  issues: [
+    {
+      id: "DER-1", budget: { files: 98, additions: 11537 }, surfaces: ["command"], riskLane: "mechanical",
+      leadType: "claude", dependsOn: ["DER-2"], notes: "n", planReviewSkipped: { why: "fixture" },
+    },
+    {
+      id: "DER-2", budget: { files: -5, additions: -5 }, surfaces: ["command"], riskLane: "mechanical",
+      leadType: "claude", dependsOn: ["DER-1"], notes: "n", planReviewSkipped: { why: "fixture" },
+      gate: { q: "which schema?" },
+    },
+  ],
+  decisions: [{ q: "ship?", a: "yes" }],
+};
+// The healthy control: the SAME shape, validator-clean. `prep-runner validate` exits 0 on this.
+const d2746Clean = (over = {}) => ({
+  issues: [{
+    id: "DER-1", budget: { files: 9, additions: 500 }, surfaces: ["command"], riskLane: "mechanical",
+    leadType: "claude", planReviewSkipped: { why: "codex unavailable on this host" }, ...over,
+  }],
+  decisions: [{ q: "ship?", a: "yes" }],
+});
+
+test("DER-2746: init-run REFUSES a plan the canonical validator rejects, and creates no run", async () => {
+  const root = await mkdtemp(join(tmpdir(), "work-d2746-"));
+  try {
+    const { validatePlan } = await import("../prep-for-work/prep-runner.mjs");
+    // Ground the fixture in the canonical validator itself, so this test cannot drift into asserting a
+    // local imitation of it: the poison plan must genuinely be un-dispatchable, the control genuinely not.
+    const canonical = validatePlan(D2746_POISON);
+    assert.equal(canonical.ok, false);
+    assert.ok(canonical.errors.length >= 4, `the fixture must really be poison (got ${canonical.errors.length} errors)`);
+    assert.equal(validatePlan(d2746Clean()).ok, true, "the control must genuinely pass the canonical validator");
+
+    const poisonPath = join(root, "poison.json");
+    await writeFile(poisonPath, JSON.stringify(D2746_POISON), "utf8");
+    await assert.rejects(
+      runSubcommand(["init-run", "--issues", "DER-1,DER-2", "--runs-root", root, "--plan", poisonPath, "--run", "POISONED"]),
+      (err) => {
+        // Every one of these is an error `prep-runner validate` reports and the old init-run did not.
+        assert.match(err.message, /dependency cycle/, "the cycle the validator names must reach the operator");
+        assert.match(err.message, /exceeds the cap/, "the 98-file/11,537-addition over-cap");
+        assert.match(err.message, /budget must be positive/, "Number.isFinite(-5) is true — presence is not validity");
+        assert.match(err.message, /unresolved gate/, "a founder question hit at 3am is the reason this phase is PRE-run");
+        assert.match(err.message, /prep-runner validate/, "name the canonical instrument so the operator can re-run it");
+        return true;
+      },
+    );
+    assert.equal(existsSync(join(root, "POISONED")), false, "a refused plan must leave NO run dir — otherwise every other subcommand thinks the run exists");
+
+    // CONTROL — the clean plan still dispatches, and still records the plan path on run_started.
+    const cleanPath = join(root, "clean.json");
+    await writeFile(cleanPath, JSON.stringify(d2746Clean()), "utf8");
+    const { runId } = await runSubcommand(["init-run", "--issues", "DER-1", "--runs-root", root, "--plan", cleanPath]);
+    const evs = await readEvents(join(root, runId));
+    assert.equal(evs[0].plan, cleanPath);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("DER-2746: init-run inherits the validator's non-read-only evidence-query refusal (#19)", async () => {
+  // The aggravator on the issue: `query-check` runs plan-file strings through `spawnSync(..., {shell:true})`,
+  // so a plan JSON is executable input. Wiring the canonical validator in means init-run refuses the same
+  // shapes prep does, rather than being a second, weaker door onto the same plan file.
+  const root = await mkdtemp(join(tmpdir(), "work-d2746-q-"));
+  try {
+    const q = { name: "kill-criterion", query: "git log --oneline | head -5; rm -rf /tmp/x", window: "last 90d", expectAtLeast: 1, observed: { count: 6 } };
+    const badPath = join(root, "shelly.json");
+    await writeFile(badPath, JSON.stringify(d2746Clean({ evidenceQueries: [q] })), "utf8");
+    await assert.rejects(
+      runSubcommand(["init-run", "--issues", "DER-1", "--runs-root", root, "--plan", badPath]),
+      /evidenceQueries\[0\]/,
+    );
+    // CONTROL — a read-only query that was actually RUN against its known-positive window passes.
+    const okPath = join(root, "ok.json");
+    await writeFile(okPath, JSON.stringify(d2746Clean({
+      evidenceQueries: [{ name: "kill-criterion", query: "git log --oneline -5", window: "last 90d", expectAtLeast: 1, observed: { count: 6 } }],
+    })), "utf8");
+    const { runId } = await runSubcommand(["init-run", "--issues", "DER-1", "--runs-root", root, "--plan", okPath]);
+    assert.ok(runId);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("DER-2746: the canonical gate refuses shapes the local check accepted; warnings stay ADVISORY", async () => {
+  // This is the BEHAVIOUR CHANGE, written down. Each case below is a plan the pre-fix `init-run` accepted
+  // and `prep-runner validate` has always rejected — so an operator who meets a new refusal can see which
+  // gate they hit and that it is the documented one, not a new invention of work-runner's.
+  const root = await mkdtemp(join(tmpdir(), "work-d2746-shapes-"));
+  try {
+    const cases = [
+      ["no plan review at all", d2746Clean({ planReviewSkipped: undefined }), /no plan review recorded/],
+      ["an unexplained plan-review skip", d2746Clean({ planReviewSkipped: {} }), /planReviewSkipped needs a `why`/],
+      ["a plan review that never opened the repo", d2746Clean({ planReviewSkipped: undefined, planReview: { verdict: "plan is sound", commands: 0 } }), /0 repository commands/],
+      ["no risk lane", d2746Clean({ riskLane: undefined }), /riskLane must be one of/],
+      ["no lead type", d2746Clean({ leadType: undefined }), /no leadType assigned/],
+      ["a governance lane first-passed on a cheap lead", d2746Clean({ riskLane: "governance", leadType: "dsv4" }), /must not first-pass/],
+      ["a symbol never resolved against the repo", d2746Clean({ symbols: [{ name: "x", from: "a.mjs", use: "test" }] }), /never resolved against the repo/],
+    ];
+    for (const [i, [label, plan, re]] of cases.entries()) {
+      const p = join(root, `case-${i}.json`);
+      await writeFile(p, JSON.stringify(plan), "utf8");
+      await assert.rejects(runSubcommand(["init-run", "--issues", "DER-1", "--runs-root", root, "--plan", p]), re, label);
+    }
+    // WARNINGS ARE ADVISORY — the issue says errors fail closed and warnings do not. A plan whose only
+    // complaints are warnings must still start a run, and the warnings must survive somewhere: init-run's
+    // stdout is the run id and every consumer parses it, so they ride on the RESULT, never on stdout.
+    const warnOnly = d2746Clean();
+    delete warnOnly.decisions;             // "no decisions recorded" — a warning in the canonical validator
+    delete warnOnly.issues[0].surfaces;    // "no surfaces declared" — likewise
+    const wp = join(root, "warn.json");
+    await writeFile(wp, JSON.stringify(warnOnly), "utf8");
+    const res = await runSubcommand(["init-run", "--issues", "DER-1", "--runs-root", root, "--plan", wp]);
+    assert.equal(res.stdout, res.runId, "init-run's stdout is the run id and nothing else — consumers parse it");
+    assert.ok(res.planWarnings?.length, "advisory findings must not vanish");
+    assert.ok(res.planWarnings.some((w) => /decisions/.test(w)) && res.planWarnings.some((w) => /surfaces/.test(w)));
+    assert.equal((await readEvents(join(root, res.runId)))[0].type, "run_started", "and the run really did start");
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("DER-2746: the validator itself must be REACHABLE from work-runner, and its absence fails closed", async () => {
+  // The pre-fix code named the validator only inside an error string ("run `prep-runner validate` before
+  // init-run"): prose enforcement, with the mechanical path waving the plan through. This asserts the
+  // wiring is real — a load that fails must refuse the run, never quietly skip the gate.
+  assert.equal(typeof WR.loadPlanValidator, "function", "the cross-skill validator load must be a seam, so its FAILURE mode is testable");
+  const fn = await WR.loadPlanValidator();
+  assert.equal(typeof fn, "function");
+  await assert.rejects(
+    () => WR.loadPlanValidator({ specifier: "./definitely-not-a-module-9f3a.mjs" }),
+    /canonical plan validator/,
+    "an unloadable validator must throw — a skipped gate is not a passed gate",
+  );
 });
 
 test("write-brief: reads the run's plan, stamps the budget, and records budget_assigned", async () => {
@@ -3255,7 +3398,9 @@ test("codexOnHead (H5): abbreviated comment sha prefix-matches; review row match
 });
 
 test("readyVerdict (H5): UNKNOWN threads is never 0; every gate must return the passing answer", () => {
-  const base = { draft: false, threads: 0, onHead: true, checks: "pass", shardsPass: 4, shardsTotal: 4 };
+  // DER-2603 added the pre-PR gate as a REQUIRED input, so the healthy fixture carries a current gate
+  // verdict. Omitting it is its own must-fail control, one test below.
+  const base = { draft: false, threads: 0, onHead: true, checks: "pass", shardsPass: 4, shardsTotal: 4, gate: { state: "current", blocks: false, label: "gate=CURRENT" } };
   assert.equal(readyVerdict(base).ready, true);
   assert.equal(readyVerdict({ ...base, threads: null }).ready, false, "throttled null is UNKNOWN, not 0");
   assert.equal(readyVerdict({ ...base, draft: true }).ready, false);
@@ -3357,8 +3502,17 @@ test("gateEvidenceVerdict (DER-2588): a stale gate with open blockers BLOCKS; st
   assert.equal(current.state, "current");
   assert.equal(current.blocks, false);
   // Control C/D — absent and unstamped are distinguishable, and neither is silently a pass.
-  assert.equal(gateEvidenceVerdict({ head, gate: null }).state, "absent");
+  // UPDATED by DER-2603. This test used to assert ONLY `.state` here, under a comment claiming "neither is
+  // silently a pass" — and `absent` WAS silently a pass (`blocks: false`), which is how #1081 merged with no
+  // gate event at all. The comment described the intent; nothing checked it. Now the claim is asserted.
+  const gone = gateEvidenceVerdict({ head, gate: null });
+  assert.equal(gone.state, "absent");
+  assert.equal(gone.blocks, true, "a gate event that never happened is not a passing gate (DER-2603)");
+  // `unstamped` still does NOT block, and that is a deliberate, narrower call than `absent`: the event
+  // exists, so the gate demonstrably RAN — it was recorded by an older `review-usage` that stamped no sha,
+  // exactly like stale-clean. Blocking it would refuse work over the runner's age, not over the review.
   assert.equal(gateEvidenceVerdict({ head, gate: { blockers: 0 } }).state, "unstamped");
+  assert.equal(gateEvidenceVerdict({ head, gate: { blockers: 0 } }).blocks, false);
   // And the verdict actually reaches the enqueue decision.
   const held = readyVerdict({ draft: false, threads: 0, onHead: true, checks: "pass", shardsPass: 4, shardsTotal: 4, gate: staleDirty });
   assert.equal(held.ready, false);
@@ -3376,6 +3530,136 @@ test("latestGateEvent: returns the LAST review_findings for the issue, ignoring 
   ];
   assert.equal(latestGateEvent(evs, "DER-1").sha, "new");
   assert.equal(latestGateEvent(evs, "DER-3"), null, "no event for the issue is null, never a sibling's");
+});
+
+// ---- DER-2603: the pre-PR review gate is a MECHANICAL pre-enqueue check ----
+// Three PRs (#1081/#1083/#1086) reached the enqueue decision with NO `review_findings` event at all in
+// one shift (run 20260727T004346Z, 2026-07-27) and #1081 MERGED, because an ABSENT gate event folded as
+// non-blocking: `ready` printed the go-ahead word on a PR nothing established had ever been reviewed.
+// Both the shepherd and the orchestrator acted on that instrument, which is why it is a harness defect —
+// a check that could not return the failing answer, in the harness's own tooling.
+const D2603_HEAD = "f1e2d3c4b5".repeat(4);
+const D2603_CLEAN = { draft: false, threads: 0, onHead: true, checks: "pass", shardsPass: 4, shardsTotal: 4 };
+const D2603_STAMPED = { type: "run_started", run_id: "R", harness_version: "0.2.0" };
+const d2603Line = (verdict, gate, mode) => WR.readyLine({
+  pr: 1081, head: D2603_HEAD, draft: false, threads: 0, onHead: true, checks: "pass", shards: "4/4",
+  behind: 0, gate: gate.state, gateLabel: gate.label, ...verdict,
+  mergeAction: WR.mergeAction({ mode, pr: 1081, verdict }),
+});
+
+test("DER-2603: no review_findings event ⇒ NEITHER go-ahead word, in queue OR direct mode", () => {
+  const events = [D2603_STAMPED, { type: "lead_spawned", issue: "DER-2527" }, { type: "pr_opened", issue: "DER-2527", pr: 1081 }];
+  const gate = gateEvidenceVerdict({ head: D2603_HEAD, gate: latestGateEvent(events, "DER-2527") });
+  assert.equal(gate.state, "absent");
+  assert.equal(gate.blocks, true, "a pre-PR gate that never ran must BLOCK — #1081 merged through this exact hole");
+  assert.match(gate.label, /gate=MISSING/);
+  const verdict = readyVerdict({ ...D2603_CLEAN, gate });
+  assert.equal(verdict.ready, false, "clean in every OTHER respect is precisely the #1081 shape");
+  assert.match(verdict.why, /MISSING/);
+  // DER-2753 made the go-ahead word mode-dependent. Both words must be gated: a DIRECT merge that
+  // skipped the review gate is strictly worse than an enqueue that did, because no queue can catch it.
+  for (const mode of ["queue", "direct"]) {
+    const line = d2603Line(verdict, gate, mode);
+    assert.doesNotMatch(line, /ENQUEUEABLE|MERGEABLE/, `${mode}: an un-gated PR must show no go-ahead word`);
+    assert.match(line, /hold \(gate=MISSING/, `${mode}: the hold reason must name the missing gate`);
+    assert.equal(line.match(/gate=MISSING/g).length, 1, `${mode}: say it once — a doubled reason is noise operators skim`);
+  }
+  // POSITIVE CONTROL — the SAME PR once the gate event exists on head. Without this the test could pass
+  // by never printing a go-ahead word at all, which is the failure mode the issue calls out by name.
+  const gated = gateEvidenceVerdict({
+    head: D2603_HEAD,
+    gate: latestGateEvent([...events, { type: "review_findings", issue: "DER-2527", sha: D2603_HEAD, blockers: 0 }], "DER-2527"),
+  });
+  const okv = readyVerdict({ ...D2603_CLEAN, gate: gated });
+  assert.equal(okv.ready, true, "a gated, otherwise-green PR must still enqueue — a gate that blocks healthy work gets switched off");
+  assert.match(d2603Line(okv, gated, "queue"), /\*\*\* ENQUEUEABLE \*\*\*/);
+  assert.match(d2603Line(okv, gated, "direct"), /\*\*\* MERGEABLE \(direct\) \*\*\*/);
+});
+
+test("DER-2603: UNKNOWN gate evidence blocks like a missing one, but says it could not TELL", () => {
+  assert.equal(typeof WR.gateEvidenceLookup, "function", "the ledger→gate-evidence read must be a pure seam, or UNKNOWN cannot be tested");
+  // 1. No ledger was read at all (`ready` invoked without --run). Not "absent" — unreadable.
+  const noLedger = WR.gateEvidenceLookup({ ledgerRead: false });
+  assert.equal(noLedger.gate, null);
+  assert.match(noLedger.unknown, /--run/, "say how to make it readable");
+  // 2. The PR maps to no issue in this run's ledger. The pre-fix lookup passed `undefined` as the issue
+  //    filter, and latestGateEvent then returned the LAST review_findings for ANY issue — a PR could be
+  //    waved through on a SIBLING's evidence.
+  const untracked = WR.gateEvidenceLookup({
+    events: [D2603_STAMPED, { type: "review_findings", issue: "DER-9", sha: D2603_HEAD, blockers: 0 }],
+    issueId: null,
+  });
+  assert.equal(untracked.gate, null, "a sibling issue's gate event must never be attributed to this PR");
+  assert.match(untracked.unknown, /not tracked/);
+  // 3. A pre-stamp ledger (DER-2748) cannot distinguish "the lead skipped it" from "this run's runner
+  //    never recorded gates at all".
+  const legacy = WR.gateEvidenceLookup({
+    events: [{ type: "run_started", run_id: "R" }, { type: "pr_opened", issue: "DER-1", pr: 7 }],
+    issueId: "DER-1",
+  });
+  assert.match(legacy.unknown, /harness_version|pre-stamp/);
+  // 4. A stamped ledger that tracks the issue and holds no gate event: genuinely ABSENT. "You skipped it."
+  const absent = WR.gateEvidenceLookup({ events: [D2603_STAMPED, { type: "pr_opened", issue: "DER-1", pr: 7 }], issueId: "DER-1" });
+  assert.equal(absent.unknown, null);
+  assert.equal(absent.gate, null);
+  // Both FAIL CLOSED, and an operator can tell them apart from the printed label alone.
+  const u = gateEvidenceVerdict({ head: D2603_HEAD, ...noLedger });
+  const a = gateEvidenceVerdict({ head: D2603_HEAD, ...absent });
+  assert.equal(u.state, "unknown");
+  assert.equal(u.blocks, true, "unreadable evidence is not passing evidence");
+  assert.match(u.label, /gate=UNKNOWN/);
+  assert.equal(a.state, "absent");
+  assert.equal(a.blocks, true);
+  assert.match(a.label, /gate=MISSING/);
+  assert.notEqual(u.label, a.label, "\"you skipped it\" and \"I could not tell\" must not read the same");
+  // CONTROL — a readable ledger holding a CURRENT gate event is neither, and does not block.
+  const found = WR.gateEvidenceLookup({
+    events: [D2603_STAMPED, { type: "review_findings", issue: "DER-1", sha: D2603_HEAD, blockers: 0 }],
+    issueId: "DER-1",
+  });
+  assert.equal(found.unknown, null);
+  assert.equal(found.gate.sha, D2603_HEAD);
+  assert.equal(gateEvidenceVerdict({ head: D2603_HEAD, ...found }).blocks, false);
+});
+
+test("DER-2603: readyVerdict with NO gate verdict at all is not ready (a caller that skips the read cannot pass)", () => {
+  const v = readyVerdict(D2603_CLEAN); // `gate` omitted entirely — the pre-fix default
+  assert.equal(v.ready, false, "no gate verdict is UNKNOWN, and unknown is never the passing answer");
+  assert.match(v.why, /gate/i);
+  // CONTROL — the same inputs WITH a current gate verdict pass, so this is not a constant refusal.
+  const gate = gateEvidenceVerdict({ head: D2603_HEAD, gate: { sha: D2603_HEAD, blockers: 0 } });
+  assert.equal(readyVerdict({ ...D2603_CLEAN, gate }).ready, true);
+});
+
+test("DER-2603: state.gate_missing puts an un-gated PR on the board, and watch re-surfaces it", async () => {
+  const base = [D2603_STAMPED, { type: "lead_spawned", issue: "DER-1" }, { type: "pr_opened", issue: "DER-1", pr: 11 }];
+  const s = materializeState(base, { run_id: "R" });
+  assert.deepEqual((s.gate_missing ?? []).map((g) => g.issue), ["DER-1"], "a handed-off PR with no gate evidence belongs on the board, not only at enqueue time");
+  assert.equal(s.issues["DER-1"].gate_seen, false);
+  assert.match(s.gate_missing[0].note, /review_findings/);
+  // CONTROL 1 — the gate event clears it. A banner that is always non-empty is a banner nobody reads.
+  const gated = materializeState([...base, { type: "review_findings", issue: "DER-1", sha: "abc", blockers: 0, round: 1 }], { run_id: "R" });
+  assert.deepEqual(gated.gate_missing, []);
+  assert.equal(gated.issues["DER-1"].gate_seen, true);
+  assert.equal(gated.issues["DER-1"].gate_sha, "abc");
+  // CONTROL 2 — a lead still building (no PR handed off) is NOT listed: the gate is a PRE-PR check, and
+  // flagging every in-flight lead would make the banner permanently red.
+  assert.deepEqual(materializeState([D2603_STAMPED, { type: "lead_spawned", issue: "DER-2" }]).gate_missing, []);
+  // CONTROL 3 — merged history is not actionable.
+  assert.deepEqual(materializeState([...base, { type: "pr_merged", issue: "DER-1", pr: 11 }]).gate_missing, []);
+
+  const root = await mkdtemp(join(tmpdir(), "work-d2603-watch-"));
+  try {
+    const { runId } = await runSubcommand(["init-run", "--issues", "DER-1", "--runs-root", root]);
+    const dir = join(root, runId);
+    await appendEvent(dir, { type: "lead_spawned", issue: "DER-1" });
+    await appendEvent(dir, { type: "pr_opened", issue: "DER-1", pr: 11 });
+    const wake = JSON.parse((await runSubcommand(["watch", "--run", runId, "--runs-root", root, "--since", "99", "--nudge-since", "0", "--timeout", "1"])).stdout);
+    assert.deepEqual(wake.pending.gate_missing, ["DER-1"], "an un-gated PR must re-surface on EVERY wake, like a pending kickback");
+    await appendEvent(dir, { type: "review_findings", issue: "DER-1", sha: "abc", blockers: 0 });
+    const wake2 = JSON.parse((await runSubcommand(["watch", "--run", runId, "--runs-root", root, "--since", "99", "--nudge-since", "0", "--timeout", "1"])).stdout);
+    assert.deepEqual(wake2.pending.gate_missing, []);
+  } finally { await rm(root, { recursive: true, force: true }); }
 });
 
 test("shaDescendsFrom (DER-2559): exit 0 = descendant, exit 1 = NOT, self is never a descendant", async () => {
@@ -3554,7 +3838,9 @@ test("init-run --spec: records mode/specRef/tracking and REFUSES a plan missing 
   const dir = await mkdtemp(join(tmpdir(), "wr-spec-"));
   try {
     const runsRoot = join(dir, "runs");
-    const unit = (id) => ({ id, budget: { files: 6, additions: 400 }, riskLane: "mechanical", leadType: "claude" });
+    // DER-2746: `--spec` plans go through the same canonical validator as `--plan`, so a spec unit needs
+    // everything `prep-runner validate` demands of a Linear unit — spec mode relaxes nothing.
+    const unit = (id) => ({ id, budget: { files: 6, additions: 400 }, surfaces: ["command"], riskLane: "mechanical", leadType: "claude", planReviewSkipped: { why: "fixture — no codex in the unit suite" } });
     const write = async (name, obj) => { const p = join(dir, name); await writeFile(p, JSON.stringify(obj), "utf8"); return p; };
 
     const good = await write("spec.json", {
@@ -3907,7 +4193,13 @@ test("DER-2737: the allowlist is CONFIG-driven (repo.ownerLogin) and defaults to
 // `/work` cannot currently shepherd THIS repo. Direct mode must reproduce, client-side, the only
 // protection the native queue was providing: never merge a PR that is not `readyVerdict`-ready.
 
-const D2753_READY = { draft: false, threads: 0, onHead: true, checks: "pass", shardsPass: 0, shardsTotal: 0 };
+// DER-2603 made the pre-PR review gate a required readyVerdict input, in BOTH modes — a direct merge that
+// skipped the gate is worse than an enqueue that did, because there is no queue behind it. So the
+// fully-ready fixture now carries a CURRENT gate verdict; the missing-gate case is its own control above.
+const D2753_READY = {
+  draft: false, threads: 0, onHead: true, checks: "pass", shardsPass: 0, shardsTotal: 0,
+  gate: { state: "current", blocks: false, label: "gate=CURRENT" },
+};
 
 test("DER-2753: mergeMode:direct + a fully-ready PR ⇒ `gh pr merge <n> --squash --delete-branch`, NOT an enqueue", () => {
   assert.equal(typeof WR.mergeAction, "function", "the queue-vs-direct decision must be a pure, testable seam");
