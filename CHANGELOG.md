@@ -10,8 +10,138 @@ section for it.
 Multiple hosts run copies of this harness (local, an ssh host, cloud sessions), each installed at a
 different time by `install.sh`. Before 0.2.0 there was no recorded version anywhere, so two hosts could
 run materially different harness code against **one shared ledger** with no way to detect the skew.
-Recording the version in `run_started` + host heartbeats — and refusing or degrading a mixed-protocol
-run — is tracked as part of the ledger-protocol work (DER-2748) and is deliberately NOT in this entry.
+0.2.0 closed that: every ledger line carries a wire `schema_version`, `run_started`/`heartbeat` stamp
+`harness_version`, and a mixed-version or foreign-schema ledger refuses dispatch (DER-2748). The dispatch
+gate itself gained the missing half below — attesting the *acting* process's own version, not only
+versions already recorded in the ledger — in DER-2779.
+
+## [Unreleased]
+
+The 2026-07-30 cold-eyes remediation wave: nine fixes against the 21 findings of a cold-eyes review of
+`2c3ecbe`, closing the gaps 0.2.0 shipped with, plus this entry itself (DER-2780), which corrects four
+places this file and its neighbors described those gaps as still open after they were closed.
+
+### Security
+
+- **DER-2777 — the evidence-query sandbox closes four outbound channels that were all validated
+  "read-only."** `git ls-remote` was in the read-subcommand allowlist and its nested `$(...)` re-validated
+  by the same rule; the awk/gawk option parser skipped every content check on any `-`-prefixed argument,
+  including an attached `-f`; gawk's `/inet/tcp/.../getline` special files were never matched by the
+  `/dev/` path predicate; and `<` input redirection was waved through because reading is a read, even
+  against `/dev/tcp/...` or an expansion-built target. All four are live outbound channels — reading a
+  value is not read-only when the read target is a remote host. awk/gawk options are now default-deny
+  against a closed safe list, `/inet[46]?/` is refused in every argument position, and `<` is refused
+  against a device/socket target or one built by expansion; `ls-remote`/`fetch`/`pull`/`push`/`clone` are
+  dropped from the read-subcommand list outright. Introduces `parseEvidenceQuery`, the shared query parse
+  DER-2776 and DER-2783 below both consume. (PR #21)
+- **DER-2778 — a fork PR could impersonate a cloud lead and silently clear a pending kickback.** This is
+  DER-2737's incomplete family: PR *comments* were hardened in 0.2.0, PR *list* state was not. This repo
+  is public and issue ids are announced in PR titles; `gh pr list` reconciliation matched PRs on a
+  branch-or-title substring with no author/owner check, so a fork PR titled with an in-flight issue id
+  could repoint the tracked PR's pointer, and its ancestry check failed **open** on an unfetchable fork
+  SHA — reading it as "proven new work" and dropping a real pending kickback out of `kickbacks_pending`. A
+  PR now counts as this run's own only when its author is the repo owner or a configured
+  `trustedPrAuthors` login **and** its head repository owner matches the target repo (a fork never does);
+  an unresolvable SHA now fails closed rather than open. `trustedPrAuthors` is deliberately a separate
+  allowlist from `trustedCommentAuthors` (DER-2737) — the review bot's *comments* are trusted input, but a
+  PR it opens is not one of your leads. (PR #23)
+
+### Fixed
+
+- **DER-2774 — a red CI no longer parses as "no checks."** `parseChecksOutput` matched the CI status row
+  by the literal job name `checks`, a carry-over from the repo this harness grew up on, and returned
+  `checks: null` for any repo using different job names — indistinguishable from "the probe died" and
+  "this repo has no CI at all." Measured directly against this repo's own genuinely-red PR, the old parser
+  reported `checks UNKNOWN — WAIVED` where the correct read is `checks=fail`. `gh`'s `--json` exit-code
+  semantics (verified against `cli/cli` source, not memory) now drive three outcomes: exit 0 classifies
+  from the returned buckets only; a `no checks reported` stderr sentinel is verified-absent and still
+  waivable; anything else is unknown and never waivable. Direct-mode merges also now bind
+  `--match-head-commit <headRefOid>`, since every gate `ready` checks is a statement about one sha, and a
+  push landing before the operator's later merge command previously went ungated. (PR #18)
+- **DER-2775 — `reap` no longer destroys work it cannot account for, and only records a kill it can
+  prove.** It had no precondition on its target: an id this run never had could append a **terminal**
+  `reaped` event (permanent, since dedup keeps the first per issue), and a unit still
+  `in_progress`/`pr_open`/`kickback` was torn down with `git worktree remove --force` exactly like a
+  merged one. Both now refuse before any teardown or ledger write; `--abandon`/`--force` is the explicit
+  deliberate-destruction hatch and is stamped on the event so audits can tell post-merge cleanup from
+  deliberate destruction. Separately, all three remote kills ran `pkill -f <pattern>; true`, which
+  discarded the exit code and never actually proved the process was gone; they are now kill-then-`pgrep`
+  in one round trip, an unverifiable kill leaks (never reads as success), and `rotate-lead`/`spawn-lead`
+  refuse to respawn onto a worktree whose predecessor is not provably dead. The kill pattern is now
+  validated at construction (non-empty, 12-character floor, `/briefs/`-bearing, no newline) through one
+  shared constructor all four call sites build through — closing a same-issue follow-up where an
+  `undefined` path segment from a missing config key cleared every check and reported a clean kill for a
+  lead it never touched. (PR #17, PR #19)
+- **DER-2776 — a torn remote ledger tail is held for retry instead of consumed as damage.**
+  `pullHostInto` advanced its cursor by the count of non-blank lines while `tail -n +N` numbers all of
+  them, so a line torn by a concurrent remote writer was misclassified as a corrupt complete record: the
+  cursor skipped past it, the completed event was **lost permanently** once the writer finished it, and
+  the non-transient `remote_malformed_json` classification latched a run-wide "every number is a lower
+  bound" damage banner that only a human could clear — over a line that was never actually corrupt. An
+  unterminated remainder is now held and re-read next cycle (`torn_tail`, transient); a hold older than
+  `WORK_LEDGER_HELD_STALE_MS` (default 5 min) surfaces as `state.ledger.held_fragment_stale` so an
+  abandoned host's fragment doesn't retry invisibly forever, and can be acknowledged so DER-2781's
+  `complete-run` below doesn't become permanently unsatisfiable once a host goes away. (PR #22)
+- **DER-2779 — the version-skew gate now attests the version of the process about to act, not only
+  versions already written to the ledger.** DER-2748's comparator only ever ran between versions already
+  recorded — so a 9.9.9 checkout dispatching into a ledger whose only recorded version was 0.1.0 was
+  **not** blocked, while the identical skew with one extra heartbeat already in the file was. The dispatch
+  gate's verdict now includes this process's own `getHarnessVersion()`, so a skewed checkout refuses even
+  with no heartbeat having run, and a process's first ledger write attests its version — but only when the
+  ledger already carries a real recorded version, so a legacy pre-stamp ledger is not retroactively
+  poisoned by its first writer. The refusal names which host and version wrote the divergent event.
+  Legacy pre-stamp ledgers stay tolerated and unblocked; read-only subcommands stay usable against a
+  skewed ledger so an operator can still diagnose one. (PR #26)
+- **DER-2782 — review-gate blockers must block on the current head, not just an absent one.**
+  `gateEvidenceVerdict` returned `{state:"current", blocks:false}` whenever the evidence sha matched head,
+  with no check of the blockers count at all — so a lead that *fixed* its findings (moving sha off head,
+  turning the gate STALE) blocked, while a lead that *ignored* them (sha stays == head) sailed through as
+  `gate=CURRENT`. Blockers are now checked on the current-head path too. The escape hatch for a blocked
+  gate is a `gate_adjudication` event that clears only the sha it names, requires non-empty findings
+  referencing the gate event, and prints loudly (`⚠ gate=ADJUDICATED (n findings waived by <who>)`) rather
+  than folding into a silent pass — authority is documented (orchestrator/operator only) rather than
+  enforced, since anyone with filesystem access can append an event. (PR #20)
+- **DER-2783 — evidence queries are gated on real exit status, and `grep -c`/`rg -c`/`wc -l` are counted
+  by number, not by output lines.** `query-check` never read the child process's exit status or signal, so
+  an ordinary nonzero exit (the tool's own documented failure shape) still evaluated its stdout and could
+  pass — `git log ... | grep -c 'fix('` matching zero commits stamped `ok 1 ≥ 1`. A query is now `ok` only
+  if the run exited 0 with no signal **and** the output meets `expectAtLeast`. In the other direction,
+  `grep -c` always emits exactly one line, so a line-counting evaluator made any floor above 1 impossible
+  to satisfy even on a genuine match — numeric mode (built on DER-2777's shared query parse) now reads a
+  single bare integer on the final counting stage as the count itself, on both a piped and a single-stage
+  query. (PR #24)
+
+### Added
+
+- **DER-2781 — `complete-run --run <r>`, a machine-checkable end to a run.** `materializeState` set
+  `status: meta.status ?? "running"`, no call site ever passed a status, no terminal run event existed,
+  and nothing read the field — a run had no way to record that it was finished, so a successor couldn't
+  distinguish completion from abandonment. `complete-run` verifies every tracked issue is terminal
+  (`pr_merged`/`reaped`), no kickbacks are pending, ledger health is ok (including DER-2776's
+  held-fragment age signal), and the protocol verdict is clean, before appending anything; any check
+  failing refuses with the list. Idempotent (a second call is a no-op "already completed"); a late event
+  arriving after completion does not reopen it but surfaces as a visible `post_completion_events` count; a
+  stale hold from a departed host can be acknowledged so completion is never a permanent dead end. (PR #25)
+
+### Docs
+
+- **DER-2780 — the changelog and its neighbors no longer contradict the version-skew protocol they
+  describe.** `install.sh` already copied `VERSION` and refused to install without it, and DER-2748/DER-2779
+  above already refused mixed-version dispatch — but `README.md`, this file's own preamble, this file's
+  "Known follow-ups" bullet under 0.2.0, and a code comment in `work-runner.mjs` still described skew as
+  invisible and `VERSION` as never copied, one of them self-contradicting a "Fixed" bullet nine lines above
+  it in the same file. Corrected in place. This `[Unreleased]` section also backfills all nine units above,
+  none of which had a changelog entry before this one — no wave commit had touched this file.
+
+### Known follow-ups
+
+- **DER-2808** — `parseEvidenceQuery("| wc -l")` yields an empty first stage with no problem raised; a
+  query that opens on a bare pipe should be refused as malformed rather than silently parsed.
+- **DER-2809** — the `Number("") === 0` env-read family: an empty `WORK_WATCH_POLL_MS` (and siblings
+  sharing the coercion) reads as `0` rather than "unset", turning a poll loop into a ~5ms spin instead of
+  its intended default.
+- **DER-2810** — `grep -c x file || true` exits 0 and is stamped `ok 1 ≥ 1`; four characters (`|| true`)
+  are enough to falsify DER-2783's exit-status guarantee from outside the evaluator it fixed.
 
 ## [0.2.0] — 2026-07-29
 
@@ -22,18 +152,24 @@ Each fix below landed with a regression test that was **observed failing on the 
 
 - **DER-2737 — unauthenticated PR comments are no longer privileged lifecycle input.** `parsePrEventComments`
   and the handoff-note reader folded any `WORK-EVENT`/`WORK-HANDOFF`-prefixed comment on any open PR into
-  the ledger with no author check, which allowed a phantom/retargeted unit, an injected `worktree` that
-  reached an **unquoted** `ssh` string in `reap`, and a forged predecessor handoff note presented to a
-  successor lead as testimony. Comment authors are now allowlisted (repo owner + known bots), comment
-  payloads may not carry `worktree`/`branch`/`host`, `pr`/`host`/`actor` are stamped by the reader rather
-  than read from the body, the run-scope filter applies to the singular `issue` as well as `issues[]`, and
-  both `reap` interpolations are `shellQuote`d.
+  the ledger with no author check, which allowed a phantom unit forged via a comment, an injected
+  `worktree` that reached an **unquoted** `ssh` string in `reap`, and a forged predecessor handoff note
+  presented to a successor lead as testimony. Comment authors are now allowlisted (repo owner + known
+  bots), comment payloads may not carry `worktree`/`branch`/`host`, `pr`/`host`/`actor` are stamped by the
+  reader rather than read from the body, the run-scope filter applies to the singular `issue` as well as
+  `issues[]`, and both `reap` interpolations are `shellQuote`d. **This closed the comment vector only** —
+  a *retargeted* unit stayed reachable through PR-*list* state (`gh pr list` + branch/title matching, no
+  comment involved at all), which a fork PR could exploit to silently drop a pending kickback; that half
+  was closed by DER-2778 (`[Unreleased]`, above).
 - **#19 — evidence queries are validated read-only before a shell runs them.** `prep-runner`'s
   `query-check` passed `evidenceQueries[].query` to `spawnSync(…, {shell: true})` behind only a *shape*
   check, and a plan is often assembled from issue text and lead output — so plan content could execute
   anything in the repo root. Validated now by an allowlist over a parsed query (not a metacharacter
   blocklist, because pipelines are the feature), applied both in `validate` and immediately before the
-  `spawnSync`. Unrecognised is refused rather than run.
+  `spawnSync`. Unrecognised is refused rather than run. **"Read-only" was not the whole test:** DER-2777
+  (`[Unreleased]`, above) later found four channels this allowlist accepted as read-only that still
+  exfiltrated over the network (`git ls-remote`, an awk option-parsing bypass, gawk's `/inet/` getline,
+  and `< /dev/tcp/...`) — reading a value is not sufficient when the read target can be a remote host.
 - **DER-2742 — `create-worktree` no longer deletes anything.** It called
   `rm(wt, {recursive:true, force:true})` unconditionally *before* `git worktree add`, with no check
   whether the path was a registered worktree or held uncommitted files. Because the path is deterministic
@@ -228,10 +364,11 @@ Each fix below landed with a regression test that was **observed failing on the 
   event carries `schema_version` / `event_id` (uuid v7) / `source_id` / `seq` / `received_at`; a ledger
   holding two harness versions or a `schema_version` this build does not implement refuses `spawn-lead` /
   `spawn-shepherd` / `spawn-orch` / `rotate-*` (harness skew is overridable with `--allow-version-skew`,
-  a foreign schema is not), and the skew shows in `state.protocol` and on every `watch` wake. Residual
-  gap: `install.sh` does not copy `VERSION` to `$CLAUDE_HOME`, so a host running from an install rather
-  than a checkout reports `harness_version: "unknown"` unless `WORK_HARNESS_VERSION` is set — two such
-  hosts look same-version to each other.
+  a foreign schema is not), and the skew shows in `state.protocol` and on every `watch` wake. `install.sh`
+  copies `VERSION` to `$CLAUDE_HOME` and refuses to install at all without it (see this entry's own
+  "Fixed" section, above) — an installed host reports its real version, not `"unknown"`. This gap is
+  closed, not residual; DER-2779 (`[Unreleased]`) closed the other remaining half, attesting the *acting*
+  process's own version too, not only versions already written to the ledger.
 
 ## [0.1.0] — 2026-07-29
 
