@@ -4336,7 +4336,7 @@ export function runCompletionReceiptVerdict({ event = null, tracked = [], runId 
   }
   const trackedIds = [...new Set(units.map((u) => u.issue))].sort();
   const claimedIds = [...claimed].sort();
-  if (trackedIds.join(" ") !== claimedIds.join(" ")) {
+  if (trackedIds.join("\u0000") !== claimedIds.join("\u0000")) {
     const unnamed = trackedIds.filter((id) => !claimedIds.includes(id));
     const invented = claimedIds.filter((id) => !trackedIds.includes(id));
     return no(
