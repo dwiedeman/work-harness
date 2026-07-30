@@ -8503,19 +8503,28 @@ test("DER-2781 (k2): MIXED harness versions refuse, and --allow-version-skew ack
 });
 
 test("DER-2781: the fold is FIRST-WINS — a second run_completed never re-stamps the run", async () => {
+  // DER-2838 — both markers carry a real receipt, minted by the production function. Before that contract
+  // this fixture was a bare `{type:"run_completed"}`, which is precisely the shape the fold now ignores:
+  // a first-wins test built on a marker the reader refuses would prove first-wins about nothing.
+  const receipt = WR.mintRunCompletionReceipt({ runId: "r1", units: ["DER-1"] });
   const base = [
     { type: "run_started", run_id: "r1", ts: "2026-07-30T10:00:00.000Z" },
     { type: "pr_merged", issue: "DER-1", pr: 1, ts: "2026-07-30T10:01:00.000Z" },
-    { type: "run_completed", run_id: "r1", ts: "2026-07-30T10:02:00.000Z" },
+    { type: "run_completed", run_id: "r1", ts: "2026-07-30T10:02:00.000Z", completion_receipt: receipt },
   ];
   const one = materializeState(base);
   assert.equal(one.status, "completed");
   assert.equal(one.completed_at, "2026-07-30T10:02:00.000Z");
   assert.equal(one.post_completion_events, 0);
-  const two = materializeState([...base, { type: "run_completed", run_id: "r1", ts: "2026-07-30T10:05:00.000Z" }]);
+  const two = materializeState([...base, { type: "run_completed", run_id: "r1", ts: "2026-07-30T10:05:00.000Z", completion_receipt: receipt }]);
   assert.equal(two.completed_at, "2026-07-30T10:02:00.000Z", "the FIRST marker owns the completion time");
   assert.equal(two.post_completion_events, 1, "…and the duplicate is counted, not swallowed");
   assert.deepEqual(two.post_completion_event_types, ["run_completed"]);
+  // A second marker is counted whether or not it would have validated: it is a real line in the ledger,
+  // and the run is already settled, so the receipt check never even runs on it.
+  const forgedSecond = materializeState([...base, { type: "run_completed", run_id: "r1", ts: "2026-07-30T10:06:00.000Z" }]);
+  assert.equal(forgedSecond.post_completion_events, 1);
+  assert.deepEqual(forgedSecond.run_completion_rejected, [], "a marker AFTER a settled completion is post-completion news, not a rejected claim");
   // And the field is still overridable by an explicit caller, which is what it was declared for.
   assert.equal(materializeState(base, { status: "aborted" }).status, "aborted");
 });
@@ -8539,6 +8548,282 @@ test("DER-2781: a leaked teardown does not BLOCK completion, but the success rec
       { actor: "orch", type: "reap_failed", issue: "DER-1", host: "mini", leaks: ["remote_pkill"], reason: "required cleanup failed: remote_pkill (the probe found it alive)" },
     ],
   });
+});
+
+// ---------------------------------------------------------------------------
+// DER-2838 — run completion is RESERVED and RECEIPTED, and the gate attests the ACTING version
+// ---------------------------------------------------------------------------
+// Two findings, one path — both are `complete-run` integrity on the terminal-state fold.
+//
+// (#5) The fold accepted the FIRST `run_completed` unconditionally, and the generic `append` relay
+// reserved only `gate_adjudication`. So anyone with `append` — or with a text editor — could mark an
+// ACTIVE or EMPTY run completed and bypass all seven DER-2781 checks, with `state.status` reading
+// "completed" to every later consumer.
+//
+// (#8) `complete-run` compared only the versions ALREADY RECORDED in the ledger. That is exactly the
+// blind spot DER-2779 closed for dispatch: the one host whose code is about to write was the one host
+// the gate never looked at. A caller on a different build passed the protocol check and then
+// auto-attested during the append, leaving a freshly-completed run with mixed protocol versions.
+//
+// WHAT THE RECEIPT IS AND IS NOT. It is NOT authentication. SECURITY.md records the deliberate decision
+// not to build authenticated privileged-event ingress, and nothing here changes it: `minted_by` is an
+// unauthenticated string exactly like `adjudicated_by`. What the receipt adds is that the claim is
+// CHECKABLE AGAINST THE LEDGER it is folded into — the marker must enumerate the units it vouched for,
+// and the fold re-derives whether those are the run's whole tracked set and whether every one of them is
+// terminal. A forger cannot fix a mismatch by writing a better receipt; they would have to make the
+// units terminal, which is the work itself.
+
+// A receipt as the SHAPE PRODUCTION WRITES. Pinned against the real minter by the binding test below, so
+// this literal cannot drift into testing a shape `complete-run` never emits.
+const d2838Checks = ["kickbacks_pending", "ledger_health", "ledger_held_fragments", "ledger_quarantine", "protocol", "units_terminal", "units_tracked"];
+const d2838Receipt = (runId, units, extra = {}) => ({
+  receipt_version: 1,
+  run_id: runId,
+  units: [...units].sort(),
+  unit_count: units.length,
+  checks_passed: [...d2838Checks],
+  harness_version: "0.2.0",
+  allow_version_skew: false,
+  minted_by: "probe:1:aa",
+  ...extra,
+});
+
+const d2838Base = (extra = []) => ([
+  { type: "run_started", run_id: "r1", ts: "2026-07-30T10:00:00.000Z" },
+  { type: "pr_merged", issue: "DER-1", pr: 1, ts: "2026-07-30T10:01:00.000Z" },
+  { type: "reaped", issue: "DER-1", ts: "2026-07-30T10:02:00.000Z" },
+  ...extra,
+]);
+
+test("DER-2838 (#5): a run_completed carrying NO receipt is IGNORED by the fold, and the rejection is NAMED", () => {
+  // The forgeable shape, on a run whose units really ARE terminal — i.e. the most legitimate-looking
+  // marker a hand-append can produce. It still does not complete the run: an unreceipted marker is not a
+  // completion, whatever else is true. The control below is what stops this from being "the fold refuses
+  // everything".
+  const st = materializeState(d2838Base([
+    { type: "run_completed", run_id: "r1", units: ["DER-1"], unit_count: 1, ts: "2026-07-30T10:03:00.000Z" },
+  ]));
+  assert.equal(st.status, "running", "an unreceipted run_completed must NOT end the run");
+  assert.equal(st.completed_at, null);
+  assert.equal((st.run_completion_rejected ?? []).length, 1, "…and it must be VISIBLE — a silently-dropped marker is a second blind spot");
+  assert.match(st.run_completion_rejected[0].reason, /receipt/i, "the rejection must say WHY");
+  assert.equal(st.run_completion_rejected[0].ts, "2026-07-30T10:03:00.000Z", "…and WHEN, so it can be found in the file");
+});
+
+test("DER-2838 (#5-control): the SAME marker WITH a valid receipt completes the run", () => {
+  // Same fold, same fixture, same terminal units — the ONLY difference is the receipt. Without this pair
+  // the test above would pass against a fold that ignored every run_completed, which would break the
+  // feature rather than fix the hole.
+  const st = materializeState(d2838Base([
+    { type: "run_completed", run_id: "r1", units: ["DER-1"], unit_count: 1, ts: "2026-07-30T10:03:00.000Z", completion_receipt: d2838Receipt("r1", ["DER-1"]) },
+  ]));
+  assert.equal(st.status, "completed", "a receipted marker over an all-terminal run must still complete it");
+  assert.equal(st.completed_at, "2026-07-30T10:03:00.000Z");
+  assert.deepEqual(st.run_completion_rejected, []);
+});
+
+test("DER-2838 (#5): a receipt CANNOT complete a run whose units are not terminal — the fold re-derives that", () => {
+  // The attack the issue names: mark an ACTIVE run completed. The forger writes a perfect receipt naming
+  // the unit — and the fold, which knows DER-2 is `pr_open`, refuses. This is the check with teeth: it is
+  // derived from the ledger, not from the receipt, so a better-forged receipt does not move it.
+  const st = materializeState([
+    ...d2838Base(),
+    { type: "pr_opened", issue: "DER-2", pr: 2, ts: "2026-07-30T10:02:30.000Z" },
+    { type: "run_completed", run_id: "r1", units: ["DER-1", "DER-2"], unit_count: 2, ts: "2026-07-30T10:03:00.000Z", completion_receipt: d2838Receipt("r1", ["DER-1", "DER-2"]) },
+  ]);
+  assert.equal(st.status, "running", "an ACTIVE unit must survive any receipt");
+  assert.match(st.run_completion_rejected[0].reason, /DER-2 \(pr_open\)/, "the rejection must name the unit that is not terminal");
+
+  // …and it cannot UNDER-CLAIM its way past that either: naming only the terminal unit leaves DER-2
+  // tracked-but-unnamed, which is the same lie told by omission.
+  const under = materializeState([
+    ...d2838Base(),
+    { type: "pr_opened", issue: "DER-2", pr: 2, ts: "2026-07-30T10:02:30.000Z" },
+    { type: "run_completed", run_id: "r1", units: ["DER-1"], unit_count: 1, ts: "2026-07-30T10:03:00.000Z", completion_receipt: d2838Receipt("r1", ["DER-1"]) },
+  ]);
+  assert.equal(under.status, "running", "a receipt that simply omits the live unit must not complete the run");
+});
+
+test("DER-2838 (#5): an EMPTY run cannot be completed by a receipt — vacuous truth is still not a gate", () => {
+  const st = materializeState([
+    { type: "run_started", run_id: "r1", ts: "2026-07-30T10:00:00.000Z" },
+    { type: "run_completed", run_id: "r1", units: [], unit_count: 0, ts: "2026-07-30T10:03:00.000Z", completion_receipt: d2838Receipt("r1", []) },
+  ]);
+  assert.equal(st.status, "running");
+  assert.match(st.run_completion_rejected[0].reason, /no units|tracks no units|units/i);
+});
+
+test("DER-2838 (#5): a DECLARED-but-never-started unit still blocks a receipt (issue-list mode)", () => {
+  // `init-run --issues DER-1,DER-2` records both on `run_started`, and a declared id that never got an
+  // event of its own has no entry in the fold's issue map at all — it is tracked through the QUEUE. A
+  // cross-check reading only the issue map would accept a receipt naming DER-1 while DER-2 was never
+  // dispatched, which is the same lie by omission the gate's own `units_terminal` refuses.
+  const st = materializeState([
+    { type: "run_started", run_id: "r1", mode: "issue-list", issues: ["DER-1", "DER-2"], ts: "2026-07-30T10:00:00.000Z" },
+    { type: "pr_merged", issue: "DER-1", pr: 1, ts: "2026-07-30T10:01:00.000Z" },
+    { type: "reaped", issue: "DER-1", ts: "2026-07-30T10:02:00.000Z" },
+    { type: "run_completed", run_id: "r1", units: ["DER-1"], unit_count: 1, ts: "2026-07-30T10:03:00.000Z", completion_receipt: d2838Receipt("r1", ["DER-1"]) },
+  ]);
+  assert.equal(st.status, "running", "a declared unit that never started is not terminal");
+  assert.match(st.run_completion_rejected[0].reason, /DER-2 \(queued\)/);
+});
+
+test("DER-2838 (#5): a receipt minted for ANOTHER run does not complete this one", () => {
+  const st = materializeState(d2838Base([
+    { type: "run_completed", run_id: "r1", units: ["DER-1"], unit_count: 1, ts: "2026-07-30T10:03:00.000Z", completion_receipt: d2838Receipt("SOME-OTHER-RUN", ["DER-1"]) },
+  ]));
+  assert.equal(st.status, "running", "a receipt copied off another run's marker must not carry over");
+  assert.match(st.run_completion_rejected[0].reason, /run/i);
+});
+
+test("DER-2838 (#5): `append` REFUSES a run_completed — the write-time half", async () => {
+  await withD2781Run(async ({ runId, root, runDir, state }) => {
+    const before = (await readEvents(runDir)).length;
+    await assert.rejects(
+      runSubcommand(["append", "--run", runId, "--runs-root", root, "--repo-root", root,
+        JSON.stringify({ actor: "orch", type: "run_completed", run_id: runId, units: ["DER-1"], unit_count: 1 })]),
+      (err) => {
+        assert.match(err.message, /run_completed/, "the refusal must name the reserved type");
+        assert.match(err.message, /complete-run/, "…and the subcommand that owns it");
+        return true;
+      },
+      "the generic relay must not be able to write the run's terminal state",
+    );
+    assert.equal((await readEvents(runDir)).length, before, "a refused append must write NOTHING");
+    assert.equal((await state()).status, "running");
+
+    // CONTROL — `append` is not broken for everything: an ordinary event still lands. Without this, the
+    // assertion above is satisfied by an `append` that refuses its whole input.
+    await runSubcommand(["append", "--run", runId, "--runs-root", root, "--repo-root", root,
+      JSON.stringify({ actor: "orch", type: "note", note: "still works" })]);
+    assert.equal((await readEvents(runDir)).length, before + 1);
+  }, { events: d2781Done("DER-1", 101) });
+});
+
+test("DER-2838 (#5): the honest `complete-run` mints a receipt the fold accepts", async () => {
+  await withD2781Run(async ({ complete, markers, state }) => {
+    const res = await complete();
+    assert.equal(res.completed, true, res.stdout);
+    const [m] = await markers();
+    const r = m.completion_receipt;
+    assert.ok(r && typeof r === "object", `the marker must CARRY a receipt, got ${JSON.stringify(m)}`);
+    assert.equal(r.receipt_version, 1);
+    assert.deepEqual(r.units, ["DER-1"], "the receipt records the units the gate vouched for");
+    assert.equal(r.unit_count, 1);
+    assert.deepEqual([...r.checks_passed].sort(), d2838Checks, "…and WHICH checks were evaluated");
+    assert.ok(r.harness_version, "…and the build that evaluated them");
+    // The end-to-end property: the marker this path wrote is the marker the fold honors.
+    assert.equal((await state()).status, "completed");
+  }, { events: d2781Done("DER-1", 101) });
+});
+
+test("DER-2838: a run completed by a PRE-RECEIPT build re-completes, and the ignored marker is REPORTED", async () => {
+  // The migration path, and the reason the strict read is affordable: every run completed before this
+  // contract carries an unreceipted marker, so it reads `running` again. `complete-run` is idempotent by
+  // GATE — it re-runs every check and mints a current marker — so recovery is one command. What it must
+  // not do is stay quiet about the marker it ignored: "your run says completed and the harness disagrees"
+  // is exactly the kind of divergence that has to be said out loud.
+  await withD2781Run(async ({ runId, complete, markers, state, appendRaw }) => {
+    await appendRaw(`${JSON.stringify({
+      ts: "2026-07-30T12:00:00.000Z", received_at: "2026-07-30T12:00:00.000Z",
+      event_id: "0197e000-0000-7000-8000-0000000legacy".slice(0, 36), source_id: "legacy:1:aa", seq: 99,
+      schema_version: 1, actor: "orch", type: "run_completed", run_id: runId, units: ["DER-1"], unit_count: 1,
+    })}\n`);
+    assert.equal((await state()).status, "running", "the pre-receipt marker no longer ends the run");
+
+    const res = await complete();
+    assert.equal(res.completed, true, res.stdout);
+    assert.equal((res.rejectedMarkers ?? []).length, 1, "the ignored marker is reported by the command that settles the run");
+    assert.match(res.stdout, /IGNORED/, "…and out loud, not just in the JSON");
+    assert.match(res.stdout, /receipt/i, "…naming why");
+    assert.equal((await markers()).length, 2, "the old line stays in the append-only file; the new one is the completion");
+    const st = await state();
+    assert.equal(st.status, "completed");
+    assert.equal(st.run_completion_rejected.length, 1, "…and the record of the ignored claim survives in state");
+  }, { events: d2781Done("DER-1", 101) });
+});
+
+test("DER-2838 (#8): a caller on a DIFFERENT harness version is refused, even though the ledger records one version", async () => {
+  // DER-2779's finding, applied to the family member it was never applied to. Nothing in this ledger
+  // disagrees with itself; the disagreement is with the process about to append the terminal marker —
+  // which then auto-attests its own version during that append, leaving a completed run mixed.
+  await withD2781Run(async ({ complete, refusal, markers }) => {
+    await withHarnessVersion("9.9.9", async () => {
+      const msg = await refusal();
+      assert.match(msg, /protocol/, "the refusal must name the check");
+      assert.match(msg, /mixed harness version/, "…and the finding");
+      assert.match(msg, /9\.9\.9/, "…and the version THIS process is running");
+      assert.match(msg, /THIS PROCESS/, "…so the operator can tell which side is theirs");
+      assert.deepEqual(await markers(), [], "a refused completion appends nothing");
+    });
+    // CONTROL 1 — the SAME run, same fixture, a same-version caller: completes. A gate that refused every
+    // caller would satisfy the assertion above while breaking completion outright.
+    const ok = await complete();
+    assert.equal(ok.completed, true, `a same-version caller must still complete the run: ${ok.stdout}`);
+    assert.equal((await markers()).length, 1);
+  }, { events: d2781Done("DER-1", 101) });
+});
+
+test("DER-2838 (#8-control): --allow-version-skew still acknowledges a deliberate cross-version completion", async () => {
+  // The escape has to reach the ACTING-version refusal too, or a host upgraded mid-run could never close
+  // the run it is holding — a fail-closed check with no escape is a dead end, which is the failure mode
+  // DER-2776's ack path exists to prevent.
+  await withD2781Run(async ({ complete, markers }) => {
+    await withHarnessVersion("9.9.9", async () => {
+      const res = await complete(["--allow-version-skew"]);
+      assert.equal(res.completed, true, `an acknowledged cross-version completion must be possible: ${res.stdout}`);
+      assert.equal((await markers()).length, 1);
+    });
+  }, { events: d2781Done("DER-1", 101) });
+});
+
+test("DER-2838: the receipt's check list is DERIVED from the gate, not hand-maintained beside it", () => {
+  // A receipt claims which checks ran. If that list is a literal that someone remembers to update, it
+  // drifts the first time a check is added — and a stale list makes every receipt pass a comparison it
+  // was supposed to fail. So read the check names out of `runCompletionRefusals`'s own source and require
+  // the exported set to match exactly.
+  //
+  // KNOWN LIMIT, stated rather than implied: this matches literal `add("name", …)` calls. A check added
+  // through a computed name would not be seen — the same class of gap the repo's own review rules ask a
+  // discovery test to declare instead of claiming completeness it does not have.
+  const src = String(WR.runCompletionRefusals);
+  const found = [...src.matchAll(/\badd\(\s*"([a-z_]+)"/g)].map((m) => m[1]);
+  assert.ok(found.length >= 5, `the scanner found ${found.length} checks — it has stopped matching the gate's shape`);
+  assert.deepEqual([...new Set(found)].sort(), [...WR.RUN_COMPLETION_CHECKS].sort(),
+    "RUN_COMPLETION_CHECKS must be exactly the checks runCompletionRefusals implements");
+  // …and the fixture the tests above build receipts from is the same set, so those tests cannot pass on
+  // a receipt shape production never writes.
+  assert.deepEqual([...WR.RUN_COMPLETION_CHECKS].sort(), d2838Checks);
+});
+
+test("DER-2838: the fixture receipt is the shape the PRODUCTION minter emits", () => {
+  // The tests above build receipts from a literal. This pins that literal to `mintRunCompletionReceipt`
+  // — the function `complete-run` actually calls — so a change to the minted shape fails HERE rather
+  // than leaving a suite full of fixtures that no longer resemble anything the harness writes.
+  const real = WR.mintRunCompletionReceipt({ runId: "r1", units: ["DER-2", "DER-1"] });
+  assert.deepEqual(Object.keys(real).sort(), Object.keys(d2838Receipt("r1", ["DER-1"])).sort());
+  assert.deepEqual(real.units, ["DER-1", "DER-2"], "the minter sorts, so two runs over the same units mint the same list");
+  assert.equal(real.unit_count, 2);
+  assert.equal(real.allow_version_skew, false);
+  assert.ok(real.minted_by, "provenance is recorded (an UNAUTHENTICATED label — see the section header)");
+  assert.equal(WR.mintRunCompletionReceipt({ runId: "r1", units: ["DER-1"], allowVersionSkew: true }).allow_version_skew, true);
+});
+
+test("DER-2838: a receipt from a FUTURE or absent version is not honored", () => {
+  const t = [{ issue: "DER-1", status: "reaped" }];
+  const ev = (receipt) => ({ type: "run_completed", run_id: "r1", completion_receipt: receipt });
+  const ok = WR.runCompletionReceiptVerdict({ event: ev(d2838Receipt("r1", ["DER-1"])), tracked: t, runId: "r1" });
+  assert.equal(ok.ok, true, `the control must PASS or the negatives below prove nothing: ${ok.reason}`);
+  for (const [label, v] of [["a future version", 2], ["a string version", "1"], ["no version", undefined]]) {
+    const bad = WR.runCompletionReceiptVerdict({ event: ev(d2838Receipt("r1", ["DER-1"], { receipt_version: v })), tracked: t, runId: "r1" });
+    assert.equal(bad.ok, false, `${label} must not be honored`);
+    assert.match(bad.reason, /version/i);
+  }
+  // A receipt that skipped a check is not a receipt: it claims a gate that did not fully run.
+  const partial = d2838Receipt("r1", ["DER-1"], { checks_passed: d2838Checks.filter((c) => c !== "units_terminal") });
+  const pv = WR.runCompletionReceiptVerdict({ event: ev(partial), tracked: t, runId: "r1" });
+  assert.equal(pv.ok, false);
+  assert.match(pv.reason, /units_terminal/, "the reason must name the check the receipt does not claim");
 });
 
 // ---- DER-2779: the dispatch gate must attest THIS process's own version --------------------------

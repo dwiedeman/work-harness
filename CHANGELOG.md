@@ -52,6 +52,36 @@ places this file and its neighbors described those gaps as still open after they
   as before. **This is consistency, not authentication** — see `SECURITY.md`; anything that can write the
   run directory can still write a self-consistent event, and `adjudicated_by` remains an unauthenticated
   string by recorded decision.
+
+- **DER-2838 (P1) — a run's terminal state could be FORGED, and the completion gate never looked at the
+  build about to write it.** Two halves of one path. **(a)** The fold accepted the first `run_completed`
+  it saw, and the generic `append` relay reserved only `gate_adjudication` — so anyone who could write
+  the ledger (an agent with `append`, or a text editor) could mark an **active or empty** run completed
+  and every one of DER-2781's seven checks was moot, with `state.status` reading `"completed"` to every
+  later consumer. Fixed on **both** sides, because a write-time check alone is defeated by appending to
+  `events.jsonl` directly: `append` now refuses the type outright, and the fold honors a marker only if
+  it carries a **completion receipt** — the versioned record `complete-run` writes naming the units it
+  vouched for, the checks it evaluated and the build it ran — whose ledger-checkable half the fold
+  **re-derives** at the marker's position in event-time order (is this run tracking anything, is every
+  tracked unit terminal, are those exactly the units the receipt names). Be exact about what that is:
+  **integrity and provenance, not authentication.** `minted_by` is an unauthenticated string with the
+  same standing as `adjudicated_by`, and there is no key, so any digest the harness could compute an
+  appender could compute too — which is why the receipt carries none. What it buys: a forged marker
+  cannot complete an active or empty run, because the only way to satisfy the cross-check is to make the
+  units terminal, which is the work itself. What it does not: on a run that would pass the gate anyway, a
+  hand-written valid receipt still completes it. Ignored markers are listed in
+  `state.run_completion_rejected` and named by `complete-run`'s output rather than silently dropped.
+  **(b)** `complete-run` compared only the harness versions **already recorded** in the ledger — exactly
+  the blind spot DER-2779 closed for dispatch, left open on the one other path that writes. A caller on a
+  different build passed the protocol check and then auto-attested its own version during the append,
+  leaving a freshly-completed run with mixed protocol versions. It now folds
+  `currentVersionAttestation()` into the verdict the gate reads, the same way dispatch does;
+  `--allow-version-skew` still acknowledges a deliberate mid-run upgrade. **Migration:** a run completed
+  by a pre-receipt build carries an unreceipted marker and reads as `running` again — re-run
+  `complete-run`, which re-checks the gate and mints a current marker (it appends nothing if a check
+  fails). Adding a future gate check means bumping the receipt version, so an older receipt is never
+  honored as covering a check its build never ran. (DER-2838)
+
 - **DER-2836 (P0) — the evidence-query policy was decorative, because a shell re-expanded the query
   AFTER it was validated.** `query-check` handed the raw text to `spawnSync(…, {shell: true})`, so the
   arguments a command finally received were not the arguments any rule had read. `find . $(printf --
