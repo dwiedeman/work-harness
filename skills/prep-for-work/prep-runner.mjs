@@ -313,7 +313,10 @@ export function validatePlan(plan, opts = {}) {
   // plan-level loops so the two cannot drift apart (the SQL-mirrors-validator class, applied to ourselves).
   const gateEvidenceQuery = (scopeId, qi, q) => {
     const label = `evidenceQueries[${qi}]${q?.name ? ` "${q.name}"` : ""}`;
-    const probs = evidenceQueryProblems(q);
+    // Shape AND shell safety, both here: the operator must see the refusal in `validate`, BEFORE
+    // query-check spawns anything. A plan is assembled from issue prose and lead output, so an
+    // evidence query is semi-trusted text that this tool otherwise hands straight to a shell.
+    const probs = [...evidenceQueryProblems(q), ...(q?.query?.trim?.() ? evidenceQueryShellProblems(q.query) : [])];
     for (const p of probs) E(scopeId, `${label}: ${p}`);
     if (probs.length) return;
     if (!Number.isFinite(q.observed?.count)) {
@@ -941,6 +944,360 @@ export function evidenceQueryProblems(q) {
   return problems;
 }
 
+// ---------------------------------------------------------------------------
+// SHELL SAFETY for evidenceQueries[].query (2026-07-29)
+// ---------------------------------------------------------------------------
+// `query-check` hands each query to spawnSync(…, { shell: true }) — a real shell, in the operator's repo,
+// with the operator's credentials and ssh agent. The query text arrives from the PLAN FILE, and a plan is
+// assembled from Linear issue prose and from lead output, so this is a path from semi-trusted content to
+// arbitrary command execution. Note the sibling sweep in priorart-check already runs its engines in ARGV
+// form (spawnSync(cmd, args) with no shell) and reasons in its comment about what the shell hides — this
+// file already knew the distinction; the query runner was the outlier.
+//
+// The queries are LEGITIMATELY shell pipelines — `git log --oneline --since=… | grep -c 'fix('` is the
+// documented shape — so banning pipes or quotes would delete the feature. Instead this is an ALLOWLIST
+// over the parsed query:
+//
+//   1. Tokenize with quote awareness, then split on the shell's own operators. Every SEGMENT (each stage
+//      of a pipe, each side of `&&`/`||`/`;`) is validated independently — an allowlisted head does not
+//      launder what comes after the pipe.
+//   2. Each segment's command must be a LITERAL name (no `$VAR`, no substitution, no `/path/to/x`, no
+//      `FOO=bar cmd`) that is on QUERY_READONLY_COMMANDS: commands whose PURPOSE is to read and print.
+//      Anything unrecognised is REFUSED, not run. That asymmetry is the whole design — a false refusal is
+//      visible to the operator and one allowlist line to widen; a false permit is a run nobody sees.
+//   3. Commands that read by default but carry their own write/exec escape hatch get a per-command rule:
+//      `sed -i` / sed's `w`,`r`,`e` commands, `sort -o`, `awk`'s `system()` and `print >`, `find -exec`
+//      / `-delete`, `rg --pre`, and git's non-read subcommands (`config`, `checkout`, …) plus `-c`
+//      (alias injection) and `--output=` (writes a file).
+//   4. Output redirection is refused unless the target is `/dev/null`; fd duplication (`2>&1`) is fine;
+//      input redirection (`< file`) is a read. `&` (background), subshell grouping, heredocs and process
+//      substitution are refused as unparsed-by-us rather than assumed safe.
+//   5. Command substitution `$(…)` / backticks is validated RECURSIVELY by these same rules, so
+//      `$(git rev-parse HEAD)` keeps working while `$(rm -rf .)` is refused.
+//
+// Deliberately NOT on the allowlist even though each is common in shell: `xargs` (its child command is
+// arbitrary), `tee` (writes), `sh`/`bash`/`node`/`python`/`perl` (arbitrary), `env`/`eval`/`exec`
+// (arbitrary), `curl`/`wget`/`nc`/`ssh`/`scp`/`rsync` (exfiltration), `sudo`/`su` (escalation),
+// `rm`/`mv`/`cp`/`chmod`/`dd`/`truncate`/`ln` (destructive), `base64`/`openssl` (smuggling a payload past
+// a reader's eyes). Those are also named in QUERY_REFUSED_COMMANDS purely so the refusal message says
+// WHY rather than "unrecognised".
+export const QUERY_READONLY_COMMANDS = new Set([
+  // No `ag`/`ack`: both can hand matches to an external pager/program, and neither is used here — an
+  // allowlist entry is a promise about that tool's flags, so it is only worth making for tools we use.
+  "git", "rg", "grep", "egrep", "fgrep",
+  "sed", "awk", "gawk", "jq", "find",
+  "wc", "sort", "uniq", "head", "tail", "cut", "tr", "comm", "paste", "nl", "rev", "seq", "column", "fold",
+  "cat", "ls", "stat", "diff", "basename", "dirname", "date", "printf", "echo", "pwd", "true", "false",
+  "test", // a predicate: inspects and exits, writes nothing. `test -f x && rm y` still refuses at the `rm` segment.
+]);
+
+// Named only for the error message — every one of these is already refused by the allowlist above.
+const QUERY_REFUSED_COMMANDS = new Map([
+  ...["rm", "rmdir", "mv", "cp", "ln", "install", "chmod", "chown", "chgrp", "dd", "truncate", "mkfifo", "mknod", "shred", "tee", "touch", "mkdir"]
+    .map((c) => [c, "writes or destroys files"]),
+  ...["curl", "wget", "nc", "ncat", "netcat", "telnet", "ssh", "scp", "sftp", "rsync", "ftp", "mail", "sendmail", "pbcopy", "osascript"]
+    .map((c) => [c, "can move repo contents off the machine (exfiltration)"]),
+  ...["sudo", "doas", "su", "security", "defaults", "launchctl", "crontab", "at", "kill", "killall", "chflags"]
+    .map((c) => [c, "escalates privilege or reconfigures the machine"]),
+  ...["sh", "bash", "zsh", "dash", "ksh", "fish", "node", "deno", "bun", "python", "python2", "python3", "perl", "ruby", "php", "eval", "exec", "source", ".", "env", "nohup", "xargs", "make", "npm", "npx", "pnpm", "yarn", "pip", "pip3", "gh", "docker", "kubectl", "brew", "apt", "apt-get"]
+    .map((c) => [c, "runs an arbitrary command of its own, so allowing it allows everything"]),
+  ...["base64", "openssl", "gpg", "uudecode", "xxd", "openssl-enc"]
+    .map((c) => [c, "is a payload smuggler here — it has no read-only evidence use"]),
+]);
+
+const GIT_READ_SUBCOMMANDS = new Set([
+  "log", "show", "diff", "diff-tree", "diff-files", "diff-index", "whatchanged", "shortlog", "blame", "annotate",
+  "grep", "ls-files", "ls-tree", "ls-remote", "cat-file", "rev-list", "rev-parse", "show-ref", "for-each-ref",
+  "name-rev", "merge-base", "describe", "status", "count-objects", "check-ignore", "check-attr", "var", "version",
+]);
+// Global options that are safe (or safe-with-a-value); anything else before the subcommand is refused,
+// which is what catches `git -c alias.x='!rm -rf .' x` — a config injection that executes.
+const GIT_GLOBAL_SAFE = new Set(["--no-pager", "-p", "--paginate", "--no-replace-objects", "--literal-pathspecs", "--glob-pathspecs", "--noglob-pathspecs", "--icase-pathspecs", "--bare", "--no-optional-locks", "--no-lazy-fetch"]);
+const GIT_GLOBAL_WITH_VALUE = new Set(["-C", "--git-dir", "--work-tree", "--namespace"]);
+// Read subcommands that can still write a file or run a program if you ask them to.
+const GIT_REFUSED_ARGS = [
+  [/^--output(=|$)/, "--output writes a file"],
+  [/^--exec-path(=|$)/, "--exec-path relocates git's helper binaries"],
+  [/^--ext-diff$/, "--ext-diff runs an external diff program"],
+  [/^(-O|--open-files-in-pager)/, "-O/--open-files-in-pager runs a program on the matches"],
+  [/^--(upload|receive)-pack(=|$)/, "--upload-pack/--receive-pack names a program to execute"],
+];
+
+// A sed script is read-only only if it neither writes (`w`, `W`, the `s///w` flag) nor reads/executes
+// (`r`, `R`, `e`, the `s///e` flag). Command-position detection is a heuristic over the addressed form.
+const SED_S_WRITE_OR_EXEC = /s(.)(?:\\.|(?!\1)[^\n])*?\1(?:\\.|(?!\1)[^\n])*?\1[a-zA-Z0-9]*[weW]/;
+const SED_CMD_WRITE_OR_EXEC = /(?:^|[;{}\n])\s*(?:\d+|\$|\/(?:\\.|[^/\n])*\/)?(?:\s*,\s*(?:\d+|\$|\/(?:\\.|[^/\n])*\/))?\s*!?\s*[wWrRe](?:$|[\s;])/;
+
+// Per-command argument rules. Each returns a list of problem strings.
+const QUERY_COMMAND_RULES = {
+  git(args) {
+    const problems = [];
+    let i = 1;
+    while (i < args.length && args[i].startsWith("-")) {
+      const a = args[i];
+      const head = a.split("=")[0];
+      if (GIT_GLOBAL_SAFE.has(a)) { i += 1; continue; }
+      if (GIT_GLOBAL_WITH_VALUE.has(head)) { i += a.includes("=") ? 1 : 2; continue; }
+      problems.push(`git global option \`${a}\` is not on the read-only allowlist (\`-c\` alone can inject an alias that executes anything)`);
+      return problems;
+    }
+    const sub = args[i];
+    if (!sub) { problems.push("`git` with no subcommand reads nothing"); return problems; }
+    if (!GIT_READ_SUBCOMMANDS.has(sub)) {
+      problems.push(`\`git ${sub}\` is not a read-only git subcommand — evidence queries may use ${[...GIT_READ_SUBCOMMANDS].slice(0, 8).join("/")}/… only`);
+      return problems;
+    }
+    for (const a of args.slice(i + 1)) {
+      for (const [re, why] of GIT_REFUSED_ARGS) if (re.test(a)) problems.push(`\`git ${sub} ${a}\` is refused: ${why}`);
+    }
+    return problems;
+  },
+  sed(args) {
+    const problems = [];
+    for (const a of args.slice(1)) {
+      if (/^--in-place/.test(a) || (/^-[^-]*i/.test(a) && !a.startsWith("--"))) problems.push("`sed -i`/--in-place EDITS FILES — an evidence query may only read");
+      if (SED_S_WRITE_OR_EXEC.test(a) || SED_CMD_WRITE_OR_EXEC.test(a)) problems.push(`sed script \`${a}\` uses a w/W/r/R/e command or s///w|e flag — those write files or execute a shell`);
+    }
+    return problems;
+  },
+  awk(args) {
+    const problems = [];
+    for (const a of args.slice(1)) {
+      if (/^(-f|--file)$/.test(a) || /^--file=/.test(a)) problems.push("`awk -f` takes its program from a file this validator cannot see");
+      if (a.startsWith("-")) continue;
+      if (/system\s*\(|\bclose\s*\(|ENVIRON|\/dev\/(?!null)/.test(a)) problems.push(`awk program \`${a}\` calls system()/close()/ENVIRON — awk is a shell when you let it be`);
+      // `print > "f"` and `print | "cmd"` write and execute. Refusing `>`/`|` inside an awk program also
+      // refuses a numeric comparison (`$1 > 5`); that is the deliberate fail-closed side of the trade.
+      if (/[>|]/.test(a)) problems.push(`awk program \`${a}\` contains \`>\` or \`|\` — awk redirects to files and pipes to commands from inside the program, where the shell-level checks cannot see it`);
+    }
+    return problems;
+  },
+  find(args) {
+    const bad = new Set(["-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf", "-fls"]);
+    return args.slice(1).filter((a) => bad.has(a)).map((a) => `\`find ${a}\` runs or deletes — use find to LIST and pipe into a reader`);
+  },
+  sort(args) {
+    return args.slice(1)
+      .filter((a) => a === "-o" || a === "--output" || a.startsWith("--output=") || a.startsWith("--compress-program"))
+      .map((a) => `\`sort ${a}\` writes a file or runs a program`);
+  },
+  rg(args) {
+    return args.slice(1)
+      .filter((a) => /^--pre(=|$|-glob)/.test(a) || /^--hostname-bin(=|$)/.test(a))
+      .map((a) => `\`rg ${a}\` runs an external program per file`);
+  },
+};
+QUERY_COMMAND_RULES.gawk = QUERY_COMMAND_RULES.awk;
+
+const SUBST_PLACEHOLDER = "__SUBST__";
+
+// Scan from `start` (just past the opening delimiter) to the matching close, respecting quotes and nesting.
+function readBalanced(src, start, open, close) {
+  let depth = 1;
+  let i = start;
+  while (i < src.length) {
+    const c = src[i];
+    if (c === "\\") { i += 2; continue; }
+    if (c === "'" || c === '"') {
+      const end = src.indexOf(c, i + 1);
+      if (end < 0) return { text: src.slice(start), next: src.length, unbalanced: true };
+      i = end + 1;
+      continue;
+    }
+    if (c === open) depth += 1;
+    else if (c === close) { depth -= 1; if (!depth) return { text: src.slice(start, i), next: i + 1, unbalanced: false }; }
+    i += 1;
+  }
+  return { text: src.slice(start), next: src.length, unbalanced: true };
+}
+
+const OP_CHARS = "|&<>";
+
+// Inside double quotes everything is literal EXCEPT `\`, `$` and backticks. Scanned literally rather
+// than re-lexed on purpose: re-lexing would drop a quoted `>` or the whitespace around it, and the
+// per-command rules (awk's `print > "f"`, sed's `1e cmd`) read that exact text.
+function readDoubleQuoted(src, open) {
+  let i = open + 1;
+  let text = "";
+  let dynamic = false;
+  const nested = [];
+  while (i < src.length) {
+    const c = src[i];
+    if (c === "\\") { text += src[i + 1] ?? ""; i += 2; continue; }
+    if (c === '"') return { text, nested, dynamic, next: i + 1, unbalanced: false };
+    if (c === "$" && src[i + 1] === "(") {
+      const r = readBalanced(src, i + 2, "(", ")");
+      if (r.unbalanced) return { text, nested, dynamic, next: src.length, unbalanced: true };
+      nested.push(r.text);
+      text += SUBST_PLACEHOLDER;
+      i = r.next;
+      continue;
+    }
+    if (c === "`") {
+      let j = i + 1;
+      while (j < src.length && src[j] !== "`") { if (src[j] === "\\") j += 1; j += 1; }
+      if (j >= src.length) return { text, nested, dynamic, next: src.length, unbalanced: true };
+      nested.push(src.slice(i + 1, j));
+      text += SUBST_PLACEHOLDER;
+      i = j + 1;
+      continue;
+    }
+    if (c === "$") { dynamic = true; text += c; i += 1; continue; }
+    text += c;
+    i += 1;
+  }
+  return { text, nested, dynamic, next: src.length, unbalanced: true };
+}
+
+// A small quote-aware lexer. Not a shell — it deliberately reports anything it does not model as a
+// problem, so "we could not parse it" and "it is unsafe" collapse into the same refusal.
+function lexShellQuery(src) {
+  const tokens = [];
+  const problems = [];
+  let cur = null;
+  const word = () => (cur ??= { kind: "word", text: "", quoted: false, dynamic: false, nested: [] });
+  const flush = () => { if (cur) { tokens.push(cur); cur = null; } };
+  let i = 0;
+  while (i < src.length) {
+    const c = src[i];
+    if (c === "\\") {
+      if (i + 1 >= src.length) { problems.push("ends in a trailing backslash — unparseable"); break; }
+      word().text += src[i + 1];
+      i += 2;
+      continue;
+    }
+    if (c === "'") {
+      const end = src.indexOf("'", i + 1);
+      if (end < 0) { problems.push("has an unbalanced single quote"); break; }
+      word().text += src.slice(i + 1, end);
+      word().quoted = true;
+      i = end + 1;
+      continue;
+    }
+    if (c === '"') {
+      const r = readDoubleQuoted(src, i);
+      if (r.unbalanced) { problems.push("has an unbalanced double quote"); break; }
+      const w = word();
+      w.quoted = true;
+      w.text += r.text;
+      w.dynamic = w.dynamic || r.dynamic;
+      w.nested.push(...r.nested);
+      i = r.next;
+      continue;
+    }
+    if (c === "$" && src[i + 1] === "(") {
+      const r = readBalanced(src, i + 2, "(", ")");
+      if (r.unbalanced) { problems.push("has an unbalanced `$(`"); break; }
+      const w = word();
+      w.text += SUBST_PLACEHOLDER;
+      w.nested.push(r.text);
+      i = r.next;
+      continue;
+    }
+    if (c === "`") {
+      let j = i + 1;
+      while (j < src.length && src[j] !== "`") { if (src[j] === "\\") j += 1; j += 1; }
+      if (j >= src.length) { problems.push("has an unbalanced backtick"); break; }
+      const w = word();
+      w.text += SUBST_PLACEHOLDER;
+      w.nested.push(src.slice(i + 1, j));
+      i = j + 1;
+      continue;
+    }
+    if (c === "$") { word().text += c; word().dynamic = true; i += 1; continue; }
+    if (c === "\n") { flush(); tokens.push({ kind: "op", text: "\n" }); i += 1; continue; }
+    if (/\s/.test(c)) { flush(); i += 1; continue; }
+    if (c === ";") { flush(); tokens.push({ kind: "op", text: ";" }); i += 1; continue; }
+    if (c === "(" || c === ")" || c === "{" || c === "}") { flush(); tokens.push({ kind: "op", text: c }); i += 1; continue; }
+    if (OP_CHARS.includes(c)) {
+      let j = i;
+      let op = "";
+      while (j < src.length && OP_CHARS.includes(src[j])) { op += src[j]; j += 1; }
+      // A bare digit immediately before a redirect is an fd, not an argument (`2>/dev/null`).
+      let fd = null;
+      if (cur && !cur.quoted && !cur.dynamic && /^\d+$/.test(cur.text)) { fd = cur.text; cur = null; } else flush();
+      if (src[j] === "(") problems.push("uses process substitution — refused: what runs inside it is a command this validator does not model");
+      tokens.push({ kind: "op", text: op, fd });
+      i = j;
+      continue;
+    }
+    word().text += c;
+    i += 1;
+  }
+  flush();
+  return { tokens, problems };
+}
+
+const SEPARATORS = new Set(["|", "||", "&&", ";", "\n"]);
+const REDIRECT_OUT = new Set([">", ">>", ">|", "&>", "&>>"]);
+
+// THE pure predicate behind the seam: given the raw query string, return the reasons it may not be run.
+// An empty array means "read-only by construction as far as this validator can tell". Exported so the
+// rules are unit-testable directly rather than only through a spawn.
+export function evidenceQueryShellProblems(query, { depth = 0 } = {}) {
+  if (typeof query !== "string") return ["query is not a string — nothing to run"];
+  if (!query.trim()) return ["query is empty — nothing to run"];
+  if (depth > 3) return ["nests command substitution more than 3 deep — refused as unreviewable"];
+  if (/\.git\/hooks/.test(query)) return ["mentions .git/hooks — a query that touches the hook directory is not evidence, it is persistence"];
+
+  const { tokens, problems } = lexShellQuery(query);
+  if (problems.length) return problems;
+
+  const segments = [[]];
+  for (const t of tokens) {
+    if (t.kind === "op" && SEPARATORS.has(t.text)) { segments.push([]); continue; }
+    segments[segments.length - 1].push(t);
+  }
+
+  const out = [];
+  for (const seg of segments) {
+    if (!seg.length) continue;
+    const words = [];
+    for (let k = 0; k < seg.length; k += 1) {
+      const t = seg[k];
+      if (t.kind === "word") { words.push(t); continue; }
+      const target = seg[k + 1]?.kind === "word" ? seg[k + 1] : null;
+      if (REDIRECT_OUT.has(t.text)) {
+        if (target?.text !== "/dev/null") out.push(`redirects output (\`${t.text}${target ? ` ${target.text}` : ""}\`) — an evidence query may only READ; the sole allowed target is /dev/null`);
+        k += target ? 1 : 0;
+        continue;
+      }
+      if (t.text === ">&" || t.text === "<&") {
+        if (!target || !/^(\d+|\/dev\/null)$/.test(target.text)) out.push(`duplicates a file descriptor onto \`${target?.text ?? "?"}\` — only \`2>&1\`-style fd duplication and /dev/null are allowed`);
+        k += target ? 1 : 0;
+        continue;
+      }
+      if (t.text === "<") { k += target ? 1 : 0; continue; } // reading a file in is a read
+      out.push(`uses the shell operator \`${t.text}\`${t.text === "&" ? " to background a job" : ""} — refused: it is not one of the pipeline operators this validator models (| || && ; newline, redirect to /dev/null, 2>&1, < file)`);
+    }
+    if (!words.length) continue;
+
+    const cmd = words[0];
+    for (const w of words) for (const n of w.nested) {
+      for (const p of evidenceQueryShellProblems(n, { depth: depth + 1 })) out.push(`inside \`$(${n})\`: ${p}`);
+    }
+    if (cmd.nested.length || cmd.dynamic || cmd.text.includes(SUBST_PLACEHOLDER)) {
+      out.push(`builds its command name by expansion (\`${cmd.text.replace(SUBST_PLACEHOLDER, "$(…)")}\`) — the command must be a literal name so it can be checked against the allowlist`);
+      continue;
+    }
+    const name = cmd.text;
+    if (!/^[A-Za-z][A-Za-z0-9_.+-]*$/.test(name)) {
+      out.push(`runs \`${name}\`, which is not a bare command name — a path, a glob or a VAR=value prefix is refused (the allowlist can only vouch for names it resolves the same way you do)`);
+      continue;
+    }
+    const refusal = QUERY_REFUSED_COMMANDS.get(name);
+    if (refusal) { out.push(`runs \`${name}\`, which ${refusal} — refused`); continue; }
+    if (!QUERY_READONLY_COMMANDS.has(name)) {
+      out.push(`runs \`${name}\`, which is not on the read-only evidence allowlist — an UNRECOGNISED command is refused, not run. If it truly only reads, add it to QUERY_READONLY_COMMANDS with a reason.`);
+      continue;
+    }
+    // hasOwn, not a bare index: a name like `constructor` must never reach Object.prototype.
+    const rule = Object.hasOwn(QUERY_COMMAND_RULES, name) ? QUERY_COMMAND_RULES[name] : null;
+    if (rule) out.push(...rule(words.map((w) => w.text)));
+  }
+  return out;
+}
+
 // Non-empty stdout lines are the match count. A query that errors produces no stdout and so counts 0 —
 // fail-closed, never "no output means clean".
 export function evaluateQueryOutput(stdout, expectAtLeast) {
@@ -1267,7 +1624,10 @@ export async function runSubcommand(argv) {
       let failures = 0;
       for (const r of rows) {
         const label = `${r.id ?? "plan"} evidenceQueries[${r.index}]${r.q?.name ? ` "${r.q.name}"` : ""}`;
-        const probs = evidenceQueryProblems(r.q);
+        // Re-checked here, not only in validate: this is the line that actually spawns a shell, and it is
+        // reachable directly (`query-check <plan>`) without validate ever having run. The refusal must
+        // land BEFORE spawnSync — after it, the payload has already run.
+        const probs = [...evidenceQueryProblems(r.q), ...(r.q?.query?.trim?.() ? evidenceQueryShellProblems(r.q.query) : [])];
         if (probs.length) { failures += 1; lines.push(`🔴 ${label}: ${probs.join(" · ")}`); continue; }
         const run = spawnSync(r.q.query, { shell: true, cwd: repoRoot, encoding: "utf8", timeout: 60_000 });
         const ev = evaluateQueryOutput(run.error ? "" : run.stdout, r.q.expectAtLeast);
