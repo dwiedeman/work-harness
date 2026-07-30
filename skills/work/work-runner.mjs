@@ -1648,6 +1648,24 @@ async function ensureWipCommit({ worktree, issueId, rotation, ssh = null }) {
 // A run-dir file does NOT ride the mini's existing sync — `pullHostInto` tails events.jsonl and
 // nothing else — so a mini note is fetched explicitly at rotation time. Cloud leads have no run dir at
 // all, so their note is a `WORK-HANDOFF` PR comment.
+// Author-aware handoff-note selection (DER-2737). This used to take the LATEST `WORK-HANDOFF` comment
+// author-blind, and `renderRotationBrief` presents whatever it returns to a successor lead under
+// "Handoff note — written by your predecessor" with `noteSynthesized:false` and no warning — so a forged
+// comment was a direct instruction to the next session, needing no ssh host and no other config. A note
+// from an untrusted author is not a note: returning null routes the successor to synthesizeHandoffNote,
+// which reconstructs state from git + the ledger and MARKS itself as evidence rather than testimony.
+// Pure, so the control for this is a unit test rather than a live rotation.
+export function selectHandoffComment({ comments = [], trustedAuthors } = {}) {
+  const trusted = toAuthorSet(trustedAuthors);
+  for (const c of [...comments].reverse()) {
+    if (!trusted.has(commentAuthorLogin(c) ?? "")) continue;
+    const body = String(c?.body ?? "");
+    if (!getHandoffMarkers().some((m) => body.trimStart().startsWith(m))) continue;
+    return body.replace(handoffMarkerRe(), "").trim() || null;
+  }
+  return null;
+}
+
 async function fetchHandoffNote({ runDir, runId, issueId, rotation, hostCfg, isCloud, pr, repoRoot }) {
   const fname = `${issueId}.rot${rotation}.md`;
   const localPath = join(runDir, "handoffs", fname);
@@ -1657,9 +1675,9 @@ async function fetchHandoffNote({ runDir, runId, issueId, rotation, hostCfg, isC
     if (res.exitCode !== 0) return null;
     try {
       const comments = JSON.parse(res.stdout || "{}").comments ?? [];
-      // Both markers accepted on read — a lead spawned before the rename still emits the legacy one.
-      const hit = [...comments].reverse().find((c) => getHandoffMarkers().some((m) => String(c?.body ?? "").trimStart().startsWith(m)));
-      return hit ? String(hit.body).replace(handoffMarkerRe(), "").trim() || null : null;
+      // Both markers accepted on read — a lead spawned before the rename still emits the legacy one —
+      // but only from an allowlisted author (DER-2737).
+      return selectHandoffComment({ comments });
     } catch {
       return null;
     }
@@ -2991,6 +3009,19 @@ export function reapCleanupCommands({ worktree, gitCwd } = {}) {
   ];
 }
 
+// The REMOTE half of reap's cleanup, as the one ssh shell string it has to become. The local half above
+// passes argv and is structurally uninjectable; this one is a string, and DER-2737 found `it.worktree`
+// interpolated into it RAW — the only unquoted use of it.worktree in the file, while every sibling (the
+// pkill in the same block, the status probe at 1642, the context probe at 1704) already shellQuoted.
+// `worktree` arrives from the LEDGER, and a PR comment could write the ledger, so the PoC reached
+// `; touch …; #`. With no ssh host configured it still degraded to `worktree remove --force <any path>`.
+// Pure and exported so the injection control is a unit test, not a live reap.
+export function reapRemoteCleanupCommand({ worktree, repo } = {}) {
+  if (!worktree) return null;
+  const wt = shellQuote(worktree);
+  return `git -C ${wt} update-ref -d AUTO_MERGE 2>/dev/null; git -C ${shellQuote(repo ?? ".")} worktree remove --force ${wt}`;
+}
+
 // ---------------------------------------------------------------------------
 // Process helpers
 // ---------------------------------------------------------------------------
@@ -3144,9 +3175,103 @@ async function reconcileMergedInto(runDir, runId, repoRoot) {
 // its session_id). Pure: extract those events from an array of comment objects/strings, keeping only
 // events for this run's issues (when `runIssues` given), tagging host:"cloud" + a lead actor if the
 // lead omitted them. Only the FIRST line after the token is parsed, so a multi-line comment is fine.
-export function parsePrEventComments({ comments = [], runIssues = null } = {}) {
+// ---------------------------------------------------------------------------
+// Untrusted-input boundary: PR comments (DER-2737)
+// ---------------------------------------------------------------------------
+// Everything below exists because `parsePrEventComments` and `fetchHandoffNote` read PR comment bodies
+// as privileged lifecycle input with no author check — `c.author.login` is in the gh payload and was
+// never consulted — while `reconcilePrEventsInto` discovers comments via `gh pr list --state open
+// --limit 100`, i.e. ANY open PR in the repo, on a `watch` loop that re-folds every ~45s with no
+// operator present. The harness already knew the rule ("never let untrusted text reach a shell",
+// DER-2456 #5); this is the inbound version, and the author-filter technique was already in-file in
+// `ready` and simply never applied to the two ingestion paths.
+
+// Bots whose comments the harness already treats as authoritative (`ready` filters the Codex review
+// surfaces on this exact login).
+const TRUSTED_COMMENT_BOTS = ["chatgpt-codex-connector[bot]"];
+let TRUSTED_COMMENT_AUTHORS_EXTRA = [];
+
+// The logins whose PR comments may become ledger events. Config-driven because the harness ships
+// without naming anyone's account — and therefore DENY-BY-DEFAULT: an unconfigured repo trusts no human
+// login at all. That is not a degraded mode. A repo that never declared an owner has no way to
+// authenticate a comment, so folding one would be a guess; and the cloud lane this protects already
+// requires `repo.repoSlug` + `repo.ownerLogin` to function, so it cannot be running unconfigured.
+export function getTrustedCommentAuthors() {
+  const set = new Set(TRUSTED_COMMENT_BOTS);
+  if (REPO_IDENTITY.ownerLogin) set.add(REPO_IDENTITY.ownerLogin);
+  for (const a of TRUSTED_COMMENT_AUTHORS_EXTRA) set.add(a);
+  return set;
+}
+
+// gh spells the author two ways: `pr view --json comments` gives `author.login`; the REST
+// `issues/<n>/comments` surface gives `user.login`. Accept both. Anything else — including a bare
+// string body, which is what the unit tests used to pass — carries no authorship and is not input.
+export function commentAuthorLogin(comment) {
+  if (!comment || typeof comment !== "object") return null;
+  const login = comment.author?.login ?? comment.user?.login ?? null;
+  return typeof login === "string" && login ? login : null;
+}
+
+function toAuthorSet(trustedAuthors) {
+  if (trustedAuthors instanceof Set) return trustedAuthors;
+  if (Array.isArray(trustedAuthors)) return new Set(trustedAuthors);
+  return getTrustedCommentAuthors();
+}
+
+// What a cloud lead may report about ITSELF through a PR comment: exactly what the cloud brief instructs
+// it to post, and nothing else. A terminal transition like `pr_merged` or `reaped` is the shepherd's to
+// record from gh state — a comment claiming one manufactures a merge that never happened.
+const COMMENT_EVENT_TYPES = new Set([
+  "pr_opened", "lead_online", "plan_scope", "handed_off", "rotate_requested", "kickback_ack", "token_usage",
+]);
+
+// Per-type field allowlist. Note what is absent from EVERY type: `worktree` and `branch` (how a forged
+// payload reached reap's ssh string, and how it retargeted a live unit) and `actor` (a forged
+// `actor:"shepherd"` supplied the disposition that turned a handoff note into an instruction). `host`,
+// `actor` and `pr` are stamped by the reader from the PR the comment was posted on. Unknown fields are
+// dropped rather than rejected, so a lead emitting a field from a newer brief still hands off.
+//
+// `ts` is deliberately kept: `eventSeenKey` dedups `token_usage` per EMISSION on `${pr}:${ts}`, and
+// dropping it would collapse a rotated cloud lead's second usage report into its predecessor's key and
+// silently under-count that unit's spend. It is accepted only from an already-authenticated author.
+const COMMENT_FIELDS_COMMON = ["type", "issue", "issues", "ts", "session_id", "sha", "note", "notes"];
+const COMMENT_FIELDS_BY_TYPE = {
+  pr_opened: [],
+  lead_online: ["handle", "draft"],
+  plan_scope: ["fileScope", "expectedAdditions", "expectedFiles"],
+  handed_off: [],
+  rotate_requested: ["disposition", "pct", "rotation"],
+  kickback_ack: ["round"],
+  token_usage: ["role", "model", "by_model", "tokens", "rotation", "kickback"],
+};
+
+// Reduce a parsed comment payload to the fields its type is allowed to carry, stamping the ambient
+// facts. Returns null for a type no cloud lead may report. Pure.
+export function sanitizeCommentEvent(event, { pr = null } = {}) {
+  if (!event || typeof event !== "object" || !COMMENT_EVENT_TYPES.has(event.type)) return null;
+  const allowed = new Set([...COMMENT_FIELDS_COMMON, ...(COMMENT_FIELDS_BY_TYPE[event.type] ?? [])]);
+  const out = {};
+  for (const [k, v] of Object.entries(event)) {
+    if (allowed.has(k) && v !== undefined) out[k] = v;
+  }
+  // A comment IS a cloud lead's only reporting channel, so host is a fact, not a claim. Left as a claim,
+  // `host:"mini"` selected a configured ssh host and completed the injection chain into a real shell.
+  out.host = "cloud";
+  // The PR the comment was posted on is authoritative. The body's `pr` is honoured only when no ambient
+  // PR was supplied — the pure-unit-test path; every production caller passes one.
+  if (pr != null) out.pr = pr;
+  else if (Number.isFinite(event.pr)) out.pr = event.pr;
+  return out;
+}
+
+export function parsePrEventComments({ comments = [], runIssues = null, pr = null, trustedAuthors } = {}) {
+  const trusted = toAuthorSet(trustedAuthors);
   const out = [];
   for (const c of comments) {
+    // AUTHORSHIP FIRST — before the marker check, before JSON.parse. An unauthenticated comment is not
+    // untrusted input to be sanitized, it is not input at all.
+    const login = commentAuthorLogin(c);
+    if (!login || !trusted.has(login)) continue;
     const body = typeof c === "string" ? c : c && c.body;
     if (typeof body !== "string") continue;
     // Writers emit EVENT_MARKER; readers accept the legacy marker too. A cloud lead spawned before the
@@ -3155,11 +3280,18 @@ export function parsePrEventComments({ comments = [], runIssues = null } = {}) {
     const marker = getEventMarkers().find((m) => body.startsWith(m));
     if (!marker) continue;
     const firstLine = body.slice(marker.length).trim().split("\n")[0];
-    let e;
-    try { e = JSON.parse(firstLine); } catch { continue; }
-    if (!e || typeof e !== "object" || !e.type) continue;
-    if (runIssues && Array.isArray(e.issues) && !e.issues.some((i) => runIssues.includes(i))) continue;
-    if (!e.host) e.host = "cloud";
+    let raw;
+    try { raw = JSON.parse(firstLine); } catch { continue; }
+    if (!raw || typeof raw !== "object" || !raw.type) continue;
+    const e = sanitizeCommentEvent(raw, { pr });
+    if (!e) continue;
+    // Run scope in BOTH shapes. The old filter rejected only a non-matching `issues` ARRAY, so a payload
+    // carrying a SINGULAR `issue` (and no array) was never filtered at all — that is how a drive-by
+    // comment folded a phantom unit, or retargeted a real one, on any run.
+    if (runIssues) {
+      if (Array.isArray(e.issues) && !e.issues.some((i) => runIssues.includes(i))) continue;
+      if (e.issue != null && !runIssues.includes(e.issue)) continue;
+    }
     // Normalize `issues:[…]` → the singular `issue` the ledger keys on (2026-07-25). The cloud brief
     // has always asked leads to emit the ARRAY form, but materializeState skips any event without
     // `issue` (`if (!e.issue) continue`) — so every WORK-EVENT comment was parsed, appended, and
@@ -3171,7 +3303,9 @@ export function parsePrEventComments({ comments = [], runIssues = null } = {}) {
     if (!e.issue && Array.isArray(e.issues) && e.issues.length) {
       e.issue = (runIssues && e.issues.find((i) => runIssues.includes(i))) || e.issues[0];
     }
-    if (!e.actor) e.actor = `lead:${e.issue || "cloud"}`;
+    // Always stamped, never read from the body: a forged `actor:"shepherd"` on a rotate_requested is what
+    // supplied the CONTINUE disposition that turned a planted handoff note into an instruction.
+    e.actor = `lead:${e.issue || "cloud"}`;
     out.push(e);
   }
   return out;
@@ -3428,7 +3562,9 @@ async function reconcilePrEventsInto(runDir, runId, repoRoot) {
       { repoRoot, kickbackSha: issueStatus === "kickback" ? kickbackShaByPr.get(pr) : null },
     );
     for (const e of derived) await emit(e);
-    for (const e of parsePrEventComments({ comments: data.comments || [], runIssues: scope })) await emit(e);
+    // `pr` is passed so the reader stamps the PR the comment was actually posted on rather than trusting
+    // the body's claim; the author allowlist comes from config (DER-2737).
+    for (const e of parsePrEventComments({ comments: data.comments || [], runIssues: scope, pr })) await emit(e);
   }
   // Publish the operator monitor links (item 7) from the freshly-folded state — cheap, and this is where
   // cloud leads' `lead_online` handles land, so links.md refreshes on each new cloud lead.
@@ -3458,6 +3594,7 @@ export async function applyRepoConfig(repoRoot) {
   REPO_IDENTITY = { ...REPO_IDENTITY_DEFAULT };
   LEGACY_EVENT_MARKER = null;
   LEGACY_HANDOFF_MARKER = null;
+  TRUSTED_COMMENT_AUTHORS_EXTRA = [];
   let cfg;
   try {
     cfg = JSON.parse(await readFile(join(repoRoot, ".claude", "work.config.json"), "utf8"));
@@ -3490,6 +3627,11 @@ export async function applyRepoConfig(repoRoot) {
     for (const k of Object.keys(REPO_IDENTITY_DEFAULT)) {
       if (typeof cfg.repo[k] === "string" && cfg.repo[k]) REPO_IDENTITY[k] = cfg.repo[k];
     }
+  }
+  // Extra logins whose PR comments may be folded as lifecycle events (DER-2737) — a second maintainer,
+  // or a bot that posts on the harness's behalf. `repo.ownerLogin` is trusted automatically.
+  if (Array.isArray(cfg.trustedCommentAuthors)) {
+    TRUSTED_COMMENT_AUTHORS_EXTRA = cfg.trustedCommentAuthors.filter((a) => typeof a === "string" && a);
   }
 }
 
@@ -4366,7 +4508,7 @@ export async function runSubcommand(argv) {
           if (remoteHost) {
             // Chain the stale-AUTO_MERGE cleanup (B5) into the same ssh as the worktree remove — no
             // extra round-trip; the `2>/dev/null` swallows a missing-ref error (best-effort, as before).
-            await runCommand({ command: "ssh", args: [remoteHost.ssh, `git -C ${it.worktree} update-ref -d AUTO_MERGE 2>/dev/null; git -C ${remoteHost.repo} worktree remove --force ${it.worktree}`] });
+            await runCommand({ command: "ssh", args: [remoteHost.ssh, reapRemoteCleanupCommand({ worktree: it.worktree, repo: remoteHost.repo })] });
           } else {
             // Best-effort, matching prior reap behavior (worktree-remove failures are not fatal); the
             // AUTO_MERGE step is `optional` so a missing ref doesn't abort the removal.

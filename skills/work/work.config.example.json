@@ -10,6 +10,9 @@
     "dbImageAssetId": null
   },
 
+  "//trustedCommentAuthors": "SECURITY (DER-2737). PR comments are how a CLOUD lead reports lifecycle events (WORK-EVENT / WORK-HANDOFF), and the fold treats them as privileged ledger input — so it accepts them ONLY from these logins, plus `repo.ownerLogin` and known harness bots. Deny-by-default: with no `repo.ownerLogin` configured, NO human login is trusted and comment folding is off. Add a second maintainer or a bot that posts on the harness's behalf here. Anyone who can comment on any open PR in the repo can otherwise write your ledger.",
+  "trustedCommentAuthors": [],
+
   "//commitAuthor": "Commits are authored as this identity. Some deploy checks (e.g. Vercel) map commit author → account and red the PR on a mismatch.",
   "commitAuthor": {
     "name": "Your Name",
