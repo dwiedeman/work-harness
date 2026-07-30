@@ -50,6 +50,18 @@ jobs:
       - name: Repo contract
         run: node --test repo-contract.test.mjs
 
+      # Fault-injection E2E (DER-2830). Drives work-runner.mjs as a real SUBPROCESS and INDUCES each
+      # failure the harness exists to survive — a torn ledger tail, version skew, a foreign wire version,
+      # a phantom reap, an unfinished run. The unit suite proves the predicates; this proves the program.
+      #
+      # Tier A only here: hermetic, no network, no model calls, no `gh`. The live tier (real leads, real
+      # PRs, real cost) is opt-in behind WORK_E2E_LIVE=1 and deliberately never runs in PR CI.
+      #
+      # This file also carries DEFECT PINS asserting known-live bugs. A pin going RED means the bug was
+      # FIXED — invert the pin, do not "repair" the harness to satisfy it.
+      - name: Fault-injection E2E (hermetic tier)
+        run: node --test e2e.test.mjs
+
   static:
     name: static checks
     runs-on: ubuntu-latest
