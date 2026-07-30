@@ -321,6 +321,11 @@ export function validatePlan(plan, opts = {}) {
     if (probs.length) return;
     if (!Number.isFinite(q.observed?.count)) {
       E(scopeId, `${label}: never validated against its known-positive window — run \`query-check --record\`. The 07-28 kill criterion's grep matched 2 of the 6 commits its own plan cited; it would have returned zero and auto-selected "delete the tool" while the problem recurred.`);
+    } else if (q.observed.failed) {
+      // Checked BEFORE the count and independently of it: `query-check` stamps 0 on a failed run, but 0
+      // is also a legitimate measurement, so the count alone cannot tell the two apart. Without this
+      // branch a hand-edited or re-stamped count would buy a query that never ran a pass here (DER-2783).
+      E(scopeId, `${label}: its last \`query-check\` run FAILED — the query exited nonzero or was killed, so its stamped count is a fail-closed 0, not a measurement. A query that cannot run is not evidence: fix the QUERY, then re-run \`query-check --record\`.`);
     } else if (q.observed.count < q.expectAtLeast) {
       E(scopeId, `${label}: returned ${q.observed.count} < ${q.expectAtLeast} on its known-positive window (${q.window}) — the query is BLIND to the history it cites; fix the QUERY, not the floor`);
     }
@@ -1418,11 +1423,108 @@ export function evidenceQueryShellProblems(query, { depth = 0 } = {}) {
   return parseEvidenceQuery(query, { depth }).problems;
 }
 
-// Non-empty stdout lines are the match count. A query that errors produces no stdout and so counts 0 —
-// fail-closed, never "no output means clean".
-export function evaluateQueryOutput(stdout, expectAtLeast) {
-  const count = String(stdout ?? "").split("\n").filter((l) => l.trim()).length;
+// ---------------------------------------------------------------------------
+// Counting what an evidence query returned (DER-2783)
+// ---------------------------------------------------------------------------
+// Two independent facts decide whether a query cleared its floor, and BOTH have to be asked. Asking only
+// the second — which is what this gate did until 2026-07-30 — produces a check that cannot fail:
+//
+//   1. DID THE RUN SUCCEED? Only `run.error` was consulted, and spawnSync sets `error` when the shell
+//      cannot be SPAWNED, never when the command it ran exits nonzero. So a query printing three lines
+//      and exiting 1 was stamped `ok`, and `validate` then honoured that blind pass. Worse, the canonical
+//      `git log … | grep -c 'fix('` with ZERO matches exits 1 with stdout `"0\n"` — one non-empty line,
+//      read as `ok 1 >= 1`. A kill criterion that returned zero would have auto-selected "delete the
+//      tool" while the problem recurred, which is the exact 07-28 failure this whole gate exists for.
+//   2. WHAT DID IT COUNT? Line counting is right for a pipeline that emits its matches, and wrong for one
+//      that emits a NUMBER. `grep -c` prints exactly one line whatever the count, so `expectAtLeast >= 2`
+//      was unsatisfiable at 500 matches — while SKILL.md documents that shape with a floor of 6.
+//
+// Fixing only (1) leaves the documented shape broken; fixing only (2) leaves a failed run passing. The
+// SIBLING idiom in `priorart-check`'s `sweep()` is deliberately NOT changed: there `grep` exiting 1 on
+// no-match is the normal signal, and a status-0 rule would fire the rg→grep fallback on every clean sweep
+// and then hard-fail. Same expression, opposite meaning — the family has one member, not two.
+
+// The counting commands whose stdout IS a number rather than the matches themselves, each with the flag
+// that makes it count. Short flags are matched as CLUSTERS (`grep -rc`), long flags exactly. `egrep`/
+// `fgrep` are here because the allowlist carries them and they are `grep` — leaving them out would be the
+// half-changed family this repo's review rules reject.
+const NUMERIC_COUNT_COMMANDS = new Map([
+  ["grep", { letter: "c", long: ["--count"] }],
+  ["egrep", { letter: "c", long: ["--count"] }],
+  ["fgrep", { letter: "c", long: ["--count"] }],
+  ["rg", { letter: "c", long: ["--count", "--count-matches"] }],
+  ["wc", { letter: "l", long: ["--lines"] }],
+]);
+
+// Does this query's LAST stage emit a count rather than the matches? Answered off the shared parse, never
+// off a second regex over the raw string — `parseEvidenceQuery` is the one lexer that already knows what
+// is a word, what is a redirect target and what is inside quotes.
+//
+// `separator` is load-bearing and is the reason this cannot be "the last stage is `wc -l`". It names the
+// operator that JOINED the final stage to the one before it, so only `|` means "this stage consumed what
+// came before": a `;`/`&&`/`||`/newline-joined trailing `wc -l` counted NOTHING the earlier stage
+// produced, and its number is not this query's answer. `null` is the one other legitimate value — it
+// occurs only on a stage that is the whole query (`grep -c 'fix(' CHANGELOG.md`), which counts its own
+// operands and has no upstream to have missed. Note that a query beginning with a bare separator
+// (`| wc -l`) parses to a single stage whose separator is `"|"`, not `null`; it is a shell syntax error
+// that now fails on exit status, which is why this predicate must never be the only gate.
+//
+// Known limit, stated rather than implied: a value that happens to be spelled like the counting flag
+// (`grep -e -c …`) reads as the flag here. It cannot promote anything on its own — numeric mode also
+// requires stdout to be a single bare integer, and matched lines are not that.
+export function queryCountsNumerically(query) {
+  const stages = parseEvidenceQuery(query).stages;
+  const last = stages.at(-1);
+  if (!last?.command) return false;
+  if (!(last.separator === "|" || (last.separator === null && stages.length === 1))) return false;
+  const rule = NUMERIC_COUNT_COMMANDS.get(last.command);
+  if (!rule) return false;
+  for (const w of last.words.slice(1)) {
+    if (w === "--") break; // everything after `--` is an operand, not an option
+    if (rule.long.includes(w)) return true;
+    if (/^-[A-Za-z]+$/.test(w) && w.slice(1).includes(rule.letter)) return true;
+  }
+  return false;
+}
+
+// Non-empty stdout lines are the match count — unless the pipeline ends in a counting command AND the
+// output is a single bare integer, in which case that integer IS the count. BOTH conditions are required:
+// `grep -c` over MULTIPLE files emits `path:count` lines, a per-file breakdown that must never be read as
+// a total. The trim is load-bearing on macOS — BSD `wc -l` right-aligns its number in a padded field, so
+// a strict `/^\d+$/` against raw stdout would leave numeric mode dead for the command most likely to want
+// it. A query that errors produces no stdout and so counts 0 — fail-closed, never "no output means clean".
+export function evaluateQueryOutput(stdout, expectAtLeast, { numeric = false } = {}) {
+  const text = String(stdout ?? "");
+  const bare = text.trim();
+  if (numeric && /^\d+$/.test(bare)) {
+    const count = Number(bare);
+    return { count, ok: count >= expectAtLeast };
+  }
+  const count = text.split("\n").filter((l) => l.trim()).length;
   return { count, ok: count >= expectAtLeast };
+}
+
+// The whole verdict for one spawned query: exit status FIRST, output second. `failed` is carried out of
+// here (and stamped into the plan) so `validate` decides on the run, not merely on the count — a count of
+// 0 is what a failed run is stamped with, and 0 is also a legitimate measurement shape, so the two must
+// not be the same fact.
+export function evaluateQueryRun(run, expectAtLeast, query) {
+  const spawnError = run?.error ?? null;
+  const signal = run?.signal ?? null;
+  const status = run?.status ?? null;
+  if (spawnError || signal || status !== 0) {
+    const why = spawnError ? `the query itself failed to run (${spawnError.message})`
+      : signal ? `the query was killed by ${signal}`
+        : status === null ? `the query reported no exit status`
+          : `the query exited ${status}`;
+    // The remedy is named because the commonest legitimate trigger is a PREDICATE exit, not a crash:
+    // grep exits 1 to say "no match", diff exits 1 to say "they differ". Ending the pipeline in
+    // something that consumes that output turns the predicate back into a count and the status back
+    // into a status — which is the shape the floor was written for anyway.
+    return { count: 0, ok: false, failed: true, failure: `${why} — a run that did not exit 0 is a FAILED run, not a count; counted as 0, fail-closed. (grep/diff exit nonzero to REPORT "no match"/"they differ": if that IS the evidence, end the pipeline in something that consumes it — \`… | wc -l\` — so the exit status means what it says.)` };
+  }
+  const ev = evaluateQueryOutput(run?.stdout, expectAtLeast, { numeric: queryCountsNumerically(query) });
+  return { ...ev, failed: false, failure: null };
 }
 
 export function collectEvidenceQueries(plan, issueId = null) {
@@ -1543,9 +1645,13 @@ export function usage() {
     `        observed). --record folds the observe-the-failure AC into notes, which the brief carries.`,
     `  query-check <plan.json> [id] [--repo-root <p>] [--record] [--out <plan.json>]`,
     `        GROUNDING GATE 2 (refuses in validate). RUNS every evidenceQueries[] entry ({name, query,`,
-    `        window, expectAtLeast} — plan-level or per-issue) and fails any returning fewer non-empty`,
-    `        stdout lines than its known-positive floor. A query that errors counts 0 — fail-closed.`,
-    `        --record stamps observed counts; validate refuses unstamped or failing queries.`,
+    `        window, expectAtLeast} — plan-level or per-issue) and fails any that exits nonzero, is`,
+    `        killed, or returns fewer than its known-positive floor. Exit status is checked FIRST: output`,
+    `        alone is never a pass, so a failed run counts 0 — fail-closed. Counting: a pipeline whose`,
+    `        LAST stage is grep -c / rg -c / wc -l reached by a pipe (or a one-stage query of the same`,
+    `        shape) counts by NUMBER when stdout is a single bare integer; everything else counts`,
+    `        non-empty stdout lines. --record stamps the observed count AND whether the run failed;`,
+    `        validate refuses unstamped, failed and under-floor queries.`,
     `  symbol-check <plan.json> [id] [--repo-root <p>] [--record] [--out <plan.json>]`,
     `        GROUNDING GATE 3 (refuses in validate). Resolves every issues[].symbols[] ({name, from, use?})`,
     `        target as exported / private / not-found. A private call/test target is a RE-SCOPE, not an`,
@@ -1750,9 +1856,11 @@ export async function runSubcommand(argv) {
         const probs = [...evidenceQueryProblems(r.q), ...(r.q?.query?.trim?.() ? evidenceQueryShellProblems(r.q.query) : [])];
         if (probs.length) { failures += 1; lines.push(`🔴 ${label}: ${probs.join(" · ")}`); continue; }
         const run = spawnSync(r.q.query, { shell: true, cwd: repoRoot, encoding: "utf8", timeout: 60_000 });
-        const ev = evaluateQueryOutput(run.error ? "" : run.stdout, r.q.expectAtLeast);
-        r.q.observed = { count: ev.count, at: new Date().toISOString() };
-        if (run.error) { failures += 1; lines.push(`🔴 ${label}: the query itself failed to run (${run.error.message}) — counted as 0, fail-closed`); }
+        // Exit status FIRST — output alone is not a pass. `failed` is stamped alongside the count so
+        // `validate` can refuse a blind pass rather than re-deriving one from a 0 it cannot interpret.
+        const ev = evaluateQueryRun(run, r.q.expectAtLeast, r.q.query);
+        r.q.observed = { count: ev.count, failed: ev.failed, at: new Date().toISOString() };
+        if (ev.failed) { failures += 1; lines.push(`🔴 ${label}: ${ev.failure}`); }
         else if (!ev.ok) { failures += 1; lines.push(`🔴 ${label}: returned ${ev.count} < ${r.q.expectAtLeast} on its known-positive window (${r.q.window}) — the query is BLIND to the history it cites; fix the QUERY, not the floor`); }
         else lines.push(`ok   ${label}: ${ev.count} ≥ ${r.q.expectAtLeast} on ${r.q.window}`);
       }
