@@ -3892,3 +3892,163 @@ test("DER-2737: the allowlist is CONFIG-driven (repo.ownerLogin) and defaults to
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+// ---- DER-2753: direct-merge mode (no merge queue) ----------------------------------------------
+// The harness is now a public skill and MOST adopter repos have no GitHub merge queue. The whole
+// merge path assumed one (`gh pr merge --auto` → native queue, which owns the strategy), so on a
+// queue-less repo the shepherd's enqueue→merge loop has nothing to drive — which is precisely why
+// `/work` cannot currently shepherd THIS repo. Direct mode must reproduce, client-side, the only
+// protection the native queue was providing: never merge a PR that is not `readyVerdict`-ready.
+
+const D2753_READY = { draft: false, threads: 0, onHead: true, checks: "pass", shardsPass: 0, shardsTotal: 0 };
+
+test("DER-2753: mergeMode:direct + a fully-ready PR ⇒ `gh pr merge <n> --squash --delete-branch`, NOT an enqueue", () => {
+  assert.equal(typeof WR.mergeAction, "function", "the queue-vs-direct decision must be a pure, testable seam");
+  const verdict = readyVerdict(D2753_READY);
+  assert.equal(verdict.ready, true, "precondition: this PR passes every gate");
+  const act = WR.mergeAction({ mode: "direct", strategy: "squash", pr: 41, verdict });
+  assert.equal(act.action, "merge");
+  assert.deepEqual(act.args, ["pr", "merge", "41", "--squash", "--delete-branch"]);
+  assert.ok(!act.args.includes("--auto"), "direct mode must never arm the queue's auto-merge");
+  // CONTROL — the ROST-shaped repo that DOES have a queue keeps the old call verbatim: plain
+  // `--auto`, no strategy flag (the queue owns the strategy; see the SKILL.md learning).
+  const q = WR.mergeAction({ mode: "queue", strategy: "squash", pr: 41, verdict });
+  assert.equal(q.action, "enqueue");
+  assert.deepEqual(q.args, ["pr", "merge", "41", "--auto"]);
+});
+
+test("DER-2753: mergeMode:direct + an unready PR ⇒ NO merge call (the gate can return the blocking answer)", () => {
+  const cases = [
+    ["open thread", { ...D2753_READY, threads: 1 }, /1 unresolved thread/],
+    ["throttled thread read", { ...D2753_READY, threads: null }, /UNKNOWN/],
+    ["red check", { ...D2753_READY, checks: "fail" }, /checks=fail/],
+    ["draft", { ...D2753_READY, draft: true }, /draft/],
+    ["codex behind head", { ...D2753_READY, onHead: false }, /codex not on head/],
+    ["stale-dirty gate", { ...D2753_READY, gate: gateEvidenceVerdict({ head: "a".repeat(40), gate: { sha: "b".repeat(40), blockers: 1 } }) }, /STALE/],
+  ];
+  for (const [label, inputs, whyRe] of cases) {
+    const verdict = readyVerdict(inputs);
+    assert.equal(verdict.ready, false, `precondition (${label}): not ready`);
+    const act = WR.mergeAction({ mode: "direct", strategy: "squash", pr: 41, verdict });
+    assert.equal(act.action, "hold", `${label}: direct mode must not merge`);
+    assert.equal(act.args, null, `${label}: no argv means no merge call is possible`);
+    assert.match(act.why, whyRe, `${label}: the hold must name the failing gate`);
+  }
+});
+
+test("DER-2753: allowMergeWithoutChecks defaults FALSE — no CI ⇒ no merge; opt-in merges on the remaining gates", () => {
+  const noCi = { ...D2753_READY, checks: null }; // a public repo with zero required checks
+  const closed = readyVerdict(noCi);
+  assert.equal(closed.ready, false, "default must fail CLOSED on UNKNOWN checks");
+  assert.match(closed.why, /checks=UNKNOWN/);
+  assert.equal(WR.mergeAction({ mode: "direct", pr: 7, verdict: closed }).action, "hold");
+  // Opt-in: an adopter with no CI at all can still merge on draft/threads/codex/gate evidence.
+  const open = readyVerdict({ ...noCi, allowMergeWithoutChecks: true });
+  assert.equal(open.ready, true, "the explicit opt-in must actually unblock");
+  assert.match(open.why, /allowMergeWithoutChecks/, "the loosening must be named in the verdict — it is auditable");
+  assert.equal(WR.mergeAction({ mode: "direct", pr: 7, verdict: open }).action, "merge");
+  // CONTROL — the loosening covers ONLY an ABSENT check surface. A RED or PENDING check still blocks
+  // with the opt-in on, or `allowMergeWithoutChecks` would silently become "ignore CI".
+  for (const bad of ["fail", "pending"]) {
+    const v = readyVerdict({ ...D2753_READY, checks: bad, allowMergeWithoutChecks: true });
+    assert.equal(v.ready, false, `checks=${bad} must block even with allowMergeWithoutChecks:true`);
+    assert.equal(WR.mergeAction({ mode: "direct", pr: 7, verdict: v }).action, "hold");
+  }
+  // And the other gates are untouched by the opt-in.
+  assert.equal(readyVerdict({ ...noCi, threads: 2, allowMergeWithoutChecks: true }).ready, false);
+});
+
+test("DER-2753: an UNRESOLVED merge mode holds and names the config key (fail closed, don't guess)", () => {
+  const verdict = readyVerdict(D2753_READY);
+  for (const mode of [null, undefined, "", "auto", "queue-ish"]) {
+    const act = WR.mergeAction({ mode, pr: 3, verdict });
+    assert.equal(act.action, "hold", `mode=${JSON.stringify(mode)} must not merge`);
+    assert.equal(act.args, null);
+    assert.match(act.why, /repo\.mergeMode/, "the error must say what to configure");
+  }
+  // A bogus strategy is also a configuration error, not a silent fallback to squash.
+  const bogus = WR.mergeAction({ mode: "direct", strategy: "octopus", pr: 3, verdict });
+  assert.equal(bogus.action, "hold");
+  assert.match(bogus.why, /repo\.mergeStrategy/);
+});
+
+test("DER-2753: queue presence is auto-detected, and an UNDETECTABLE queue never becomes a direct merge", () => {
+  assert.equal(typeof WR.parseMergeQueueProbe, "function");
+  assert.equal(WR.parseMergeQueueProbe({ exitCode: 0, stdout: "MDE4Ok1lcmdlUXVldWUx\n" }), true);
+  assert.equal(WR.parseMergeQueueProbe({ exitCode: 0, stdout: "null\n" }), false);
+  assert.equal(WR.parseMergeQueueProbe({ exitCode: 0, stdout: "\n" }), false);
+  assert.equal(WR.parseMergeQueueProbe({ exitCode: 1, stdout: "" }), null, "a failed probe is UNKNOWN, never `no queue`");
+
+  assert.equal(typeof WR.resolveMergeMode, "function");
+  // Explicit config always wins over the probe.
+  assert.equal(WR.resolveMergeMode({ configured: "direct", queueDetected: true }).mode, "direct");
+  assert.equal(WR.resolveMergeMode({ configured: "queue", queueDetected: false }).mode, "queue");
+  // Auto-detect.
+  assert.equal(WR.resolveMergeMode({ configured: null, queueDetected: false }).mode, "direct");
+  assert.equal(WR.resolveMergeMode({ configured: null, queueDetected: true }).mode, "queue");
+  assert.equal(WR.resolveMergeMode({ configured: null, queueDetected: false }).source, "detected");
+  // The probe failed and nothing is configured: refuse to resolve. Guessing `direct` here would merge
+  // on a repo whose queue we simply could not see.
+  const un = WR.resolveMergeMode({ configured: null, queueDetected: null });
+  assert.equal(un.mode, null);
+  assert.match(un.why, /repo\.mergeMode/);
+  assert.equal(WR.mergeAction({ mode: un.mode, pr: 9, verdict: readyVerdict(D2753_READY) }).action, "hold");
+  // A garbage configured value is rejected rather than coerced.
+  assert.equal(WR.resolveMergeMode({ configured: "DIRECT-ISH", queueDetected: true }).mode, null);
+});
+
+test("DER-2753: `ready` reports the mode-correct verdict word and the exact command to run", () => {
+  assert.equal(typeof WR.readyLine, "function", "the ready line must be a pure seam so its wording is testable");
+  const base = { pr: 12, head: "c".repeat(40), draft: false, threads: 0, onHead: true, checks: "pass", shards: "0/0", behind: 0, gate: "current", gateLabel: "gate=CURRENT" };
+  const verdict = readyVerdict(D2753_READY);
+  const direct = WR.readyLine({ ...base, ...verdict, mergeAction: WR.mergeAction({ mode: "direct", pr: 12, verdict }) });
+  assert.match(direct, /\*\*\* MERGEABLE \(direct\) \*\*\*/, "an adopter with no queue must not be told to ENQUEUE");
+  assert.match(direct, /gh pr merge 12 --squash --delete-branch/, "print the command, so the shepherd cannot invent one");
+  const queued = WR.readyLine({ ...base, ...verdict, mergeAction: WR.mergeAction({ mode: "queue", pr: 12, verdict }) });
+  assert.match(queued, /\*\*\* ENQUEUEABLE \*\*\*/);
+  assert.match(queued, /gh pr merge 12 --auto/);
+  // Not ready ⇒ neither word appears, in EITHER mode. This is the string the shepherd greps.
+  for (const mode of ["direct", "queue"]) {
+    const bad = readyVerdict({ ...D2753_READY, threads: 3 });
+    const line = WR.readyLine({ ...base, ...bad, mergeAction: WR.mergeAction({ mode, pr: 12, verdict: bad }) });
+    assert.doesNotMatch(line, /MERGEABLE|ENQUEUEABLE/, `${mode}: an unready PR must show no go-ahead word`);
+    assert.match(line, /hold \(3 unresolved thread/);
+  }
+});
+
+test("DER-2753: the merge policy is CONFIG-driven and resets to the conservative default", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "wr-d2753-"));
+  try {
+    assert.equal(typeof WR.getMergePolicy, "function");
+    await applyRepoConfig(join(dir, "no-config-here"));
+    assert.deepEqual(WR.getMergePolicy(), { mergeMode: null, mergeStrategy: "squash", allowMergeWithoutChecks: false },
+      "no config ⇒ mode unresolved (auto-detect), squash, and NO merging without checks");
+    await mkdir(join(dir, ".claude"), { recursive: true });
+    await writeFile(join(dir, ".claude", "work.config.json"), JSON.stringify({
+      repo: { repoSlug: "someone/public-repo", mergeMode: "direct", mergeStrategy: "rebase", allowMergeWithoutChecks: true },
+    }), "utf8");
+    await applyRepoConfig(dir);
+    assert.deepEqual(WR.getMergePolicy(), { mergeMode: "direct", mergeStrategy: "rebase", allowMergeWithoutChecks: true });
+    assert.equal(getRepoIdentity().repoSlug, "someone/public-repo", "the merge keys must not disturb repo identity");
+    const act = WR.mergeAction({ mode: "direct", strategy: WR.getMergePolicy().mergeStrategy, pr: 55, verdict: readyVerdict(D2753_READY) });
+    assert.deepEqual(act.args, ["pr", "merge", "55", "--rebase", "--delete-branch"]);
+    // A garbage config value must not be adopted — it stays at the safe default rather than reaching
+    // `gh` as an invalid flag mid-merge.
+    await writeFile(join(dir, ".claude", "work.config.json"), JSON.stringify({
+      repo: { mergeMode: "yolo", mergeStrategy: 7, allowMergeWithoutChecks: "yes" },
+    }), "utf8");
+    await applyRepoConfig(dir);
+    assert.deepEqual(WR.getMergePolicy(), { mergeMode: null, mergeStrategy: "squash", allowMergeWithoutChecks: false });
+  } finally {
+    await applyRepoConfig("/nonexistent-reset");
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("DER-2753: work.config.example.json documents every new merge key (it is the only adopter doc)", async () => {
+  const example = JSON.parse(await readFile(new URL("./work.config.example.json", import.meta.url), "utf8"));
+  for (const k of ["mergeMode", "mergeStrategy", "allowMergeWithoutChecks"]) {
+    assert.ok(k in example.repo, `work.config.example.json repo.${k} is undocumented`);
+  }
+  assert.equal(example.repo.allowMergeWithoutChecks, false, "the shipped example must show the conservative default");
+});

@@ -1085,15 +1085,98 @@ export function latestGateEvent(events, issueId) {
   return out;
 }
 
-export function readyVerdict({ draft, threads, onHead, checks, shardsPass, shardsTotal, gate } = {}) {
+// DER-2753 `allowMergeWithoutChecks`: a PUBLIC adopter repo often has NO required checks at all, so
+// `gh pr checks` reports nothing, `checks` reads UNKNOWN, and this verdict never passes — which in
+// direct-merge mode means the shepherd can never merge anything. The opt-in loosens EXACTLY that one
+// case (an ABSENT check surface) and nothing else: a `fail` or `pending` check still blocks with the
+// flag on, or the key would quietly mean "ignore CI". Default false — the loosening is the adopter's
+// explicit, written decision, and the verdict says so out loud so it stays auditable in the run log.
+export function readyVerdict({ draft, threads, onHead, checks, shardsPass, shardsTotal, gate, allowMergeWithoutChecks = false } = {}) {
   if (draft !== false) return { ready: false, why: "draft" };
   if (threads !== 0) return { ready: false, why: threads == null || Number.isNaN(threads) ? "threads UNKNOWN (throttled — never treat as 0)" : `${threads} unresolved thread(s)` };
   if (!onHead) return { ready: false, why: "codex not on head" };
-  if (checks !== "pass") return { ready: false, why: `checks=${checks ?? "UNKNOWN"}` };
+  const checksAbsent = checks == null || checks === "";
+  const checksWaived = checksAbsent && allowMergeWithoutChecks === true;
+  if (checks !== "pass" && !checksWaived) return { ready: false, why: `checks=${checks ?? "UNKNOWN"}` };
   if (shardsTotal > 0 && shardsPass !== shardsTotal) return { ready: false, why: `db shards ${shardsPass}/${shardsTotal}` };
   if (shardsPass > shardsTotal) return { ready: false, why: "INCONSISTENT shard read — re-run" };
   if (gate?.blocks) return { ready: false, why: gate.label };
-  return { ready: true, why: "all gates pass" };
+  return { ready: true, why: checksWaived ? "all gates pass (checks UNKNOWN — WAIVED by repo.allowMergeWithoutChecks)" : "all gates pass" };
+}
+
+// ── Merge mode: queue vs direct (DER-2753) ──────────────────────────────────────────────────────
+// The harness grew up on a repo with a native GitHub merge queue, and the queue is what ENFORCED
+// "don't merge until green + threads resolved" — the harness only had to arm `gh pr merge --auto`
+// and let the queue own the strategy. MOST public adopters have no queue, so `--auto` either means
+// something different or there is no enqueue→merge loop to drive at all. That is why `/work` could
+// not shepherd this very repo. Direct mode moves the queue's protection client-side: the SAME
+// `readyVerdict` is the only thing that authorizes a merge, and the argv is produced by a pure
+// function so a test can assert the exact call instead of trusting prose in a SKILL.
+const MERGE_STRATEGIES = new Set(["squash", "merge", "rebase"]);
+const MERGE_MODES = new Set(["queue", "direct"]);
+
+// GraphQL `repository.mergeQueue(branch:)` is non-null exactly when a queue is configured for that
+// branch. A FAILED probe (no auth, throttled, older gh) is UNKNOWN — never "no queue", because
+// "no queue" is the answer that unlocks a real merge.
+export function parseMergeQueueProbe({ exitCode, stdout } = {}) {
+  if (exitCode !== 0) return null;
+  const v = String(stdout ?? "").trim();
+  if (!v || v === "null") return false;
+  return true;
+}
+
+// Config wins; otherwise the probe decides. An unresolvable mode stays NULL and mergeAction holds —
+// defaulting to `direct` here would merge on a repo whose queue we merely failed to see, and
+// defaulting to `queue` would arm `--auto` on a repo that has no queue to catch it.
+export function resolveMergeMode({ configured = null, queueDetected = null } = {}) {
+  if (configured != null && configured !== "") {
+    if (MERGE_MODES.has(configured)) return { mode: configured, source: "config", why: `repo.mergeMode=${configured}` };
+    return { mode: null, source: "config", why: `repo.mergeMode=${JSON.stringify(configured)} is not "queue" or "direct" — fix .claude/work.config.json` };
+  }
+  if (queueDetected === true) return { mode: "queue", source: "detected", why: "a merge queue is configured on the default branch" };
+  if (queueDetected === false) return { mode: "direct", source: "detected", why: "no merge queue on the default branch" };
+  return {
+    mode: null,
+    source: "unresolved",
+    why: "could not detect whether this repo has a merge queue — set repo.mergeMode to \"queue\" or \"direct\" in .claude/work.config.json",
+  };
+}
+
+// The single decision point for "what do I run to land this PR". Returns argv (for `gh`) or null.
+// `hold` with `args: null` is the fail-closed answer: with no argv there is no merge call to make.
+export function mergeAction({ mode, strategy = "squash", pr, verdict, deleteBranch = true } = {}) {
+  if (!verdict?.ready) return { action: "hold", args: null, why: verdict?.why ?? "no ready verdict — run `ready` first" };
+  if (!MERGE_MODES.has(mode)) {
+    return {
+      action: "hold",
+      args: null,
+      why: `merge mode unresolved (${mode == null || mode === "" ? "unset" : JSON.stringify(mode)}) — set repo.mergeMode to "queue" or "direct" in .claude/work.config.json`,
+    };
+  }
+  if (mode === "queue") {
+    // Verbatim the pre-DER-2753 call: plain `--auto`, NO strategy flag. The native queue owns the
+    // strategy and passing one is the documented mistake.
+    return { action: "enqueue", args: ["pr", "merge", String(pr), "--auto"], why: "native merge queue owns the strategy" };
+  }
+  if (!MERGE_STRATEGIES.has(strategy)) {
+    return { action: "hold", args: null, why: `repo.mergeStrategy=${JSON.stringify(strategy)} is not "squash", "merge" or "rebase" — fix .claude/work.config.json` };
+  }
+  const args = ["pr", "merge", String(pr), `--${strategy}`];
+  if (deleteBranch) args.push("--delete-branch");
+  return { action: "merge", args, why: `direct merge (${strategy}) — every readyVerdict gate passed` };
+}
+
+// One `ready` result → one operator/shepherd line. Extracted so the GO-AHEAD WORD is testable: the
+// shepherd greps this output, and telling a queue-less adopter to "ENQUEUE" is an instruction they
+// cannot carry out. An unready PR shows NEITHER word, in either mode.
+export function readyLine(r = {}) {
+  const act = r.mergeAction ?? null;
+  let tail;
+  if (!r.ready) tail = `hold (${r.why})`;
+  else if (act?.action === "merge") tail = `*** MERGEABLE (direct) *** → gh ${act.args.join(" ")}`;
+  else if (act?.action === "enqueue") tail = `*** ENQUEUEABLE *** → gh ${act.args.join(" ")}`;
+  else tail = `hold (gates pass but ${act?.why ?? "no merge mode resolved"})`;
+  return `#${r.pr} head=${(r.head ?? "?").slice(0, 10)} draft=${r.draft} thr=${r.threads ?? "UNKNOWN"} codex-on-head=${r.onHead ? "YES" : "NO"} (rev=${(r.reviewSha ?? "").slice(0, 10)} cmt=${(r.commentSha ?? "").slice(0, 10)}) checks=${r.checks ?? "?"} shards=${r.shards} behind-main=${r.behind ?? "?"}${r.behind > 0 ? " ⚠" : ""} push=${r.push ?? "?"} ${r.gateLabel}  ${tail}${r.note ?? ""}`;
 }
 
 export function scoreReviewFidelity({ local = [], cloud = [], slack = 25 } = {}) {
@@ -2017,6 +2100,13 @@ const COLLISION_DEFAULTS = {
 const REPO_IDENTITY_DEFAULT = { repoSlug: null, ownerLogin: null, repoPath: null, dbImageAssetId: null, envFile: ".env" };
 let REPO_IDENTITY = { ...REPO_IDENTITY_DEFAULT };
 export function getRepoIdentity() { return REPO_IDENTITY; }
+// How this repo lands PRs (DER-2753). Lives under `repo` in the config because it is a property of the
+// repo, not of the run. Deliberately conservative all three ways: mergeMode null means "auto-detect,
+// and refuse to guess if the probe fails"; squash is the least surprising strategy; and
+// allowMergeWithoutChecks false keeps a repo with no CI un-mergeable until an adopter opts in.
+const MERGE_POLICY_DEFAULT = { mergeMode: null, mergeStrategy: "squash", allowMergeWithoutChecks: false };
+let MERGE_POLICY = { ...MERGE_POLICY_DEFAULT };
+export function getMergePolicy() { return MERGE_POLICY; }
 let VERSION_HOLDER_PREFIXES = [...COLLISION_DEFAULTS.versionHolderPrefixes];
 let VERSION_HOLDER_FILES = new Set(COLLISION_DEFAULTS.versionHolderFiles);
 let SERIALIZED_FILES = new Set(COLLISION_DEFAULTS.serializedFiles);
@@ -3607,6 +3697,7 @@ export async function applyRepoConfig(repoRoot) {
   BUDGET = { ...BUDGET_DEFAULT };
   MODEL_PRICES = { ...MODEL_PRICES_DEFAULT };
   REPO_IDENTITY = { ...REPO_IDENTITY_DEFAULT };
+  MERGE_POLICY = { ...MERGE_POLICY_DEFAULT };
   LEGACY_EVENT_MARKER = null;
   LEGACY_HANDOFF_MARKER = null;
   TRUSTED_COMMENT_AUTHORS_EXTRA = [];
@@ -3642,6 +3733,12 @@ export async function applyRepoConfig(repoRoot) {
     for (const k of Object.keys(REPO_IDENTITY_DEFAULT)) {
       if (typeof cfg.repo[k] === "string" && cfg.repo[k]) REPO_IDENTITY[k] = cfg.repo[k];
     }
+    // Merge policy (DER-2753) — validated HERE, not at the merge call. A bad value must not reach `gh`
+    // as an invalid flag halfway through landing a PR; an unrecognized one keeps the safe default.
+    if (MERGE_MODES.has(cfg.repo.mergeMode)) MERGE_POLICY.mergeMode = cfg.repo.mergeMode;
+    if (MERGE_STRATEGIES.has(cfg.repo.mergeStrategy)) MERGE_POLICY.mergeStrategy = cfg.repo.mergeStrategy;
+    // Strict `=== true`: a truthy string like "no" must NOT loosen a merge gate.
+    if (cfg.repo.allowMergeWithoutChecks === true) MERGE_POLICY.allowMergeWithoutChecks = true;
   }
   // Extra logins whose PR comments may be folded as lifecycle events (DER-2737) — a second maintainer,
   // or a bot that posts on the harness's behalf. `repo.ownerLogin` is trusted automatically.
@@ -3713,6 +3810,12 @@ export async function runSubcommand(argv) {
       // passes forceHost/preferHosts to pickHost each dispatch.
       if (o.host) started.forceHost = o.host;
       if (o.prefer) started.preferHosts = [o.prefer];
+      // DER-2753 — record how this run intends to land PRs, so a merge is auditable against a run-start
+      // declaration rather than whatever the config happened to say at merge time. `"auto"` means the
+      // mode is detected per `ready` call (there is no queue probe here: init-run makes no network calls,
+      // and a probe that silently no-ops in an unauthenticated shell is worse than an honest "auto").
+      started.mergeMode = getMergePolicy().mergeMode ?? "auto";
+      if (getMergePolicy().allowMergeWithoutChecks) started.allowMergeWithoutChecks = true;
       // Run plan from /prep-for-work (2026-07-25): every subsequent `write-brief` reads the issue's
       // ASSIGNED budget from here, so the lead's plan_scope is checked rather than self-graded.
       // Validate it NOW — an invalid plan must fail at init, not silently at the first dispatch.
@@ -4568,6 +4671,20 @@ export async function runSubcommand(argv) {
         prNums = Object.values(readyState.issues).filter((v) => v.pr != null && ACTIVE_STATUSES.has(v.status)).map((v) => v.pr);
       }
       if (!prNums.length) throw new Error("ready: no PR numbers given and none open in the run ledger");
+      // DER-2753 — resolve the merge mode ONCE for the whole invocation. On a queue-less adopter repo
+      // the go-ahead is a direct `gh pr merge`, and the SAME readyVerdict below is the only thing that
+      // authorizes it: the native queue's "green + threads resolved" enforcement, moved client-side.
+      const mergePolicy = getMergePolicy();
+      let queueDetected = null;
+      if (!mergePolicy.mergeMode) {
+        const [qOwner, qName] = slug.split("/");
+        const defRes = await runCommand({ command: "gh", args: ["repo", "view", "--json", "defaultBranchRef", "-q", ".defaultBranchRef.name"], cwd: repoRootReady });
+        const defBranch = String(defRes.stdout ?? "").trim() || "main";
+        const mqQuery = `{repository(owner:"${qOwner}",name:"${qName}"){mergeQueue(branch:"${defBranch}"){id}}}`;
+        const mqRes = await runCommand({ command: "gh", args: ["api", "graphql", "-f", `query=${mqQuery}`, "-q", ".data.repository.mergeQueue.id"], cwd: repoRootReady });
+        queueDetected = parseMergeQueueProbe({ exitCode: mqRes.exitCode, stdout: mqRes.stdout });
+      }
+      const resolvedMode = resolveMergeMode({ configured: mergePolicy.mergeMode, queueDetected });
       const results = [];
       for (const n of prNums) {
         const vRes = await runCommand({ command: "gh", args: ["pr", "view", String(n), "--repo", slug, "--json", "isDraft,headRefOid,commits"], cwd: repoRootReady });
@@ -4614,13 +4731,16 @@ export async function runSubcommand(argv) {
         }
         // DER-2588: does this PR's OWN local gate evidence cover the tree that would merge?
         const gate = gateEvidenceVerdict({ head, gate: latestGateEvent(readyEvents, issueByPr.get(n)) });
-        const verdict = readyVerdict({ draft, threads, onHead, checks: chk.checks, shardsPass: chk.shardsPass, shardsTotal: chk.shardsTotal, gate });
-        results.push({ pr: n, head, draft, threads, onHead, reviewSha, commentSha, checks: chk.checks, shards: `${chk.shardsPass}/${chk.shardsTotal}`, behind, push, gate: gate.state, gateLabel: gate.label, ...verdict, note });
+        const verdict = readyVerdict({
+          draft, threads, onHead, checks: chk.checks, shardsPass: chk.shardsPass, shardsTotal: chk.shardsTotal, gate,
+          allowMergeWithoutChecks: mergePolicy.allowMergeWithoutChecks,
+        });
+        const action = mergeAction({ mode: resolvedMode.mode, strategy: mergePolicy.mergeStrategy, pr: n, verdict });
+        results.push({ pr: n, head, draft, threads, onHead, reviewSha, commentSha, checks: chk.checks, shards: `${chk.shardsPass}/${chk.shardsTotal}`, behind, push, gate: gate.state, gateLabel: gate.label, ...verdict, note, mergeMode: resolvedMode.mode, mergeModeSource: resolvedMode.source, mergeAction: action });
       }
-      const text = results.map((r) =>
-        `#${r.pr} head=${(r.head ?? "?").slice(0, 10)} draft=${r.draft} thr=${r.threads ?? "UNKNOWN"} codex-on-head=${r.onHead ? "YES" : "NO"} (rev=${(r.reviewSha ?? "").slice(0, 10)} cmt=${(r.commentSha ?? "").slice(0, 10)}) checks=${r.checks ?? "?"} shards=${r.shards} behind-main=${r.behind ?? "?"}${r.behind > 0 ? " ⚠" : ""} push=${r.push ?? "?"} ${r.gateLabel}  ${r.ready ? "*** ENQUEUEABLE ***" : `hold (${r.why})`}${r.note}`,
-      ).join("\n");
-      return { results, stdout: o.json ? JSON.stringify(results) : text };
+      const header = `merge mode: ${resolvedMode.mode ?? "UNRESOLVED"} (${resolvedMode.source}) — ${resolvedMode.why}${mergePolicy.allowMergeWithoutChecks ? "  [repo.allowMergeWithoutChecks=true: an ABSENT check surface is waived; a red/pending check still blocks]" : ""}`;
+      const text = [header, ...results.map((r) => readyLine(r))].join("\n");
+      return { results, mergeMode: resolvedMode.mode, stdout: o.json ? JSON.stringify(results) : text };
     }
     case "preflight": {
       // Test the HARNESS before trusting it with a run (operator ask 2026-07-26). The unit suite
@@ -4657,6 +4777,26 @@ export async function runSubcommand(argv) {
         add("gh-identity", ok, login
           ? `active: ${login}${expected && login !== expected ? ` — MUST be ${expected} (gh auth switch --user ${expected})` : (expected ? "" : " (no repo.ownerLogin configured — not asserted)")}`
           : "gh api user failed");
+      }
+      // 3b. Merge mode (DER-2753) — the run cannot land ANY PR if the harness can neither read a
+      // configured mode nor see whether a queue exists, and that is worth knowing at preflight rather
+      // than at 3am on the first ready PR. This check CAN return the failing answer: an unauthenticated
+      // gh or a repo we cannot resolve leaves the mode UNRESOLVED and reds it.
+      {
+        const policy = getMergePolicy();
+        let queueDetected = null;
+        if (!policy.mergeMode) {
+          const slugRes = await runCommand({ command: "gh", args: ["repo", "view", "--json", "nameWithOwner,defaultBranchRef", "-q", '"\\(.nameWithOwner)\\t\\(.defaultBranchRef.name)"'], timeoutMs: 15000 }).catch(() => ({ exitCode: 1, stdout: "" }));
+          const [nwo, branch] = String(slugRes.stdout ?? "").trim().split("\t");
+          if (slugRes.exitCode === 0 && nwo && nwo.includes("/")) {
+            const [ow, nm] = nwo.split("/");
+            const q = `{repository(owner:"${ow}",name:"${nm}"){mergeQueue(branch:"${branch || "main"}"){id}}}`;
+            const mq = await runCommand({ command: "gh", args: ["api", "graphql", "-f", `query=${q}`, "-q", ".data.repository.mergeQueue.id"], timeoutMs: 15000 }).catch(() => ({ exitCode: 1, stdout: "" }));
+            queueDetected = parseMergeQueueProbe({ exitCode: mq.exitCode, stdout: mq.stdout });
+          }
+        }
+        const resolved = resolveMergeMode({ configured: policy.mergeMode, queueDetected });
+        add("merge-mode", resolved.mode != null, `${resolved.mode ?? "UNRESOLVED"} (${resolved.source}) — ${resolved.why}${resolved.mode === "direct" ? `; strategy=${policy.mergeStrategy}, allowMergeWithoutChecks=${policy.allowMergeWithoutChecks}` : ""}`);
       }
       // 4. Disk headroom — the cmux freeze had the data volume at 99% + 11 GB swapped.
       {
@@ -4944,9 +5084,13 @@ axis (they are not kickback rounds) and are capped at ${ROTATION_CAP} — the ne
 Design: the README's context-rotation section.
 
   reap --run <r> <DER-id>                     git worktree remove + close EVERY workspace the issue ever had
-  ready --run <r> [PR…] [--json]              per-PR enqueue gate (H5): BOTH Codex surfaces author-filtered, checks
+  ready --run <r> [PR…] [--json]              per-PR merge gate (H5): BOTH Codex surfaces author-filtered, checks
                                               captured once, throttled-null threads = UNKNOWN never 0, cancelled-run
-                                              note, behind-main column (CI tests the MERGE tree — H11)
+                                              note, behind-main column (CI tests the MERGE tree — H11). Resolves the
+                                              merge mode once (repo.mergeMode, else a queue probe) and prints the exact
+                                              command: *** ENQUEUEABLE *** → gh pr merge <n> --auto on a queue repo,
+                                              *** MERGEABLE (direct) *** → gh pr merge <n> --<strategy> --delete-branch
+                                              on a queue-less one. No go-ahead word ⇒ do not land the PR (DER-2753)
   preflight [--skip-probes]                   test the DEPLOYED harness before a run: unit suite, cmux, gh identity,
                                               disk, transcript persistence, telemetry hooks, skills sync per host,
                                               stale runner copies, 1-token Claude probe per account, codex gate probe.

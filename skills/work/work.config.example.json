@@ -2,12 +2,18 @@
   "//": "Copy to <your-repo>/.claude/work.config.json and edit. Every key is OPTIONAL — the harness runs single-host, local-only, with no repo identity if this file is absent. Keys marked REQUIRED-FOR are only needed for the feature named.",
 
   "//repo": "REQUIRED-FOR cloud leads and the preflight identity check. These five values used to be hardcoded in work-runner.mjs; that is what made the harness un-shareable.",
+  "//repo.mergeMode": "How the shepherd lands a PR (DER-2753). \"queue\" = arm the native GitHub merge queue with `gh pr merge <n> --auto` and let the queue own the strategy. \"direct\" = the shepherd merges itself with `gh pr merge <n> --<mergeStrategy> --delete-branch` — for the MAJORITY of repos, which have no merge queue. OMIT the key to auto-detect once per `ready` call (GraphQL repository.mergeQueue on the default branch). If the probe cannot answer, the mode stays UNRESOLVED and NOTHING is merged — set it explicitly rather than let the harness guess. In direct mode the harness reproduces client-side the only protection the queue was giving you: it merges ONLY when `ready` passes every gate (not draft, 0 unresolved threads, Codex on head, checks pass, gate evidence current).",
+  "//repo.mergeStrategy": "direct mode only: \"squash\" (default) | \"merge\" | \"rebase\". Ignored in queue mode, where passing a strategy is a documented mistake.",
+  "//repo.allowMergeWithoutChecks": "A LOOSENING — default false, leave it false if you have any CI. A public repo with NO required checks reports no check surface at all, so `ready` reads checks=UNKNOWN and, fail-closed, never lets anything merge. Set true to merge on the remaining gates (draft / threads / Codex-on-head / gate evidence) when there is genuinely no CI to wait for. It waives ONLY an ABSENT check surface: a red or pending check still blocks the merge with this on. The waiver is printed in the `ready` verdict and recorded on `run_started`, so it stays auditable.",
   "repo": {
     "repoSlug": "your-org/your-repo",
     "ownerLogin": "your-github-login",
     "repoPath": "$HOME/your-repo",
     "envFile": ".env",
-    "dbImageAssetId": null
+    "dbImageAssetId": null,
+    "mergeMode": "direct",
+    "mergeStrategy": "squash",
+    "allowMergeWithoutChecks": false
   },
 
   "//trustedCommentAuthors": "SECURITY (DER-2737). PR comments are how a CLOUD lead reports lifecycle events (WORK-EVENT / WORK-HANDOFF), and the fold treats them as privileged ledger input — so it accepts them ONLY from these logins, plus `repo.ownerLogin` and known harness bots. Deny-by-default: with no `repo.ownerLogin` configured, NO human login is trusted and comment folding is off. Add a second maintainer or a bot that posts on the harness's behalf here. Anyone who can comment on any open PR in the repo can otherwise write your ledger.",
