@@ -3846,7 +3846,12 @@ async function readHeldFragmentFor(runDir, host) {
   }
   try {
     const rec = JSON.parse(raw);
-    if (rec && typeof rec === "object" && !Array.isArray(rec)) return rec;
+    // PARSING is not the bar — AGEING is (Codex round 2, #3: `{}` parsed fine, so it slipped past as a
+    // valid record and reported `{bytes: null, first_seen_at: null}` with no `unreadable` flag, which
+    // reads as a hold in good standing). `readHeldFragments` sets the same rule for the family: a record
+    // it cannot date is stale. A hold whose `first_seen_at` will not parse is one we cannot vouch for.
+    if (rec && typeof rec === "object" && !Array.isArray(rec)
+      && Number.isFinite(Date.parse(String(rec.first_seen_at ?? "")))) return rec;
   } catch { /* malformed ⇒ unreadable, below */ }
   return { unreadable: true, bytes: null, first_seen_at: null, stale: true };
 }
@@ -5873,7 +5878,15 @@ async function readCursor(runDir, host) {
 // now the only place that constructs it, so it is the only place that has to be right. `cursor` is
 // arithmetic on a parsed integer and is not interpolated as text.
 function remoteLedgerTailCommand(remotePath, cursor) {
-  return `tail -n +${cursor + 1} ${shellQuote(String(remotePath))}`;
+  const path = String(remotePath);
+  // A leading `~/` is left OUTSIDE the quotes so the remote shell still expands it (Codex round 2, #1:
+  // quoting the whole string turned a `ledgerRoot: "~/work-ledger"` into a literal path and would have
+  // failed every pull on such a host). Everything after it is quoted, so the space/metacharacter fix
+  // holds. No config in this repo uses a `~` root today — this exists so the tightening cannot silently
+  // break one that does.
+  const tilde = path.startsWith("~/");
+  const quoted = tilde ? `~/${shellQuote(path.slice(2))}` : shellQuote(path);
+  return `tail -n +${cursor + 1} ${quoted}`;
 }
 
 async function pullHostInto(runDir, hostName, runId) {
@@ -8372,13 +8385,29 @@ export async function runSubcommand(argv) {
       const pullFailures = new Map();
       for (;;) {
         if ((pullHostNames.length || reconcileMerged || reconcilePrEvents) && Date.now() - lastSideEffect >= PULL_INTERVAL_MS) {
+          // Which hosts this run actually EXPECTS a ledger from. `--pull-hosts auto` selects every
+          // ENABLED host, which is not the same set: a run that dispatched everything locally still polls
+          // an enabled `mini` whose ledger has never existed, and reporting that forever would put a
+          // permanent false alert on every wake (Codex round 2, #2). A banner that is always on is one
+          // operators learn to skim, which is how the signal added above would destroy itself.
+          const dispatchedTo = new Set(
+            (await readEvents(runDir)).filter((e) => e.type === "lead_spawned" && e.host).map((e) => e.host),
+          );
           for (const h of pullHostNames) {
             try {
               const pulled = await pullHostInto(runDir, h, o.runId);
-              if (pulled?.pull_failed) pullFailures.set(h, pulled.pull_error || `exit ${pulled.exitCode ?? "?"}`);
+              if (!pulled?.pull_failed) { pullFailures.delete(h); continue; }
+              // Surface only with positive evidence that a readable ledger should exist: we have read
+              // from this host before (a cursor past 0, or a held fragment), or the run dispatched a lead
+              // there. Otherwise the failure is indistinguishable from "that host has not started yet",
+              // which is a routine race and not news. Note the evidence is MONOTONIC — once either holds
+              // it keeps holding — so a genuine failure cannot be suppressed after the first real read.
+              const everRead = (pulled.cursor ?? 0) > 0 || pulled.held != null;
+              if (everRead || dispatchedTo.has(h)) pullFailures.set(h, pulled.pull_error || `exit ${pulled.exitCode ?? "?"}`);
               else pullFailures.delete(h);
             } catch (err) {
               // A throw is also "the pull did not happen" — it must not be quieter than a nonzero exit.
+              // Unconditional: a throw is a harness/ssh fault, never the not-started-yet race above.
               pullFailures.set(h, String(err?.message ?? err));
             }
           }

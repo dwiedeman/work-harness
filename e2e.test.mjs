@@ -675,6 +675,7 @@ async function newPullHostRun(t, { remoteDirName = null } = {}) {
       ["watch", "--run", runId, "--runs-root", runsRoot, "--repo-root", repoRoot, "--pull-hosts", "mini", "--timeout", "1"],
       { env },
     ),
+    append: (ev) => cli(["append", "--run", runId, "--runs-root", runsRoot, JSON.stringify(ev)], { env }),
   };
 }
 
@@ -724,8 +725,14 @@ for (const [mode, breakRemote] of [
       `the failure response must REPORT the hold it preserved, got ${JSON.stringify(rep.held)}`);
     assert.ok(typeof rep.pull_error === "string" && rep.pull_error.trim(),
       `the failure must carry a reason, got ${JSON.stringify(rep.pull_error)}`);
-    assert.match(rep.pull_error, /No such file|not permitted|Permission denied|cannot open|exit \d+/i,
-      `the reason must describe the ACTUAL failure, not a placeholder: ${JSON.stringify(rep.pull_error)}`);
+    // The reason must be the REMOTE'S OWN stderr, which is the whole point of dropping `2>/dev/null`.
+    // The first draft of this assertion listed `exit \d+` as an accepted match — the generic fallback
+    // used when there is no stderr at all, i.e. it accepted the very placeholder its message forbade,
+    // and would have stayed green if the suppression came back. (Codex round 2, #4.)
+    assert.doesNotMatch(rep.pull_error, /^exit \d+$/,
+      `"${rep.pull_error}" is the no-stderr fallback, not a reason — the remote's stderr was discarded`);
+    assert.match(rep.pull_error, /No such file|not permitted|Permission denied|cannot open/i,
+      `the reason must describe the ACTUAL failure: ${JSON.stringify(rep.pull_error)}`);
   });
 }
 
@@ -748,6 +755,28 @@ test("FAULT an UNREADABLE hold record reports as unknown, never as 'nothing held
     `an unreadable hold must not be reported as no hold at all, got ${JSON.stringify(rep.held)}`);
   assert.equal(rep.held?.unreadable, true, `…it must say it is unvouchable: ${JSON.stringify(rep.held)}`);
   assert.equal(rep.held?.stale, true, "…and count as stale, matching readHeldFragments' stated rule");
+});
+
+// PARSING is not the bar — AGEING is. `{}` is valid JSON and a valid object, so it slipped past the first
+// draft's structural check and reported as a hold in good standing with a null age. The family rule is
+// `readHeldFragments`': a record it cannot date is stale. (Codex round 2, #3.)
+test("FAULT a hold record that PARSES but cannot be aged is still unvouchable (DER-2839)", async (t) => {
+  const R = await newPullHostRun(t);
+  await R.writeRemote(`${PH_LINE1}${PH_TORN}`);
+  succeeded(await R.pull());
+  assert.ok((await R.held())?.first_seen_at, "CONTROL: a real, ageable hold exists first");
+
+  await writeFile(R.heldPath, "{}", "utf8"); // parses; carries no first_seen_at
+  await rm(R.remoteLedger, { force: true });
+  const rep = JSON.parse((await R.pull()).stdout);
+  assert.equal(rep.held?.unreadable, true,
+    `a hold with no ageable first_seen_at must not read as one in good standing, got ${JSON.stringify(rep.held)}`);
+
+  // CONTROL: a record that parses AND dates is still accepted — the check must not reject every hold.
+  await writeFile(R.heldPath, JSON.stringify({ host: "mini", cursor: 1, first_seen_at: "2026-07-30T10:00:00.000Z", bytes: 12 }), "utf8");
+  const ok = JSON.parse((await R.pull()).stdout);
+  assert.equal(ok.held?.unreadable, undefined, `a well-formed hold must still be vouched for, got ${JSON.stringify(ok.held)}`);
+  assert.equal(ok.held?.first_seen_at, "2026-07-30T10:00:00.000Z");
 });
 
 // THE CONTROL that stops the two cases above from being satisfied by a fix that simply calls every pull a
@@ -825,8 +854,33 @@ test("FAULT `watch --pull-hosts` SURFACES a failed remote read instead of swallo
   const failures = JSON.parse(broken.stdout).pending.pull_failed;
   assert.equal(failures.length, 1, `the unreadable host must surface on the wake, got ${JSON.stringify(failures)}`);
   assert.equal(failures[0].host, "mini", "…named");
-  assert.match(failures[0].why, /No such file|cannot open|exit \d+/i,
+  assert.match(failures[0].why, /No such file|cannot open/i,
     `…and carrying the remote's own reason, got ${JSON.stringify(failures[0].why)}`);
+});
+
+// The other half of that signal: a host the run has NEVER read from and NEVER dispatched to has no ledger
+// because nothing has run there. Reporting it every wake would put a permanent banner on a healthy run —
+// and a banner that is always on is one operators learn to skim, which destroys the signal above rather
+// than adding to it. (Codex round 2, #2.)
+test("`watch --pull-hosts` stays SILENT about a host the run never used (DER-2839)", async (t) => {
+  const R = await newPullHostRun(t);
+  await rm(R.remoteLedger, { force: true }); // never written: nothing was ever dispatched to mini
+
+  const r = await R.watch();
+  succeeded(r);
+  assert.deepEqual(JSON.parse(r.stdout).pending.pull_failed, [],
+    `a host that never started is not a failure to report:\n${r.out}`);
+
+  // …but the silence is EVIDENCE-BASED, not blanket. Dispatch a lead there and the same unreadable
+  // ledger becomes news. Without this control the test above would also pass on a fix that simply
+  // deleted the signal.
+  succeeded(await R.append({ actor: "orch", type: "lead_spawned", issue: "DER-9", host: "mini", worktree: "/wt/DER-9" }));
+  const after = await R.watch();
+  succeeded(after);
+  const failures = JSON.parse(after.stdout).pending.pull_failed;
+  assert.equal(failures.length, 1,
+    `once the run dispatched to that host, an unreadable ledger IS news, got ${JSON.stringify(failures)}`);
+  assert.equal(failures[0].host, "mini");
 });
 
 // The path is interpolated into a string the REMOTE SHELL evaluates. A `ledgerRoot` containing a space is

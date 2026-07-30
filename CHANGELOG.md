@@ -76,6 +76,29 @@ would otherwise conclude the file had drifted.
   the path*: the remote path was unquoted, so a valid `ledgerRoot: "/Volumes/Work Ledger"` split into two
   operands and failed every pull, and a metacharacter in `ledgerRoot` or the run id was interpreted by
   the remote shell.
+  **A second review round found five more, all in the remediation itself** — recorded because the pattern
+  is the point: each round of "I fixed the laundering" was true only of the layer it looked at.
+  (a) Quoting the whole remote path also disabled `~`/`$HOME` expansion, so a `ledgerRoot: "~/work-ledger"`
+  would have failed every pull; a leading `~/` is now left outside the quotes while the rest stays quoted.
+  No config here uses one — the point is that the tightening must not silently break one that does.
+  (b) `--pull-hosts auto` selects every ENABLED host, not every host the run USES, so an enabled `mini`
+  that was never dispatched to reported a failed read on **every wake, forever** — a permanent banner on a
+  healthy run, which is how a new signal destroys itself. It is now raised only on positive evidence that
+  a readable ledger should exist (a cursor past 0, a held fragment, or a `lead_spawned` on that host); the
+  evidence is monotonic, so a real failure cannot be suppressed after the first successful read. A throw
+  is still reported unconditionally — that is a harness fault, not the not-started race.
+  (c) The hold reader checked that the record PARSED, but `{}` parses: it reported as a hold in good
+  standing with a null age. The bar is now the one `readHeldFragments` already sets for the family — a
+  record it cannot DATE is stale.
+  (d) The "the reason must describe the ACTUAL failure" assertion listed `exit \d+` among its accepted
+  matches — the generic no-stderr fallback, i.e. it accepted the exact placeholder its own message
+  forbade, and would have stayed green if `2>/dev/null` came back. It now rejects that form explicitly.
+  (e) `skills/work/SKILL.md` carries an exhaustive list of the `pending` block's keys, read by the
+  unattended agent consumer, and adding `pull_failed` to the payload without adding it there left the one
+  reader that acts on it unaware the signal exists.
+  **Stated limit:** the per-host failure latch clears on the next successful pull, and that clearing is
+  covered across separate `watch` processes but not within a single long-lived one (each pull cycle is
+  ~45s apart, which no hermetic test should wait for).
   **Repo-wide sweep** (the acceptance criterion): two `|| true` sites remain in command construction and
   both were verified fail-closed against their masked paths rather than reasoned about. `install.sh:41`
   masks a *display* grep of the suite summary — load-bearing under the file's `set -euo pipefail`, and
