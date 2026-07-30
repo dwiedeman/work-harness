@@ -7980,3 +7980,360 @@ test("DER-2778 CONTROL: a WORK-EVENT comment on a TRUSTED PR still folds (the ga
     await applyRepoConfig("/nonexistent-reset");
   }
 });
+
+// ---------------------------------------------------------------------------
+// DER-2781 — `complete-run`: a fail-closed TERMINAL RUN STATE
+// ---------------------------------------------------------------------------
+// `materializeState` returned `status: meta.status ?? "running"` and that was a CONSTANT — no call site
+// passed `meta.status`, no event could set it, nothing read it. A run had no machine-checkable end.
+//
+// The risk in fixing that is shipping the very defect this wave exists to remove: a `complete-run` that
+// flips the field on command is another check that cannot fail. So the assertions below are weighted
+// toward REFUSAL, and each refusal test binds to the SPECIFIC check that must have produced it — a test
+// that merely asserts "it threw" would stay green with the check deleted, because the checks overlap.
+// Every refusal test is paired with a control that passes, so "refused" means the gate discriminated
+// rather than that it refuses everything.
+//
+// Named through the `WR` namespace deliberately (see the DER-2737 note at the top of this file): an
+// absent seam then fails as its own assertion instead of taking the whole suite down as an import error.
+
+// A unit taken all the way to `reaped` — the shape a completable run is made of.
+const d2781Done = (id, pr) => ([
+  { actor: "orch", type: "worktree_created", issue: id, worktree: `/wt/${id}`, branch: `b-${id}` },
+  { actor: "orch", type: "lead_spawned", issue: id, worktree: `/wt/${id}` },
+  { actor: `lead:${id}`, type: "pr_opened", issue: id, pr },
+  { actor: "shepherd", type: "pr_merged", issue: id, pr },
+  { actor: "orch", type: "reaped", issue: id, cleanup_ok: true },
+]);
+
+async function withD2781Run(body, { events = [] } = {}) {
+  const root = await mkdtemp(join(tmpdir(), "wr-2781-"));
+  try {
+    const { runId } = await runSubcommand(["init-run", "--project", "sandbox", "--runs-root", root, "--repo-root", root]);
+    const runDir = join(root, runId);
+    for (const ev of events) await appendEvent(runDir, ev);
+    const complete = (extra = []) => runSubcommand(["complete-run", "--run", runId, "--runs-root", root, "--repo-root", root, ...extra]);
+    return await body({
+      root, runId, runDir, complete,
+      // Every `run_completed` line ACTUALLY on disk — the only honest answer to "did it append?".
+      markers: async () => (await readEvents(runDir)).filter((e) => e.type === "run_completed"),
+      state: async () => materializeState(await readEvents(runDir), { run_id: runId, ledger: await readLedgerHealth(runDir) }),
+      // Raw append, for damage and for wire-protocol lines `appendEvent` would re-stamp.
+      appendRaw: async (text) => {
+        const file = join(runDir, "events.jsonl");
+        let body_ = "";
+        try { body_ = await readFile(file, "utf8"); } catch { /* first line */ }
+        await writeFile(file, `${body_}${text}`, "utf8");
+      },
+      refusal: async (extra = []) => {
+        let err = null;
+        try { await complete(extra); } catch (e) { err = e; }
+        assert.ok(err, "complete-run was expected to REFUSE and did not");
+        return String(err.message ?? err);
+      },
+    });
+  } finally {
+    await applyRepoConfig("/nonexistent-reset");
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+test("DER-2781: the gate is a real function, not a flag flip", () => {
+  assert.equal(typeof WR.runCompletionRefusals, "function", "the completion checks must be a seam the tests can call directly");
+  assert.equal(typeof WR.renderRunCompletionRefusal, "function");
+  // Every refusal has to carry an ACT that clears it. A gate with no escape is a run that can never end,
+  // which is how a fail-closed check turns into a dead end (the reason DER-2776 shipped its ack path).
+  const all = WR.runCompletionRefusals({ state: {}, ledger: null });
+  assert.ok(all.length >= 3, `an empty state must fail several checks, got ${JSON.stringify(all)}`);
+  for (const r of all) {
+    assert.ok(r.check && typeof r.check === "string", `refusal has no check name: ${JSON.stringify(r)}`);
+    assert.ok(r.reason && r.reason.length > 10, `refusal ${r.check} has no usable reason`);
+    assert.ok(r.fix && r.fix.length > 10, `refusal ${r.check} names no way out — a check with no escape is a dead end`);
+  }
+});
+
+test("DER-2781 (a): a run with an ACTIVE unit is REFUSED, and nothing is appended", async () => {
+  // The CONTROL — the same run completing once that unit goes terminal — is the NEXT test, so that a
+  // gate which refuses everything cannot satisfy this pair.
+  await withD2781Run(async ({ markers, refusal, state }) => {
+    const msg = await refusal();
+    assert.match(msg, /units_terminal/, "the refusal must name the check that produced it");
+    assert.match(msg, /DER-2 \(in_progress\)/, "…and the unit, and the status that is not terminal");
+    assert.match(msg, /NOTHING was appended/);
+    assert.deepEqual(await markers(), [], "a refused completion must leave the ledger untouched");
+    assert.equal((await state()).status, "running", "and the run is still running");
+  }, { events: [...d2781Done("DER-1", 101), { actor: "orch", type: "worktree_created", issue: "DER-2", worktree: "/wt/DER-2" }, { actor: "orch", type: "lead_spawned", issue: "DER-2", worktree: "/wt/DER-2" }] });
+});
+
+test("DER-2781 (a-control): the SAME run completes once its active unit goes terminal", async () => {
+  await withD2781Run(async ({ runDir, complete, refusal, markers, state }) => {
+    assert.match(await refusal(), /units_terminal/);
+    for (const ev of d2781Done("DER-2", 102)) await appendEvent(runDir, ev);
+    const res = await complete();
+    assert.equal(res.completed, true, res.stdout);
+    assert.equal((await markers()).length, 1);
+    assert.equal((await state()).status, "completed");
+  }, { events: [...d2781Done("DER-1", 101), { actor: "orch", type: "worktree_created", issue: "DER-2", worktree: "/wt/DER-2" }, { actor: "orch", type: "lead_spawned", issue: "DER-2", worktree: "/wt/DER-2" }] });
+});
+
+test("DER-2781 (b): all-terminal units + healthy ledger ⇒ run_completed appended and state.status folds to completed", async () => {
+  await withD2781Run(async ({ runDir, runId, complete, markers, state }) => {
+    const before = await state();
+    assert.equal(before.status, "running", "the pre-state must be the failing answer, or this proves nothing");
+    assert.equal(before.completed_at, null);
+    const res = await complete();
+    assert.equal(res.completed, true, res.stdout);
+    const ms = await markers();
+    assert.equal(ms.length, 1, `exactly one run_completed, got ${JSON.stringify(ms)}`);
+    assert.deepEqual(ms[0].units, ["DER-1", "DER-2"], "the marker records WHICH units it vouched for");
+    assert.equal(ms[0].unit_count, 2);
+    const after = await state();
+    assert.equal(after.status, "completed");
+    assert.ok(after.completed_at, "and when");
+    assert.equal(after.post_completion_events, 0);
+    // state.json is refreshed, so a successor reading only the file learns the run is over.
+    const onDisk = JSON.parse(await readFile(join(runDir, "state.json"), "utf8"));
+    assert.equal(onDisk.status, "completed", "state.json must not still say running");
+    assert.equal(onDisk.run_id, runId);
+  }, { events: [...d2781Done("DER-1", 101), ...d2781Done("DER-2", 102)] });
+});
+
+test("DER-2781 (c): a SECOND complete-run is a no-op success — no second event", async () => {
+  await withD2781Run(async ({ complete, markers }) => {
+    await complete();
+    const first = await markers();
+    const again = await complete();
+    assert.equal(again.alreadyCompleted, true, again.stdout);
+    assert.equal(again.completed, true, "…and it is a SUCCESS, not an error");
+    assert.match(again.stdout, /ALREADY completed/);
+    const after = await markers();
+    assert.equal(after.length, 1, `first-wins: exactly one marker after two calls, got ${after.length}`);
+    assert.equal(after[0].event_id, first[0].event_id, "and it is the ORIGINAL marker, not a re-stamp");
+  }, { events: d2781Done("DER-1", 101) });
+});
+
+test("DER-2781 (d): a LATE pr_merged after completion does not reopen the run — it is COUNTED", async () => {
+  // DER-2587's actual shape, which is why the fixture reaps WITHOUT a folded pr_merged: the unit was
+  // merged out of band and reaped off that, and the `--reconcile-merged` sweep delivers its `pr_merged`
+  // afterwards — here, after the run itself was declared over. (A pr_merged that merely REPEATS one
+  // already folded is a duplicate delivery, not a late event, and is asserted separately below.)
+  await withD2781Run(async ({ runDir, complete, state, markers }) => {
+    await complete();
+    await appendEvent(runDir, { actor: "shepherd", type: "pr_merged", issue: "DER-1", pr: 101 });
+    const st = await state();
+    assert.equal(st.status, "completed", "a late event must NOT walk the run back to running");
+    assert.equal(st.issues["DER-1"].status, "reaped", "…nor walk its unit back off reaped (DER-2587)");
+    assert.equal(st.post_completion_events, 1, "…and it is visible, not silently absorbed");
+    assert.deepEqual(st.post_completion_event_types, ["pr_merged"], "…named, so nobody has to diff the ledger to find it");
+    // A DUPLICATE of that same merge is not news: dedupeTerminalEvents drops it at the read choke point,
+    // before this fold ever sees it, so it must not inflate the count either.
+    await appendEvent(runDir, { actor: "orch", type: "pr_merged", issue: "DER-1", pr: 101 });
+    assert.equal((await state()).post_completion_events, 1, "a duplicate terminal delivery is deduped, not counted");
+    // Anything genuinely new still counts.
+    await appendEvent(runDir, { actor: "lead:DER-1", type: "token_usage", issue: "DER-1", by_model: { m: { input: 1 } }, total_tokens: 1 });
+    const st2 = await state();
+    assert.equal(st2.post_completion_events, 2);
+    assert.deepEqual(st2.post_completion_event_types, ["pr_merged", "token_usage"]);
+    // Re-running stays a no-op success even with late events on the ledger.
+    const again = await complete();
+    assert.equal(again.alreadyCompleted, true);
+    assert.match(again.stdout, /landed AFTER completion/);
+    assert.equal((await markers()).length, 1);
+  }, {
+    events: [
+      { actor: "orch", type: "worktree_created", issue: "DER-1", worktree: "/wt/DER-1", branch: "b-DER-1" },
+      { actor: "orch", type: "lead_spawned", issue: "DER-1", worktree: "/wt/DER-1" },
+      { actor: "lead:DER-1", type: "pr_opened", issue: "DER-1", pr: 101 },
+      { actor: "orch", type: "reaped", issue: "DER-1", cleanup_ok: true },
+    ],
+  });
+});
+
+test("DER-2781 (e): a STALE held remote fragment REFUSES — and a FRESH one does not (DER-2776 integration)", async () => {
+  await withD2781Run(async ({ runDir, complete, refusal, markers }) => {
+    // The record `recordHeldFragment` writes: one file per host, next to sync-cursor.<host>. The name is
+    // pinned by DER-2776's own test ("health names the file to delete"), and readHeldFragments — the real
+    // production reader — is what ages it.
+    const held = join(runDir, "sync-held.mini.json");
+    await writeFile(held, `${JSON.stringify({
+      host: "mini", cursor: 2, first_seen_at: new Date().toISOString(), last_seen_at: new Date().toISOString(),
+      bytes: 48, raw: '{"actor":"lead:DER-1","type":"pr_opened","issue":', raw_truncated: false,
+    })}\n`, "utf8");
+    // A writer that died mid-line: past the threshold, events are still being WITHHELD.
+    await withEnv({ WORK_LEDGER_HELD_STALE_MS: "0" }, async () => {
+      const msg = await refusal();
+      assert.match(msg, /ledger_held_fragments/, "the refusal must name the DER-2776 check");
+      assert.match(msg, /mini/, "…the host to go look at");
+      assert.match(msg, /sync-held\.mini\.json/, "…and the exact file that acknowledges it");
+      assert.deepEqual(await markers(), [], "nothing appended");
+    });
+    // CONTROL, and the whole point of gating on `held_fragment_stale` rather than on "a hold exists":
+    // the SAME file, seconds old, under the real threshold is a live writer mid-append and must NOT block.
+    const res = await complete();
+    assert.equal(res.completed, true, `a FRESH hold must not block completion: ${res.stdout}`);
+    assert.equal((await markers()).length, 1);
+  }, { events: d2781Done("DER-1", 101) });
+});
+
+test("DER-2781 (e2): a stale hold can be ACKNOWLEDGED — the gate is never a dead end", async () => {
+  // If the mini is gone for good, no future pull can complete that line. DER-2776 shipped the escape
+  // (delete the record) precisely so a health signal could not make a run permanently uncompletable;
+  // this asserts `complete-run` honors it rather than dead-ending on it.
+  await withD2781Run(async ({ runDir, complete, refusal, markers }) => {
+    const held = join(runDir, "sync-held.mini.json");
+    await writeFile(held, `${JSON.stringify({ host: "mini", cursor: 1, first_seen_at: new Date().toISOString(), bytes: 12 })}\n`, "utf8");
+    await withEnv({ WORK_LEDGER_HELD_STALE_MS: "0" }, async () => {
+      assert.match(await refusal(), /ledger_held_fragments/);
+      await rm(held, { force: true }); // the documented acknowledgement
+      const res = await complete();
+      assert.equal(res.completed, true, `acknowledged — completion must now be possible: ${res.stdout}`);
+      assert.equal((await markers()).length, 1);
+    });
+  }, { events: d2781Done("DER-1", 101) });
+});
+
+test("DER-2781 (f): a pending kickback REFUSES, naming the un-delivered round", async () => {
+  // Structurally this cannot fire without units_terminal firing too (`kickback` is not a terminal
+  // status), so the assertion binds to the ENTRY, not merely to the fact that it threw — with the
+  // kickbacks_pending check deleted, the run is still refused but this line goes red.
+  await withD2781Run(async ({ refusal, markers }) => {
+    const msg = await refusal();
+    assert.match(msg, /kickbacks_pending: 1 kickback round\(s\) were composed but never DELIVERED: DER-2/);
+    assert.match(msg, /units_terminal/, "…and the coupled check is listed too — the operator reads ALL of it at once");
+    assert.deepEqual(await markers(), []);
+  }, {
+    events: [
+      ...d2781Done("DER-1", 101),
+      { actor: "orch", type: "worktree_created", issue: "DER-2", worktree: "/wt/DER-2" },
+      { actor: "orch", type: "lead_spawned", issue: "DER-2", worktree: "/wt/DER-2" },
+      { actor: "lead:DER-2", type: "pr_opened", issue: "DER-2", pr: 102 },
+      { actor: "shepherd", type: "kickback", issue: "DER-2", pr: 102, sha: "abc" },
+    ],
+  });
+});
+
+test("DER-2781 (g): a run that tracks NOTHING is refused — vacuous truth is not a passing gate", async () => {
+  // `every([])` is true, so without this an empty ledger completes. It is also DER-2570's phantom-ledger
+  // signature: a forked, empty events.jsonl for a live run id reads healthy from every other angle.
+  await withD2781Run(async ({ refusal, markers }) => {
+    const msg = await refusal();
+    assert.match(msg, /units_tracked/);
+    assert.match(msg, /DER-2570/, "the refusal points at the failure this shape usually IS");
+    assert.deepEqual(await markers(), []);
+  });
+});
+
+test("DER-2781 (h): a TORN TAIL refuses through the ledger_health catch-all", async () => {
+  // The catch-all exists so a signal folded into readLedgerHealth().ok AFTER this gate was written still
+  // refuses. It has to be reachable to be worth anything: a torn tail is `ok:false` and is neither of the
+  // two causes the gate names explicitly, so it lands here — and nowhere else.
+  await withD2781Run(async ({ complete, refusal, appendRaw, markers }) => {
+    await appendRaw('{"actor":"lead:DER-1","type":"plan_scope","issue":');
+    const msg = await refusal();
+    assert.match(msg, /ledger_health/, "an unhealthy ledger must block a claim that the run is finished");
+    assert.match(msg, /torn tail/);
+    assert.doesNotMatch(msg, /ledger_held_fragments/, "a LOCAL torn tail is not a held remote fragment");
+    assert.doesNotMatch(msg, /ledger_quarantine/, "…and a torn tail is TRANSIENT, not unacknowledged damage");
+    assert.deepEqual(await markers(), []);
+    // CONTROL: the writer finishes the line and the run completes on its own — transient, as designed.
+    await appendRaw('"DER-1","expectedAdditions":10}\n');
+    const res = await complete();
+    assert.equal(res.completed, true, `a healed tail must unblock completion: ${res.stdout}`);
+  }, { events: d2781Done("DER-1", 101) });
+});
+
+test("DER-2781 (i): a line that NEVER folded refuses — every count in the run is a lower bound until it does", async () => {
+  await withD2781Run(async ({ runDir, complete, refusal, appendRaw, markers }) => {
+    await appendRaw('{"actor":"lead:DER-1","type":\n'); // TERMINATED and unparseable ⇒ permanent damage
+    const msg = await refusal();
+    assert.match(msg, /ledger_quarantine/);
+    assert.match(msg, /LOWER BOUND/);
+    assert.match(msg, /ledger-quarantine\.jsonl/, "the refusal names the sidecar holding the raw bytes");
+    assert.deepEqual(await markers(), []);
+    // CONTROL / escape: repair the line and acknowledge the sidecar, and the run completes.
+    const file = join(runDir, "events.jsonl");
+    const kept = (await readFile(file, "utf8")).split("\n").filter((l) => { try { JSON.parse(l); return true; } catch { return false; } });
+    await writeFile(file, `${kept.join("\n")}\n`, "utf8");
+    await rm(join(runDir, "ledger-quarantine.jsonl"), { force: true });
+    const res = await complete();
+    assert.equal(res.completed, true, `repaired + acknowledged: ${res.stdout}`);
+  }, { events: d2781Done("DER-1", 101) });
+});
+
+test("DER-2781 (j): --dry-run runs every check and appends NOTHING", async () => {
+  // Dry-run purity (DER-2514) matters most on the one command whose entire product is a durable claim.
+  await withD2781Run(async ({ complete, markers, state }) => {
+    const res = await complete(["--dry-run"]);
+    assert.equal(res.dryRun, true);
+    assert.equal(res.completed, false);
+    assert.match(res.stdout, /WOULD complete/);
+    assert.deepEqual(await markers(), [], "a preview that ends the run is not a preview");
+    assert.equal((await state()).status, "running");
+    assert.equal((await complete()).completed, true, "…and the real call still works afterwards");
+  }, { events: d2781Done("DER-1", 101) });
+});
+
+test("DER-2781 (k): a FOREIGN schema_version refuses and --allow-version-skew does NOT waive it", async () => {
+  await withD2781Run(async ({ refusal, appendRaw, markers }) => {
+    await appendRaw(`${JSON.stringify({ actor: "orch", type: "note", schema_version: 99, ts: "2026-07-30T12:00:00.000Z", event_id: "x1" })}\n`);
+    assert.match(await refusal(), /protocol/);
+    const forced = await refusal(["--allow-version-skew"]);
+    assert.match(forced, /foreign schema_version/, "the skew flag never covers a wire version this build cannot parse");
+    assert.deepEqual(await markers(), []);
+  }, { events: d2781Done("DER-1", 101) });
+});
+
+test("DER-2781 (k2): MIXED harness versions refuse, and --allow-version-skew acknowledges them", async () => {
+  // Without this escape a multi-host run whose mini was upgraded mid-run could never be completed at
+  // all — the mixed versions are in its history permanently. Same split assertLedgerProtocolCompatible
+  // already applies to dispatch, reused rather than re-invented stricter.
+  await withD2781Run(async ({ complete, refusal, appendRaw, markers }) => {
+    await appendRaw(`${JSON.stringify({ actor: "orch", type: "host_heartbeat", host: "mini", harness_version: "9.9.9", schema_version: 1, ts: "2026-07-30T12:00:00.000Z", event_id: "x2" })}\n`);
+    const msg = await refusal();
+    assert.match(msg, /protocol/);
+    assert.match(msg, /mixed harness version/);
+    assert.deepEqual(await markers(), []);
+    const res = await complete(["--allow-version-skew"]);
+    assert.equal(res.completed, true, `an acknowledged mid-run upgrade must be completable: ${res.stdout}`);
+    assert.equal((await markers()).length, 1);
+  }, { events: d2781Done("DER-1", 101) });
+});
+
+test("DER-2781: the fold is FIRST-WINS — a second run_completed never re-stamps the run", async () => {
+  const base = [
+    { type: "run_started", run_id: "r1", ts: "2026-07-30T10:00:00.000Z" },
+    { type: "pr_merged", issue: "DER-1", pr: 1, ts: "2026-07-30T10:01:00.000Z" },
+    { type: "run_completed", run_id: "r1", ts: "2026-07-30T10:02:00.000Z" },
+  ];
+  const one = materializeState(base);
+  assert.equal(one.status, "completed");
+  assert.equal(one.completed_at, "2026-07-30T10:02:00.000Z");
+  assert.equal(one.post_completion_events, 0);
+  const two = materializeState([...base, { type: "run_completed", run_id: "r1", ts: "2026-07-30T10:05:00.000Z" }]);
+  assert.equal(two.completed_at, "2026-07-30T10:02:00.000Z", "the FIRST marker owns the completion time");
+  assert.equal(two.post_completion_events, 1, "…and the duplicate is counted, not swallowed");
+  assert.deepEqual(two.post_completion_event_types, ["run_completed"]);
+  // And the field is still overridable by an explicit caller, which is what it was declared for.
+  assert.equal(materializeState(base, { status: "aborted" }).status, "aborted");
+});
+
+test("DER-2781: a leaked teardown does not BLOCK completion, but the success receipt says so", async () => {
+  // DER-2740's reap_failures survives terminal status on purpose (the unit IS reaped while something it
+  // owned is still running). It is deliberately NOT one of the completion checks — the settled contract
+  // does not include it — but a run whose mini still has a live lead on it is still spending, so an
+  // unqualified "COMPLETE" would be the receipt lying by omission.
+  await withD2781Run(async ({ complete, markers }) => {
+    const res = await complete();
+    assert.equal(res.completed, true, "a leaked teardown must not make the run uncompletable");
+    assert.equal((await markers()).length, 1);
+    assert.deepEqual((res.reapFailures ?? []).map((r) => r.issue), ["DER-1"]);
+    assert.match(res.stdout, /did NOT tear down cleanly/);
+    assert.match(res.stdout, /remote_pkill/, "the receipt names WHAT leaked, not just that something did");
+    assert.match(res.stdout, /NOT part of this gate/, "…and is honest that the gate did not check it");
+  }, {
+    events: [
+      ...d2781Done("DER-1", 101),
+      { actor: "orch", type: "reap_failed", issue: "DER-1", host: "mini", leaks: ["remote_pkill"], reason: "required cleanup failed: remote_pkill (the probe found it alive)" },
+    ],
+  });
+});

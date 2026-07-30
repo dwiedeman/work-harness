@@ -242,7 +242,17 @@ Browser + CLI verification live **here**, on the single orchestrator session —
 
 ## 7. Run end
 
-When every issue is `merged`+`reaped`: **first pull each mini host's staged learnings** — the mini leads' SessionEnd hook staged pointers to the mini-local `<ledgerRoot>/<RUN>/run-learnings.jsonl`, so `ssh <mini.ssh> "cat <ledgerRoot>/$RUN/run-learnings.jsonl" >> tmp/work/$RUN/run-learnings.jsonl` before consolidating. Then do the **one consolidated learnings capture** — read `tmp/work/$RUN/run-learnings.jsonl` (all leads'/shepherd's staged pointers) + your own transcript, distill the durable dev-flow learnings, and write ONE high-signal entry (a `/done`-style pass). Then `/goal complete`.
+When every issue is `merged`+`reaped`, close the run in this order — **the ledger first, then the writing, then the goal.**
+
+**1. Drain every host into the canonical ledger.** `pull-host --run "$RUN" --host <h>` for each mini, then one final `reconcile-pr-events --run "$RUN"` for the cloud lane. Do this BEFORE step 2: everything downstream reads the canonical ledger, so an event still sitting on a host is invisible to every check.
+
+**2. `complete-run --run "$RUN"` — the run's terminal state, and it is a GATE (DER-2781).** Until this exists a run has no machine-checkable end, so "are we done?" gets answered by eyeballing the ledger. `complete-run` appends `run_completed`, and `state.status` folds from `running` to `completed`, **only if** every one of these holds: at least one tracked unit and every one of them terminal (`merged`/`reaped`); no un-delivered kickback; no unacknowledged quarantined line; no **stale held remote fragment** (DER-2776 — a host's writer died mid-line and its events are still being withheld); ledger health `ok`; wire protocol `ok`. Otherwise it **refuses, lists every failing check with the act that clears it, and appends nothing.**
+
+There is **no `--force`** — each check's escape is a real act with a receipt: reap the stranded unit, deliver the kickback, repair the ledger line (or delete `ledger-quarantine.jsonl` to acknowledge it), delete `sync-held.<host>.json` to acknowledge a dead host's hold, `--allow-version-skew` for a deliberate mid-run host upgrade (never for a foreign `schema_version`). Use `--dry-run` to see the verdict without ending the run. A second `complete-run` is a **no-op success** ("already completed"), and a late event — DER-2587's reconciled-after-the-fact `pr_merged` — does **not** reopen the run: it folds onto its own unit and shows up as `state.post_completion_events`.
+
+**3. Learnings capture.** **First pull each mini host's staged learnings** — the mini leads' SessionEnd hook staged pointers to the mini-local `<ledgerRoot>/<RUN>/run-learnings.jsonl`, so `ssh <mini.ssh> "cat <ledgerRoot>/$RUN/run-learnings.jsonl" >> tmp/work/$RUN/run-learnings.jsonl` before consolidating. Then do the **one consolidated learnings capture** — read `tmp/work/$RUN/run-learnings.jsonl` (all leads'/shepherd's staged pointers) + your own transcript, distill the durable dev-flow learnings, and write ONE high-signal entry (a `/done`-style pass).
+
+**4. The token-telemetry rollup below, then `/goal complete`.** `/goal complete` goes last, and only after `complete-run` succeeded — the ledger, not your transcript, is the run's memory, and `status: "completed"` is the only durable record that this run ended cleanly rather than being abandoned. Expect **your own** `token_usage` to land after the marker (your SessionEnd hook fires when you go quiet, which is by definition later): it counts in `post_completion_events` and that is correct, not damage.
 
 **Token telemetry rollup (2026-07-16; hook-automated 2026-07-26) — the end-of-run report MUST include the token breakdown.** Three steps, in order:
 
