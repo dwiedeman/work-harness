@@ -1099,6 +1099,105 @@ test("legitimate evidence queries still RUN and still pass after DER-2841/2810/2
 });
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
+// DER-2840 — a same-owner FORK is not the same REPOSITORY
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+//
+// DER-2778 authenticates a PR's author and its head-repo OWNER before deriving cloud lifecycle events.
+// GitHub lets one owner hold both a repository and a fork of it, so `headRepositoryOwner.login === owner`
+// is satisfied by a repository that is NOT the target repository: owner equality is strictly weaker than
+// repository identity. A same-org fork therefore passed the gate and could repoint a tracked unit.
+//
+// The unit suite proves the predicate and the fold. This proves the PROGRAM: a real `reconcile-pr-events`
+// subprocess, a real `gh` on PATH, and the field list the harness actually sends.
+
+const D2840_OWNER = "acme";
+
+// A repo whose config names `acme` as the owner and `acme-dev` as the trusted author, plus a `gh` stub
+// that answers `pr list` from a rows file and logs the argv it was called with.
+async function newForkIdentityRun(t, rows) {
+  const runsRoot = await mkdtemp(join(tmpdir(), "wh-e2e-fk-runs-"));
+  const repoRoot = await mkdtemp(join(tmpdir(), "wh-e2e-fk-repo-"));
+  t.after(() => Promise.all([runsRoot, repoRoot].map((d) => rm(d, { recursive: true, force: true }))));
+
+  await mkdir(join(repoRoot, ".claude"), { recursive: true });
+  await writeFile(join(repoRoot, ".claude", "work.config.json"), JSON.stringify({
+    repo: { repoSlug: `${D2840_OWNER}/widgets`, ownerLogin: "acme-dev" },
+  }), "utf8");
+
+  const bin = join(repoRoot, "bin");
+  await mkdir(bin, { recursive: true });
+  const rowsPath = join(repoRoot, "rows.json");
+  await writeFile(rowsPath, JSON.stringify(rows), "utf8");
+  const ghLog = join(repoRoot, "gh.log");
+  await writeFile(join(bin, "gh"), [
+    "#!/bin/sh",
+    `printf '%s\\n' "$*" >> ${JSON.stringify(ghLog)}`,
+    `case "$1 $2" in`,
+    `  "pr list") cat ${JSON.stringify(rowsPath)} ;;`,
+    `  *) printf '%s\\n' '[]' ;;`,
+    "esac",
+    "exit 0",
+  ].join("\n") + "\n", "utf8");
+  await chmod(join(bin, "gh"), 0o755);
+
+  const env = { PATH: `${bin}:${process.env.PATH}` };
+  const init = await cli(["init-run", "--project", "sandbox", "--runs-root", runsRoot, "--repo-root", repoRoot], { env });
+  succeeded(init);
+  const runId = init.stdout.trim().split("\n").filter(Boolean).pop();
+  const ledger = join(runsRoot, runId, "events.jsonl");
+  // A tracked unit, stamped through the real `append` — with an empty scope the fold returns early and
+  // every assertion below would pass without the gate ever being consulted.
+  succeeded(await cli(["append", "--run", runId, "--runs-root", runsRoot,
+    JSON.stringify({ actor: "orch", type: "lead_spawned", issue: "DER-9", host: "cloud", workspace_ref: "workspace:1" })], { env }));
+
+  return {
+    runId,
+    reconcile: () => cli(["reconcile-pr-events", "--run", runId, "--runs-root", runsRoot, "--repo-root", repoRoot], { env }),
+    events: async () => (await readFile(ledger, "utf8")).split("\n").filter(Boolean).map((l) => JSON.parse(l)),
+    ghCalls: async () => (await readFile(ghLog, "utf8").catch(() => "")).split("\n").filter(Boolean),
+  };
+}
+
+// Everything DER-2778 checks passes on this row. Only `isCrossRepository` distinguishes it.
+const d2840ForkRow = {
+  number: 4343, isDraft: false, headRefName: "der-9-x", title: "feat: DER-9",
+  body: "claude.ai/code/session_01FORK", headRefOid: "forkhead", comments: [],
+  author: { login: "acme-dev" }, headRepositoryOwner: { login: D2840_OWNER }, isCrossRepository: true,
+};
+const d2840SameRepoRow = { ...d2840ForkRow, number: 707, body: "claude.ai/code/session_01OK", headRefOid: "realhead", isCrossRepository: false };
+
+test("FAULT a SAME-OWNER fork PR derives NO cloud lifecycle events (DER-2840)", async (t) => {
+  const R = await newForkIdentityRun(t, [d2840ForkRow]);
+  succeeded(await R.reconcile());
+
+  // THE ASSERTION THAT FAILS ON THE PARENT: there the fork's author and head-repo owner both matched, so
+  // it authenticated and derived lead_online + handed_off against a tracked unit.
+  const evs = await R.events();
+  assert.equal(evs.some((e) => e.pr === 4343), false,
+    `no event may carry the same-owner fork's PR number, got ${JSON.stringify(evs.filter((e) => e.pr === 4343))}`);
+  assert.equal(evs.some((e) => e.type === "lead_online" || e.type === "handed_off"), false,
+    "and no cloud lifecycle event may be derived at all");
+
+  // The field must be REQUESTED on the wire, not merely consulted. If the harness never asks for it,
+  // every row arrives with it undefined, the fail-closed branch refuses the fork AND the canonical PR,
+  // and the assertions above pass while the cloud lane is dead.
+  const lists = (await R.ghCalls()).filter((l) => l.startsWith("pr list"));
+  assert.equal(lists.length, 1, `expected exactly one \`gh pr list\`, saw ${lists.length}`);
+  assert.match(lists[0], /isCrossRepository/,
+    `the list must request isCrossRepository, or the gate decides on a field it never asked for:\n${lists[0]}`);
+});
+
+test("a genuine same-repository PR still folds end to end (DER-2840 control)", async (t) => {
+  // The inverse failure — a gate that refuses everything — would disable the cloud lane while every
+  // security assertion above stayed green.
+  const R = await newForkIdentityRun(t, [d2840SameRepoRow]);
+  succeeded(await R.reconcile());
+  const evs = await R.events();
+  assert.equal(evs.some((e) => e.type === "lead_online" && e.pr === 707), true,
+    `the canonical-repo PR must still be discovered, got ${JSON.stringify(evs.map((e) => e.type))}`);
+});
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
 // TIER B — LIVE. Opt in with WORK_E2E_LIVE=1. Real model calls, real GitHub, real cost.
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
 
