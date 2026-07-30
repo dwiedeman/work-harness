@@ -3434,6 +3434,26 @@ export const LEDGER_RAW_KEEP = 4096;
 // that outlives this is reported (transiently) rather than waited on, and clears itself on the next read.
 const LEDGER_TORN_RETRY_MS = 25;
 
+// DER-2776 — the REMOTE half of the same fact. `pull-host` cannot re-read 25ms later: the next look at a
+// mini's ledger is the next pull cycle (~45s). So an unterminated remote tail is HELD — the cursor does
+// not advance past it and it folds on a later cycle — which fixes the loss but buys a new blind spot: a
+// writer that died mid-line is now retried, silently, forever. The held fragment therefore carries a
+// FIRST-SEEN time, and past this threshold it stops being "the writer is busy" and becomes a fact about
+// the run. Persisted per host (below) because every `pull-host` is a fresh PROCESS — an in-memory clock
+// would restart every cycle and could never age.
+export const LEDGER_HELD_STALE_MS_DEFAULT = 300000; // 5 min ≈ 6 pull cycles at watch's ~45s
+export function ledgerHeldStaleMs() {
+  // `WORK_LEDGER_HELD_STALE_MS=` (exported empty, which a shell does routinely) must read as UNSET, not
+  // as 0 — `Number("")` is 0, and a 0 threshold marks every live writer's mid-append as a dead one.
+  const rawStr = String(process.env.WORK_LEDGER_HELD_STALE_MS ?? "").trim();
+  if (!rawStr) return LEDGER_HELD_STALE_MS_DEFAULT;
+  const raw = Number(rawStr);
+  if (!Number.isFinite(raw) || raw < 0) return LEDGER_HELD_STALE_MS_DEFAULT;
+  return Math.floor(raw);
+}
+export const LEDGER_HELD_FILE_PREFIX = "sync-held.";
+export const LEDGER_HELD_FILE_SUFFIX = ".json";
+
 // The work-done seam (DER-2741 #16). Counters, not wall-clock: the review benchmark was a 100k-event /
 // 9.8 MB ledger at ~310 ms/read, ~120× over a 5-minute idle watch, and the property that has to hold is
 // "work per poll scales with NEW activity, not with total history" — which is a count, not a duration.
@@ -3555,19 +3575,107 @@ async function recordLedgerDamage(ledgerFile, bad, extra = {}) {
   } catch { /* unwritable run dir — the in-process health record above still surfaces it */ }
   // LOUD, once per signature per process: the operator running the command that hit the damage sees it
   // without having to go looking for state.json.
+  //
+  // …but only for damage that NEEDS an operator. A purely transient batch is an unterminated tail line
+  // that will fold itself, and DER-2776 makes those routine on the pull path (one per cycle for as long
+  // as a mini is mid-append). "Repair or acknowledge them there" is the wrong instruction for a line
+  // nobody has to touch, and an always-on warning is one operators learn to skim.
+  const transientOnly = fresh.every((b) => TRANSIENT_DAMAGE_REASONS.has(b.reason));
   try {
     process.stderr.write(
-      `WARNING: ledger ${ledgerFile} — ${fresh.length} line(s) did NOT fold into state ` +
-      `(${[...new Set(fresh.map((b) => b.reason))].join(", ")}; first at byte ${fresh[0].offset ?? "?"}). ` +
-      `Raw bytes kept in ${sidecar} — repair or acknowledge them there.\n`,
+      transientOnly
+        ? `NOTE: ledger ${ledgerFile} — ${fresh.length} UNTERMINATED tail line(s) held back, not folded YET ` +
+          `(a writer caught mid-append). Raw bytes kept in ${sidecar}; they fold on their own once the ` +
+          `line is completed. Nothing to repair unless they stop clearing (see state.ledger.held_fragment_stale).\n`
+        : `WARNING: ledger ${ledgerFile} — ${fresh.length} line(s) did NOT fold into state ` +
+          `(${[...new Set(fresh.map((b) => b.reason))].join(", ")}; first at byte ${fresh[0].offset ?? "?"}). ` +
+          `Raw bytes kept in ${sidecar} — repair or acknowledge them there.\n`,
     );
   } catch { /* stderr closed */ }
+}
+
+// ---------------------------------------------------------------------------
+// Held remote fragments (DER-2776)
+// ---------------------------------------------------------------------------
+// One tiny JSON file per host, next to `sync-cursor.<host>`, recording the unterminated tail line the
+// last pull held back. It exists so the age of that hold survives the process that observed it: `pull-host`
+// runs fresh every cycle, and `readLedgerHealth` usually runs in a DIFFERENT process again (`state`,
+// `watch`), so neither can see how long the line has been stuck without something on disk saying so.
+function heldFragmentPathFor(runDir, host) {
+  return join(runDir, `${LEDGER_HELD_FILE_PREFIX}${host}${LEDGER_HELD_FILE_SUFFIX}`);
+}
+
+// `fragment: null` ⇒ nothing is held any more: the record is DELETED, which is how the signal
+// self-clears the moment the writer finishes the line. `cursor` is the post-pull cursor, i.e. the identity
+// of the held line — a fragment at a NEW cursor is a different line and starts its own clock, so a host
+// that tears one line after another cannot inherit an ancient first-seen time.
+async function recordHeldFragment(runDir, host, { fragment, cursor }) {
+  const path = heldFragmentPathFor(runDir, host);
+  if (fragment == null) {
+    await rm(path, { force: true }).catch(() => { /* best-effort: a read-only run dir must still pull */ });
+    return null;
+  }
+  let prev = null;
+  try { prev = JSON.parse(await readFile(path, "utf8")); } catch { /* absent or unreadable ⇒ new clock */ }
+  const now = new Date().toISOString();
+  const sameLine = prev && typeof prev.first_seen_at === "string" && prev.cursor === cursor;
+  const rec = {
+    host,
+    cursor,
+    first_seen_at: sameLine ? prev.first_seen_at : now,
+    last_seen_at: now,
+    bytes: Buffer.byteLength(String(fragment)),
+    raw: String(fragment).slice(0, LEDGER_RAW_KEEP),
+    raw_truncated: String(fragment).length > LEDGER_RAW_KEEP,
+  };
+  try { await writeFile(path, `${JSON.stringify(rec)}\n`, "utf8"); }
+  catch { /* unwritable run dir — the pull still succeeded; only the age clock is lost */ }
+  return rec;
+}
+
+// Every host's currently-held fragment, aged. FAIL-CLOSED on an unreadable/undatable record: a hold we
+// cannot age is one we cannot vouch for, so it counts as stale rather than silently disappearing.
+async function readHeldFragments(runDir, now = Date.now()) {
+  let names;
+  try { names = await readdir(runDir); } catch { return []; }
+  const staleMs = ledgerHeldStaleMs();
+  const out = [];
+  for (const n of names) {
+    if (!n.startsWith(LEDGER_HELD_FILE_PREFIX) || !n.endsWith(LEDGER_HELD_FILE_SUFFIX)) continue;
+    const fallbackHost = n.slice(LEDGER_HELD_FILE_PREFIX.length, n.length - LEDGER_HELD_FILE_SUFFIX.length);
+    const file = join(runDir, n);
+    let rec = null;
+    try { rec = JSON.parse(await readFile(file, "utf8")); } catch { /* unreadable ⇒ below */ }
+    if (!rec || typeof rec !== "object" || Array.isArray(rec)) {
+      out.push({ host: fallbackHost, file, first_seen_at: null, age_ms: null, bytes: null, stale: true });
+      continue;
+    }
+    const firstSeen = Date.parse(String(rec.first_seen_at ?? ""));
+    const ageMs = Number.isFinite(firstSeen) ? Math.max(0, now - firstSeen) : null;
+    out.push({
+      host: typeof rec.host === "string" && rec.host ? rec.host : fallbackHost,
+      file,
+      first_seen_at: rec.first_seen_at ?? null,
+      age_ms: ageMs,
+      bytes: typeof rec.bytes === "number" ? rec.bytes : null,
+      stale: ageMs === null || ageMs >= staleMs,
+    });
+  }
+  // Oldest first. `MAX_SAFE_INTEGER` (not Infinity) for an unaged record, so two of them subtract to 0
+  // rather than to NaN — a NaN comparator is not a stable "equal", it is undefined ordering.
+  return out.sort((a, b) => (b.age_ms ?? Number.MAX_SAFE_INTEGER) - (a.age_ms ?? Number.MAX_SAFE_INTEGER));
 }
 
 // Ledger health as data, for `state.ledger` and `watch`'s wake banner. Combines THIS process's last read
 // with the durable sidecar, so damage recorded by an earlier process is still visible after the fact.
 // `ok:false` latches on permanent (non-transient) damage until the sidecar is cleared — an unacknowledged
 // line that never folded is a standing fact about the run, not a one-shot message.
+//
+// DER-2776 adds the second standing fact: a remote host's tail line held back for longer than
+// `ledgerHeldStaleMs()`. A FRESH hold is not damage (it is what a live writer looks like) and deliberately
+// does not move `ok`; a STALE one does, because at that point the pull is re-reading a line nobody is
+// finishing and every count in the run is a lower bound for as long as it lasts. Self-clearing: the
+// record is deleted by the pull that finally folds the line.
 export async function readLedgerHealth(runDir) {
   const ledgerFile = join(runDir, "events.jsonl");
   const sidecar = quarantinePathFor(ledgerFile);
@@ -3588,8 +3696,27 @@ export async function readLedgerHealth(runDir) {
       }
     }
   } catch { /* no sidecar ⇒ nothing was ever quarantined */ }
+  const held = await readHeldFragments(runDir);
+  const heldStale = held.filter((h) => h.stale);
+  const heldAges = held.map((h) => h.age_ms).filter((a) => Number.isFinite(a));
+  const notes = [];
+  if (recordedPermanent) {
+    notes.push(`${recordedPermanent} ledger line(s) never folded into state; raw bytes are in ${sidecar}. Repair the ledger or delete that file to acknowledge.`);
+  }
+  if (heldStale.length) {
+    notes.push(
+      `${heldStale.length} remote host(s) have an UNTERMINATED tail line held back for ≥${ledgerHeldStaleMs()}ms ` +
+      `(${heldStale.map((h) => `${h.host}: ${h.age_ms == null ? "age unknown" : `${h.age_ms}ms`}`).join(", ")}). ` +
+      `Every pull re-reads that line and folds nothing — check whether that host's writer died mid-line. ` +
+      `Clears itself the moment the line is completed. ` +
+      // An unclearable health signal would make a run impossible to finish once its mini went away, so
+      // say the escape out loud: same shape as the quarantine sidecar's "delete to acknowledge".
+      `To acknowledge instead, delete ${heldStale.map((h) => h.file).join(", ")} ` +
+      `(a later pull that still sees the line will restart the clock).`,
+    );
+  }
   return {
-    ok: last.quarantined === 0 && last.torn_tail === 0 && recordedPermanent === 0,
+    ok: last.quarantined === 0 && last.torn_tail === 0 && recordedPermanent === 0 && heldStale.length === 0,
     quarantined: last.quarantined,
     torn_tail: last.torn_tail,
     first_bad_offset: last.first_bad_offset ?? firstRecordedOffset,
@@ -3598,9 +3725,13 @@ export async function readLedgerHealth(runDir) {
     quarantined_unacknowledged: recordedPermanent,
     quarantine_file: recorded ? sidecar : null,
     last_read_at: last.at,
-    note: recordedPermanent
-      ? `${recordedPermanent} ledger line(s) never folded into state; raw bytes are in ${sidecar}. Repair the ledger or delete that file to acknowledge.`
-      : null,
+    // DER-2776 — the held-fragment age signal. `held_fragments` is every host currently holding an
+    // unterminated tail line; `held_fragment_stale` is how many of those are past the threshold and is
+    // the field a health gate (W10's `complete-run`) reads. Both are absent-safe: no holds ⇒ [] and 0.
+    held_fragments: held,
+    held_fragment_stale: heldStale.length,
+    held_fragment_max_age_ms: heldAges.length ? Math.max(...heldAges) : null,
+    note: notes.length ? notes.join(" ") : null,
   };
 }
 
@@ -3798,11 +3929,29 @@ export function watchPollMs() {
 // The remote tail is the likeliest place to meet a torn line — `tail -n +N` of a file the mini is
 // actively appending to. Pass `damage` to collect what was dropped (pull-host quarantines it); omit it
 // and the tolerance is still there, which is the point: no consumer can crash on one bad remote line.
-export function mergeRemoteEvents({ remoteLines = [], host, damage } = {}) {
+//
+// DER-2776: …but "dropped" was the wrong verb for the tail line. `terminated:false` means the body did
+// NOT end in a newline, so its LAST element is a writer caught mid-append — the same fact
+// `parseLedgerLines` classifies `torn_tail` on the local side, and the same classification is used here,
+// because `torn_tail` is TRANSIENT: a routine mid-append race must not latch a permanent run-wide damage
+// banner. The fragment is never emitted as an event even when it happens to parse (a complete object
+// missing only its "\n"), because the caller holds the cursor back and re-reads that line next pull —
+// emitting it here would fold the same event twice.
+export function mergeRemoteEvents({ remoteLines = [], host, damage, terminated = true } = {}) {
   const out = [];
   for (let i = 0; i < remoteLines.length; i += 1) {
     const l = remoteLines[i];
     if (!l || !l.trim()) continue;
+    if (!terminated && i === remoteLines.length - 1) {
+      if (damage) {
+        damage.push({
+          reason: "torn_tail", host: host ?? null, offset: null, line: i + 1,
+          bytes: Buffer.byteLength(String(l)), raw: String(l).slice(0, LEDGER_RAW_KEEP),
+          raw_truncated: String(l).length > LEDGER_RAW_KEEP, held: true,
+        });
+      }
+      continue;
+    }
     const v = classifyLedgerLine(l);
     if (!v.ok) {
       if (damage) {
@@ -5077,16 +5226,50 @@ async function pullHostInto(runDir, hostName, runId) {
   const remotePath = `${host.ledgerRoot}/${runId}/events.jsonl`;
   const remote = `tail -n +${cursor + 1} ${remotePath} 2>/dev/null || true`;
   const res = await runCommand({ command: "ssh", args: [host.ssh, remote] });
-  const lines = res.stdout.split("\n").filter((l) => l.trim());
+  // The remote command ends in `|| true`, so a nonzero exit is ssh ITSELF failing — nothing was read.
+  // Return without touching the cursor OR the held-fragment record: clearing the latter here would
+  // restart a stuck line's age clock on every network flap, which is how an age signal becomes a lie.
+  if (res.exitCode !== 0) {
+    return { host: hostName, pulled: 0, quarantined: 0, cursor, held: null, pull_failed: true };
+  }
+  const body = String(res.stdout ?? "");
+  // DER-2776 — two arithmetic facts this line used to get wrong, both of which lose events:
+  //
+  //   1. `tail -n +N` numbers EVERY line, blank ones included; the old `.filter(l => l.trim())` then
+  //      advanced the cursor by the count of NON-BLANK lines. One blank line in a remote ledger and the
+  //      cursor lags by one FOREVER — every subsequent pull re-reads a line it already merged.
+  //   2. The last line of the body is only a LINE if it ended in "\n". `tail` of a file being appended to
+  //      routinely returns a final fragment; counting it advanced the cursor past a line that was never
+  //      folded, so the completed record could never be re-read. That is permanent event loss (a
+  //      `pr_opened` observed missing from a canonical ledger), and it arrived dressed as PERMANENT
+  //      damage (`remote_malformed_json`), latching the run-wide "every number is a LOWER BOUND" banner
+  //      on what is a routine mid-append race.
+  //
+  // So: split on "\n", take everything before the final element as the terminated lines (`"a\nb\n"` and
+  // `"a\nb"` both leave exactly the complete lines there, and `""` leaves none), and advance the cursor by
+  // THAT count. The fragment is held — re-read next cycle, when it will either be complete or still torn.
+  const parts = body.split("\n");
+  const terminated = body === "" || body.endsWith("\n");
+  const lines = parts.slice(0, -1);
+  const fragment = terminated ? null : parts[parts.length - 1];
+  const nextCursor = cursor + lines.length;
   // DER-2738: one torn line in the mini's tail used to throw the whole pull (and the watch cycle that
   // called it). Dropped lines are quarantined with their raw bytes so a lost remote event is VISIBLE —
-  // the per-host cursor still advances past them, so an invisible drop here would be permanent.
+  // for a MALFORMED COMPLETE record the cursor still advances past it, so an invisible drop would be
+  // permanent. The held fragment is the opposite case: it is recorded as `torn_tail` (transient) and the
+  // cursor stays behind it, so it is not a drop at all.
   const damage = [];
-  const events = mergeRemoteEvents({ remoteLines: lines, host: hostName, damage });
+  const events = mergeRemoteEvents({ remoteLines: parts, host: hostName, damage, terminated });
   for (const e of events) await appendEvent(runDir, e);
-  if (damage.length) await recordLedgerDamage(join(runDir, "events.jsonl"), damage, { pulled_from: hostName });
-  await writeFile(join(runDir, `sync-cursor.${hostName}`), String(cursor + lines.length), "utf8");
-  return { host: hostName, pulled: events.length, quarantined: damage.length, cursor: cursor + lines.length };
+  // Unconditional: this is the pull's health record, and "no damage this time" is exactly the answer that
+  // has to overwrite a previous pull's torn_tail — otherwise a tear that HAS healed keeps reading red.
+  await recordLedgerDamage(join(runDir, "events.jsonl"), damage, { pulled_from: hostName, remote_cursor: cursor });
+  const held = await recordHeldFragment(runDir, hostName, { fragment, cursor: nextCursor });
+  await writeFile(join(runDir, `sync-cursor.${hostName}`), String(nextCursor), "utf8");
+  return {
+    host: hostName, pulled: events.length, quarantined: damage.length, cursor: nextCursor,
+    held: held ? { bytes: held.bytes, first_seen_at: held.first_seen_at } : null,
+  };
 }
 
 // Reconcile the ledger against `gh` truth (B3): list merged PRs, append a `pr_merged` for any in-flight
@@ -7298,6 +7481,11 @@ export async function runSubcommand(argv) {
               // the same reason as protocol_skew — an operator must not have to run `state` to find out
               // that the run's source of truth has holes in it. `state.ledger` names the file.
               ledger_damage: !(st.ledger?.ok ?? true),
+              // DER-2776: hosts whose ledger tail has been stuck mid-line past the staleness threshold.
+              // Its own key rather than a second cause of `ledger_damage` because the REMEDY is somewhere
+              // else entirely — nothing here is repairable; the writer on that host is. Empty for the
+              // routine case (a fresh hold is a live writer, not a fault) and self-clearing.
+              ledger_held_fragments: (st.ledger?.held_fragments ?? []).filter((h) => h.stale).map((h) => h.host),
             },
           });
         };
