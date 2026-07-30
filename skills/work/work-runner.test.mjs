@@ -38,7 +38,7 @@ import {
   pendingKickbackFindings, REMOTE_PATH_PRELUDE,
   UNIT_ID_RE, isSpecUnitId,
   EVENT_MARKER, HANDOFF_MARKER, getEventMarkers, getHandoffMarkers,
-  getRepoIdentity,
+  getRepoIdentity, readLedgerHealth,
 } from "./work-runner.mjs";
 // Namespace import for the DER-2737 seams: a missing NAME in the static import list above is a module
 // SyntaxError that takes all 363 tests down with it, which is a useless way to observe a must-fail
@@ -5961,6 +5961,270 @@ test("DER-2738: mergeRemoteEvents tolerates a torn/malformed remote line, record
   const clean = [];
   assert.equal(mergeRemoteEvents({ remoteLines: [good, good], host: "mini", damage: clean }).length, 2);
   assert.equal(clean.length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// DER-2776 — the remote pull must HOLD an unterminated tail line, not consume it
+// ---------------------------------------------------------------------------
+// DER-2738 taught the LOCAL reader that an unterminated final line is a writer mid-append (`torn_tail`,
+// transient, retried) rather than a corrupt record. The REMOTE pull got neither half: it split the ssh
+// stdout, dropped blanks, classified the fragment `remote_malformed_json` (PERMANENT — it latches the
+// run-wide "every number is a LOWER BOUND" banner on a routine race), and advanced the per-host cursor by
+// the number of NON-BLANK lines. Two ways to lose an event, both reproduced below.
+//
+// The ssh stub deliberately EXECUTES the remote command locally instead of replaying canned stdout: the
+// cursor bug is an arithmetic disagreement with `tail -n +N`'s line numbering, so a stub that re-implements
+// tail could only ever confirm whichever numbering the stub itself chose.
+async function withPullHostFixture(body) {
+  const remoteRoot = await mkdtemp(join(tmpdir(), "wr-2776-remote-"));
+  const repoRoot = await mkRepoWithHosts({
+    hosts: {
+      local: { cap: 3 },
+      mini: {
+        enabled: true, cap: 3, ssh: "example-mini-host",
+        repo: "/Users/example/your-repo", worktreeRoot: "/Users/example/agent-work",
+        ledgerRoot: remoteRoot,
+      },
+    },
+  });
+  const runsRoot = join(repoRoot, "runs");
+  const runDir = join(runsRoot, "R1");
+  const bin = join(remoteRoot, "bin");
+  await mkdir(bin, { recursive: true });
+  // `ssh <host> <command>` → run <command> against the LOCAL "remote" ledger, real `tail` and all.
+  await writeFile(join(bin, "ssh"), '#!/bin/sh\nexec /bin/sh -c "$2"\n', "utf8");
+  await chmod(join(bin, "ssh"), 0o755);
+  await mkdir(join(remoteRoot, "R1"), { recursive: true });
+  const remoteLedger = join(remoteRoot, "R1", "events.jsonl");
+  const prevPath = process.env.PATH;
+  process.env.PATH = `${bin}:${prevPath}`;
+  try {
+    await runSubcommand(["init-run", "--project", "sandbox", "--run", "R1", "--runs-root", runsRoot, "--repo-root", repoRoot]);
+    return await body({
+      runDir,
+      remoteLedger,
+      writeRemote: (text) => writeFile(remoteLedger, text, "utf8"),
+      pull: async () => JSON.parse((await runSubcommand([
+        "pull-host", "--run", "R1", "--host", "mini", "--repo-root", repoRoot, "--runs-root", runsRoot,
+      ])).stdout),
+      cursor: async () => Number.parseInt(await readFile(join(runDir, "sync-cursor.mini"), "utf8"), 10),
+      watchPending: async () => JSON.parse((await runSubcommand([
+        "watch", "--run", "R1", "--runs-root", runsRoot, "--repo-root", repoRoot, "--timeout", "1",
+      ])).stdout).pending,
+    });
+  } finally {
+    process.env.PATH = prevPath;
+    await applyRepoConfig("/nonexistent-reset");
+    await rm(remoteRoot, { recursive: true, force: true });
+    await rm(repoRoot, { recursive: true, force: true });
+  }
+}
+
+const D2776_LINE1 = L({ actor: "lead:DER-9", type: "lead_spawned", issue: "DER-9", ts: "2026-07-30T10:00:00.000Z" });
+const D2776_LINE2 = L({ actor: "lead:DER-9", type: "plan_scope", issue: "DER-9", ts: "2026-07-30T10:01:00.000Z" });
+// The real shape: the mini's writer was caught between the last field and the closing brace.
+const D2776_TORN = '{"actor":"lead:DER-9","type":"pr_opened","issue":"DER-9","pr":';
+const D2776_LINE3 = L({ actor: "lead:DER-9", type: "pr_opened", issue: "DER-9", pr: 707, ts: "2026-07-30T10:02:00.000Z" });
+const D2776_LINE4 = L({ actor: "lead:DER-9", type: "handed_off", issue: "DER-9", pr: 707, ts: "2026-07-30T10:03:00.000Z" });
+
+test("DER-2776: a remote line torn on pull #1 still reaches the canonical ledger once it is completed", async () => {
+  await withPullHostFixture(async ({ runDir, writeRemote, pull, cursor }) => {
+    // Pull #1 catches the mini mid-append: two complete lines and a fragment of the third.
+    await writeRemote(`${D2776_LINE1}\n${D2776_LINE2}\n${D2776_TORN}`);
+    const first = await pull();
+    const cursorAfterFirst = await cursor();
+    // The writer finishes line 3 and appends line 4.
+    await writeRemote(`${D2776_LINE1}\n${D2776_LINE2}\n${D2776_LINE3}\n${D2776_LINE4}\n`);
+    const second = await pull();
+    // THE HARM, asserted first: before this fix the cursor had already advanced past the torn line, so the
+    // completed record was never re-read and this array was EMPTY — permanently, in a canonical ledger.
+    const opened = (await readEvents(runDir)).filter((e) => e.type === "pr_opened");
+    assert.equal(opened.length, 1, `the completed pr_opened folds EXACTLY once, got ${JSON.stringify(opened)}`);
+    assert.equal(opened[0].pr, 707);
+    assert.equal(opened[0].host, "mini", "still host-tagged");
+    // …and the mechanism that gets it there.
+    assert.equal(first.pulled, 2, "only the COMPLETE lines fold on pull #1");
+    assert.equal(cursorAfterFirst, 2, "the cursor must stop BEFORE the unterminated line so it can be re-read");
+    assert.ok(first.held && first.held.bytes > 0, `the fragment is reported as held, got ${JSON.stringify(first.held)}`);
+    assert.equal(second.pulled, 2, "the completed line 3 AND line 4 fold on the next pull");
+    assert.equal(await cursor(), 4);
+    assert.equal(second.held, null, "nothing is held once the tail is terminated");
+  });
+});
+
+test("DER-2776: a torn remote tail is TRANSIENT damage — health returns to ok once the line completes", async () => {
+  await withPullHostFixture(async ({ runDir, writeRemote, pull }) => {
+    await writeRemote(`${D2776_LINE1}\n${D2776_LINE2}\n${D2776_TORN}`);
+    await pull();
+    const torn = await readLedgerHealth(runDir);
+    await writeRemote(`${D2776_LINE1}\n${D2776_LINE2}\n${D2776_LINE3}\n${D2776_LINE4}\n`);
+    await pull();
+    const healed = await readLedgerHealth(runDir);
+    // THE HARM, asserted first: classifying the fragment as a corrupt COMPLETE record made a routine
+    // mid-append race latch `ok:false quarantined_unacknowledged:1` — the run-wide "every number you read
+    // from this run is a LOWER BOUND" banner — permanently, with no operator action able to be wrong.
+    assert.equal(healed.ok, true, `health must recover once the line folds, got ${JSON.stringify(healed)}`);
+    assert.equal(healed.quarantined_unacknowledged, 0, "a mid-append race must not latch a permanent banner");
+    assert.equal(healed.torn_tail, 0);
+    assert.equal(healed.note, null);
+    // …and while it WAS torn it was still recorded — transiently, which is the whole distinction.
+    assert.equal(torn.torn_tail, 1, "the fragment is recorded as a torn tail");
+    assert.equal(torn.quarantined_unacknowledged, 0, "a mid-append race is NOT permanent damage");
+    assert.equal(torn.held_fragment_stale, 0, "a fresh hold is a live writer, not a fault");
+  });
+});
+
+test("DER-2776: the cursor counts lines the way `tail -n +N` does — a blank remote line does not desync it", async () => {
+  await withPullHostFixture(async ({ runDir, writeRemote, pull, cursor }) => {
+    // Three lines by tail's numbering; only two of them are events.
+    await writeRemote(`${D2776_LINE1}\n\n${D2776_LINE3}\n`);
+    const first = await pull();
+    assert.equal(first.pulled, 2, "a blank line is not an event");
+    assert.equal(await cursor(), 3, "…but it IS a line: the cursor must skip it, or every later pull re-reads");
+    // Nothing new on the mini. A cursor that lags by the blank line re-delivers the last event forever.
+    const second = await pull();
+    assert.equal(second.pulled, 0, "a re-pull with no new remote lines must merge nothing");
+    const opened = (await readEvents(runDir)).filter((e) => e.type === "pr_opened");
+    assert.equal(opened.length, 1, `the same remote event must not fold twice, got ${JSON.stringify(opened)}`);
+    assert.equal(await cursor(), 3, "and the cursor stays put");
+  });
+});
+
+test("DER-2776: a held fragment ages — past the threshold it becomes a visible signal, and clears when the line completes", async () => {
+  await withPullHostFixture(async ({ runDir, writeRemote, pull, watchPending }) => {
+    await writeRemote(`${D2776_LINE1}\n${D2776_LINE2}\n${D2776_TORN}`);
+    await pull();
+    // CONTROL first: under the real threshold a hold seconds old is silent. Without this, a signal that
+    // fires on every mid-append race would "prove" the same assertions below and mean nothing.
+    const fresh = await readLedgerHealth(runDir);
+    assert.equal((fresh.held_fragments ?? []).length, 1, "the hold is tracked from the first pull that sees it");
+    assert.equal(fresh.held_fragment_stale, 0, "…but a fresh hold raises no signal");
+    // Now the dead-writer case: nobody ever finishes that line.
+    await withEnv({ WORK_LEDGER_HELD_STALE_MS: "0" }, async () => {
+      const stale = await readLedgerHealth(runDir);
+      assert.equal(stale.held_fragment_stale, 1, "past the threshold the stuck line is a fact about the run");
+      assert.equal((stale.held_fragments ?? [])[0]?.host, "mini", "and it names the host to go look at");
+      assert.equal(stale.ok, false, "a line nobody is finishing means every count is a lower bound");
+      assert.match(String(stale.note ?? ""), /mini/, "the note names the host");
+      assert.deepEqual((await watchPending()).ledger_held_fragments ?? [], ["mini"],
+        "surfaced on EVERY wake — a hold retried invisibly forever is exactly what this fix would otherwise buy");
+    });
+    // Self-clearing: the writer finishes the line and the signal goes away on its own, at threshold 0.
+    await writeRemote(`${D2776_LINE1}\n${D2776_LINE2}\n${D2776_LINE3}\n${D2776_LINE4}\n`);
+    await pull();
+    await withEnv({ WORK_LEDGER_HELD_STALE_MS: "0" }, async () => {
+      const healed = await readLedgerHealth(runDir);
+      assert.equal((healed.held_fragments ?? []).length, 0, "the held record is deleted by the pull that folds the line");
+      assert.equal(healed.held_fragment_stale, 0);
+      assert.deepEqual((await watchPending()).ledger_held_fragments ?? [], []);
+    });
+  });
+});
+
+test("DER-2776: the FIRST pull of a ledger whose ONLY line is torn holds everything and advances nothing", async () => {
+  // The cursor-0 boundary: no terminated lines at all, so the arithmetic has to yield an EMPTY line list
+  // and leave the cursor exactly where it started. Getting this wrong by one skips the run's first event.
+  await withPullHostFixture(async ({ runDir, writeRemote, pull, cursor }) => {
+    await writeRemote(D2776_TORN); // one fragment, no newline, nothing else in the file
+    const first = await pull();
+    assert.equal(first.pulled, 0, "there is no complete line to fold");
+    assert.equal(await cursor(), 0, "the cursor must stay at 0 — the only line is still being written");
+    assert.ok(first.held && first.held.bytes > 0, `the fragment is held, got ${JSON.stringify(first.held)}`);
+    await writeRemote(`${D2776_LINE3}\n`);
+    const second = await pull();
+    const opened = (await readEvents(runDir)).filter((e) => e.type === "pr_opened");
+    assert.equal(opened.length, 1, `the run's FIRST remote event still arrives, got ${JSON.stringify(opened)}`);
+    assert.equal(second.pulled, 1);
+    assert.equal(await cursor(), 1);
+    assert.equal(second.held, null);
+  });
+});
+
+test("DER-2776: a stale hold can be ACKNOWLEDGED — health must not be permanently unclearable", async () => {
+  // If the host is gone for good (a reaped mini whose writer died mid-line), no future pull can ever
+  // complete that line, so a signal with no off switch would make the run impossible to finish. The
+  // escape is the same shape as the quarantine sidecar's: delete the record.
+  await withPullHostFixture(async ({ runDir, writeRemote, pull }) => {
+    await writeRemote(`${D2776_LINE1}\n${D2776_TORN}`);
+    await pull();
+    await withEnv({ WORK_LEDGER_HELD_STALE_MS: "0" }, async () => {
+      const stuck = await readLedgerHealth(runDir);
+      assert.equal(stuck.held_fragment_stale, 1);
+      const file = (stuck.held_fragments ?? [])[0]?.file;
+      assert.equal(file, join(runDir, "sync-held.mini.json"), "health names the file to delete");
+      assert.match(String(stuck.note ?? ""), /delete/i, "…and the note says so, or nobody finds it");
+      await rm(file, { force: true });
+      const acked = await readLedgerHealth(runDir);
+      assert.equal(acked.held_fragment_stale, 0, "acknowledged");
+      assert.equal((acked.held_fragments ?? []).length, 0);
+    });
+  });
+});
+
+test("DER-2776: an EMPTY WORK_LEDGER_HELD_STALE_MS reads as UNSET, not as a zero threshold", async () => {
+  // `export WORK_LEDGER_HELD_STALE_MS=` is a normal thing for a shell to do, and `Number("")` is 0 — a 0
+  // threshold marks every live writer's mid-append as a dead one, i.e. the loudest possible always-on
+  // signal. Named through the namespace so an absent seam fails as an assertion, not a module TypeError.
+  assert.equal(typeof WR.ledgerHeldStaleMs, "function", "the threshold is a seam, not a magic number");
+  const dflt = WR.LEDGER_HELD_STALE_MS_DEFAULT;
+  assert.ok(dflt > 0, "the default must be a real window");
+  await withEnv({ WORK_LEDGER_HELD_STALE_MS: "" }, () => assert.equal(WR.ledgerHeldStaleMs(), dflt));
+  await withEnv({ WORK_LEDGER_HELD_STALE_MS: "   " }, () => assert.equal(WR.ledgerHeldStaleMs(), dflt));
+  await withEnv({ WORK_LEDGER_HELD_STALE_MS: "nonsense" }, () => assert.equal(WR.ledgerHeldStaleMs(), dflt));
+  await withEnv({ WORK_LEDGER_HELD_STALE_MS: "-5" }, () => assert.equal(WR.ledgerHeldStaleMs(), dflt));
+  await withEnv({ WORK_LEDGER_HELD_STALE_MS: undefined }, () => assert.equal(WR.ledgerHeldStaleMs(), dflt));
+  // CONTROL: a real value IS honoured, or the assertions above would pass on a hardcoded constant.
+  await withEnv({ WORK_LEDGER_HELD_STALE_MS: "0" }, () => assert.equal(WR.ledgerHeldStaleMs(), 0));
+  await withEnv({ WORK_LEDGER_HELD_STALE_MS: "1500" }, () => assert.equal(WR.ledgerHeldStaleMs(), 1500));
+});
+
+test("DER-2776: an unterminated line that happens to PARSE is still held — and still folds exactly once", async () => {
+  // The duplicate this fix could have introduced. A partial write can leave a syntactically complete
+  // object with no "\n" yet; folding it AND holding the cursor behind it would fold the same event twice
+  // on the next pull. Held, never emitted, folded once — asserted because "it parsed" is the tempting
+  // shortcut here.
+  await withPullHostFixture(async ({ runDir, writeRemote, pull, cursor }) => {
+    await writeRemote(`${D2776_LINE1}\n${D2776_LINE3}`); // valid JSON, no trailing newline
+    const first = await pull();
+    assert.equal(first.pulled, 1, "a complete-looking fragment is still not a line");
+    assert.equal(await cursor(), 1);
+    await writeRemote(`${D2776_LINE1}\n${D2776_LINE3}\n`); // the writer adds only the newline
+    const second = await pull();
+    assert.equal(second.pulled, 1);
+    assert.equal(await cursor(), 2);
+    const opened = (await readEvents(runDir)).filter((e) => e.type === "pr_opened");
+    assert.equal(opened.length, 1, `folded exactly once, got ${JSON.stringify(opened)}`);
+  });
+});
+
+test("DER-2776: an ssh transport failure changes nothing — cursor and hold age both survive it", async () => {
+  // The age clock is only meaningful if a network flap cannot restart it, and the cursor must not move on
+  // a pull that read nothing. Both are what "held forever" would otherwise hide.
+  await withPullHostFixture(async ({ runDir, writeRemote, pull, cursor }) => {
+    await writeRemote(`${D2776_LINE1}\n${D2776_TORN}`);
+    await pull();
+    // Tolerant read: with no hold record at all this must fail as an ASSERTION about behaviour, not as an
+    // ENOENT — a test that crashes on the parent proves nothing about what the parent does.
+    const readHeld = async () => JSON.parse(await readFile(join(runDir, "sync-held.mini.json"), "utf8").catch(() => "null"));
+    const before = await readHeld();
+    assert.ok(before?.first_seen_at, `the hold records when it was first seen, got ${JSON.stringify(before)}`);
+    const prevPath = process.env.PATH;
+    const brokenBin = await mkdtemp(join(tmpdir(), "wr-2776-noss-"));
+    try {
+      await writeFile(join(brokenBin, "ssh"), "#!/bin/sh\nprintf 'ssh: connect: refused\\n' >&2\nexit 255\n", "utf8");
+      await chmod(join(brokenBin, "ssh"), 0o755);
+      process.env.PATH = `${brokenBin}:${prevPath}`;
+      const failed = await pull();
+      assert.equal(failed.pull_failed, true, "a failed pull says so rather than reporting a clean zero");
+      assert.equal(failed.pulled, 0);
+    } finally {
+      process.env.PATH = prevPath;
+      await rm(brokenBin, { recursive: true, force: true });
+    }
+    assert.equal(await cursor(), 1, "a pull that read nothing must not move the cursor");
+    const after = await readHeld();
+    assert.equal(after?.first_seen_at, before?.first_seen_at, "…and must not restart the hold's age clock");
+  });
 });
 
 // ---------------------------------------------------------------------------
