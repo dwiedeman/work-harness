@@ -28,7 +28,7 @@
 // prevent: a check that cannot fail is not evidence.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, writeFile, appendFile, readFile, rm } from "node:fs/promises";
+import { mkdtemp, writeFile, appendFile, readFile, rm, access } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
@@ -293,6 +293,108 @@ test("PIN DER-2323: a descendant-sha hand-off still clears a kickback with NO de
   assert.equal(!!st.issues["DER-1"].kickback_unactioned, false,
     "DEFECT PIN: a head move currently counts as delivery. If the kickback now stays pending, DER-2323 " +
     "has landed — INVERT this pin. NOTE: DER-2323 is gated on DER-2823's measurement; do not 'fix' it here.");
+});
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// DER-2836 — THE EVIDENCE SANDBOX CANNOT BE MADE TO DELETE A FILE
+//
+// This is the fault-injection case the unit suite structurally cannot make: the unit tests call the
+// validator, which is a PREDICATE — it returns strings and never spawns, so a unit test asserting "this
+// is refused" would stay green even if the runner executed every payload it refused. The gap between
+// "the validator said no" and "nothing ran" is exactly where this P0 lived, and only a real subprocess
+// against a real filesystem can close it.
+//
+// So each case plants a CANARY FILE and asserts it SURVIVES. That assertion, not the exit code, is the
+// one that fails on the parent commit: there `find . $(printf -- -delete)` passed the validator, reached
+// `spawnSync(…, {shell: true})`, and the shell expanded the substitution into find's `-delete` — the
+// canary was gone and the gate reported nothing wrong.
+//
+// ALL SIX WERE OBSERVED RED ON THE PARENT COMMIT, BUT NOT ALL IN THE SAME WAY, AND THE DIFFERENCE IS
+// STATED RATHER THAN AVERAGED OVER:
+//   • the five expansion cases (substitution, backtick, alternate generator, quoted, `$'…'`) each RED on
+//     the CANARY assertion — the file was actually deleted;
+//   • the glob case RED on the REFUSAL assertion — the validator passed it and the payload ran, but BSD
+//     `find` rejects `find . -delete canary.txt plan.json` on its own argument grammar before deleting
+//     anything. Whether pathname expansion reaches a deletion is a property of the local `find`, not of
+//     the harness; what this suite pins is that the query is refused BEFORE that question can be asked.
+// Both are real REDs. Claiming six deletions when the sixth was an execution would be the overclaim this
+// repo's review rules exist to catch.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+const PREP = join(REPO, "skills/prep-for-work/prep-runner.mjs");
+
+function prep(args, { timeoutMs = 30000, cwd = REPO } = {}) {
+  return new Promise((res) => {
+    execFile(process.execPath, [PREP, ...args], { timeout: timeoutMs, cwd, encoding: "utf8" }, (err, stdout, stderr) => {
+      const timedOut = !!(err && (err.killed || err.signal === "SIGTERM"));
+      res({ code: timedOut ? null : (err?.code ?? 0), timedOut, stdout: stdout ?? "", stderr: stderr ?? "", out: `${stdout ?? ""}${stderr ?? ""}` });
+    });
+  });
+}
+
+// A throwaway repo holding one canary file, plus a plan whose single evidence query is `query`.
+//
+// `plantDashDelete` writes a file literally NAMED `-delete`. That is what makes the glob case a real
+// deletion rather than a refusal-only assertion: pathname expansion can only synthesize an option if a
+// file with that name exists to be matched, so without it `find . *` is harmless and the case would prove
+// nothing about the payload — only about the refusal. A repository is semi-trusted input here, and a
+// committed file named `-delete` is the supply-chain shape of this bug.
+async function sandboxWithQuery(t, query, { plantDashDelete = false } = {}) {
+  const root = await mkdtemp(join(tmpdir(), "wh-e2e-q-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const canary = join(root, "canary.txt");
+  await writeFile(canary, "if this file is gone, the evidence sandbox executed a payload\n", "utf8");
+  if (plantDashDelete) await writeFile(join(root, "-delete"), "an adversarially-named file\n", "utf8");
+  const planPath = join(root, "plan.json");
+  await writeFile(planPath, JSON.stringify({
+    evidenceQueries: [{ name: "injected", query, window: "n/a", expectAtLeast: 1 }],
+  }, null, 2), "utf8");
+  return { root, canary, planPath, run: () => prep(["query-check", planPath, "--repo-root", root], { cwd: root }) };
+}
+
+// Every payload here is a DIFFERENT generator or a DIFFERENT expansion mechanism. A fix that string-
+// matched `printf`, or that only modelled `$(…)`, leaves most of this list green-on-the-wrong-answer.
+for (const [mechanism, query, opts] of [
+  ["$(…) substitution", `find . $(printf -- -delete)`, {}],
+  ["backtick substitution", "find . `printf -- -delete`", {}],
+  ["a different generator (echo)", `find . $(echo -delete)`, {}],
+  ["a quoted substitution", `find . "$(printf -- -delete)"`, {}],
+  ["ANSI-C quoting, no substitution at all", `find . $'-delete'`, {}],
+  ["an unquoted glob", `find . *`, { plantDashDelete: true }],
+]) {
+  test(`query-check refuses ${mechanism} AND the canary file survives (DER-2836)`, async (t) => {
+    const S = await sandboxWithQuery(t, query, opts);
+    const r = await S.run();
+
+    // 1. THE ASSERTION THAT FAILS ON THE PARENT COMMIT. Checked FIRST and independently of the exit
+    //    code: a gate that refused loudly while the payload had already run would still be the bug.
+    await access(S.canary); // throws if the payload deleted it
+
+    // 2. And it is refused, rather than run-and-found-harmless.
+    assert.equal(r.timedOut, false, "query-check TIMED OUT — UNKNOWN, not a refusal");
+    assert.equal(r.code, 1, `expected a refusal (exit 1), got ${r.code}\n${r.out}`);
+    assert.match(r.out, /expansion|substitut|glob/i, `the refusal must name the mechanism:\n${r.out}`);
+  });
+}
+
+// The control that stops the six cases above from being satisfied by a validator that refuses
+// everything: a real read-only pipeline still RUNS, and returns a real count off the real filesystem.
+test("query-check still RUNS a legitimate read-only query after the DER-2836 fix", async (t) => {
+  const S = await sandboxWithQuery(t, `find . -name 'canary.txt'`);
+  const r = await S.run();
+  await access(S.canary);
+  assert.equal(r.code, 0, `a legitimate query must still run and pass:\n${r.out}`);
+  assert.match(r.out, /ok\s+plan evidenceQueries\[0\]/, `expected a passing row:\n${r.out}`);
+});
+
+// Pipelines are the documented feature and they are now stitched in JS rather than by a shell. If the
+// hand-rolled piping regressed, this is the case that catches it — two stages, the second consuming the
+// first, counted numerically.
+test("query-check pipes stage-to-stage without a shell (DER-2836)", async (t) => {
+  const S = await sandboxWithQuery(t, `find . -name 'canary.txt' | grep -c canary`);
+  const r = await S.run();
+  assert.equal(r.code, 0, `a two-stage pipeline must still run:\n${r.out}`);
+  assert.match(r.out, /1 ≥ 1/, `the second stage must have consumed the first's output:\n${r.out}`);
 });
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────

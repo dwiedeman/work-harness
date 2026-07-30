@@ -18,6 +18,9 @@
 // plan file. Run: node prep-runner.mjs <subcommand>
 
 import { readFile, writeFile, access, mkdir } from "node:fs/promises";
+// Sync, deliberately: `runEvidenceQuery` reproduces a `< file` redirect inside a spawnSync pipeline, and
+// an await there would make the executor async for every caller to satisfy one rare redirect form.
+import { readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { resolve, join } from "node:path";
@@ -952,12 +955,30 @@ export function evidenceQueryProblems(q) {
 // ---------------------------------------------------------------------------
 // SHELL SAFETY for evidenceQueries[].query (2026-07-29)
 // ---------------------------------------------------------------------------
-// `query-check` hands each query to spawnSync(…, { shell: true }) — a real shell, in the operator's repo,
-// with the operator's credentials and ssh agent. The query text arrives from the PLAN FILE, and a plan is
-// assembled from Linear issue prose and from lead output, so this is a path from semi-trusted content to
-// arbitrary command execution. Note the sibling sweep in priorart-check already runs its engines in ARGV
-// form (spawnSync(cmd, args) with no shell) and reasons in its comment about what the shell hides — this
-// file already knew the distinction; the query runner was the outlier.
+// `query-check` runs each query in the operator's repo with the operator's credentials and ssh agent. The
+// query text arrives from the PLAN FILE, and a plan is assembled from Linear issue prose and from lead
+// output, so this is a path from semi-trusted content to command execution.
+//
+// UNTIL 2026-07-30 THAT PATH ENDED IN spawnSync(…, { shell: true }), AND THAT MADE THE VALIDATOR BELOW
+// DECORATIVE (DER-2836). A shell expands the query a SECOND time, after validation, so the arguments the
+// command finally received were not the arguments any rule here read. `find . $(printf -- -delete)` passed
+// every check — the substitution was validated on its own (`printf` is read-only and allowlisted) and then
+// collapsed to a placeholder, so `find`'s `-delete` rule was applied to a word that was not yet `-delete`.
+// The same hole was `$'-delete'` and `$EVIL` (no substitution at all, just expansion) and an unquoted glob
+// in a repo containing a file NAMED `-delete`. Enumerating shell expansions and refusing each one is a fix
+// that is only as good as the enumeration; the fix taken instead REMOVES THE EXPANDER:
+//
+//   `runEvidenceQuery` executes the parsed pipeline in ARGV form — spawnSync(cmd, args) with no shell, one
+//   stage at a time, stdout of each piped into the next. There is no second expansion, so the argument the
+//   rules below read IS the argument execve delivers. That is a property of the execution model, not of
+//   this file's list of things a shell can do. The sibling sweep in priorart-check already ran its engines
+//   this way and reasoned in its comment about what the shell hides — the query runner was the outlier.
+//
+// Because nothing expands them any more, words that a shell WOULD have expanded are refused rather than
+// passed through literally: an operator who wrote `$(git rev-parse HEAD)` meant the commit, not the eleven
+// characters, and silently running the literal text would answer a different question. That refusal is
+// about honesty, and about defense in depth if a future caller reintroduces a shell — it is NOT what makes
+// this safe. Argv execution is.
 //
 // The queries are LEGITIMATELY shell pipelines — `git log --oneline --since=… | grep -c 'fix('` is the
 // documented shape — so banning pipes or quotes would delete the feature. Instead this is an ALLOWLIST
@@ -979,8 +1000,12 @@ export function evidenceQueryProblems(q) {
 //      — `< /dev/tcp/host/port` is an outbound connection and `< $(…)` is an unchecked command. `&`
 //      (background), subshell grouping, heredocs and process substitution are refused as unparsed-by-us
 //      rather than assumed safe.
-//   5. Command substitution `$(…)` / backticks is validated RECURSIVELY by these same rules, so
-//      `$(git rev-parse HEAD)` keeps working while `$(rm -rf .)` is refused.
+//   5. A word carrying ANY shell expansion — `$(…)`, backticks, `$VAR`, `$'…'`, `${…}` — is refused in
+//      EVERY position, not only the command name. Before DER-2836 substitutions were instead validated
+//      recursively and allowed, which is what made rule 3 bypassable: a nested command that is itself
+//      read-only (`printf`, `echo`, `cat`) still emits arbitrary TEXT, and that text became an option of
+//      the outer command. An unquoted glob (`*`, `?`, `[…]`) is refused for the adjacent reason: argv
+//      execution does not expand it, so it would silently match nothing where a shell matched files.
 //
 // READ-ONLY IS NOT THE WHOLE TEST — THE SECOND TEST IS "CAN IT REACH A NETWORK" (DER-2777). A command that
 // writes nothing locally still exfiltrates if it can name a remote, because the request URL lands in the
@@ -1311,6 +1336,18 @@ function lexShellQuery(src) {
   return { tokens, problems };
 }
 
+// Does this word carry something a shell would have expanded? `nested` is a `$(…)`/backtick the lexer
+// pulled out, `dynamic` is a bare `$` (a parameter, `$'…'`, `$((…))`), and the placeholder is what a
+// substitution left behind in the text. Any of the three means the word the rules read is not the word the
+// operator's shell would have produced — which is the whole of DER-2836.
+const wordExpands = (w) => w.nested.length > 0 || w.dynamic || w.text.includes(SUBST_PLACEHOLDER);
+// Unquoted pathname-expansion metacharacters. `quoted` is true when ANY part of the word was quoted, so a
+// half-quoted `'x'*` reads as quoted here and is NOT refused — deliberately imprecise in the permissive
+// direction, because under argv execution an unexpanded glob is a WRONG ANSWER, never an unsafe one. The
+// security boundary is that no shell runs; this check only stops a query from silently meaning something
+// other than what its author read.
+const UNQUOTED_GLOB = /[*?[]/;
+
 const SEPARATORS = new Set(["|", "||", "&&", ";", "\n"]);
 const REDIRECT_OUT = new Set([">", ">>", ">|", "&>", "&>>"]);
 // `< /dev/tcp/host/port` is bash's socket syntax (and /bin/sh IS bash on macOS); `/inet/…` is gawk's.
@@ -1323,24 +1360,23 @@ const REDIRECT_IN_REFUSED = /^\/dev\/(?!null\b)|^\/inet[46]?\//;
 //
 //   problems — an empty array means "read-only by construction as far as this validator can tell".
 //   stages   — one entry per pipeline segment that has a command, in source order:
-//                { separator: string|null, command: string|null, words: string[] }
+//                { separator: string|null, command: string|null, words: string[], redirects: {…} }
 //              `separator` is the shell operator that JOINED this stage to the previous one — `"|"`,
 //              `"&&"`, `"||"`, `";"`, `"\n"` — and null on the first stage. A consumer asking "does the
 //              last stage count the output of the one before it?" must check this: a `;`-separated
 //              trailing `wc -l` counts nothing the earlier stage produced. `command` is the literal
 //              command name, or null when the name is built by expansion (which `problems` also refuses).
 //              `words` are the segment's command words with quotes removed and each `$(…)` collapsed to
-//              the SUBST_PLACEHOLDER sentinel; redirect operators and their targets are NOT words.
-//              Substitutions are validated recursively but their stages are not surfaced — `stages`
-//              describes the top-level pipeline only.
+//              the SUBST_PLACEHOLDER sentinel; redirect operators and their targets are NOT words — they
+//              are resolved into `redirects` ({stdoutToNull, stderrToNull, stderrToStdout, stdinFile}),
+//              which is what `runEvidenceQuery` needs to reproduce them without a shell to interpret them.
 //
 // `stages` is a PARSE, not a verdict: it is populated whenever the lexer succeeded, including for queries
 // that `problems` refuses. Check `problems` first; only a query with no problems is one that will run.
-export function parseEvidenceQuery(query, { depth = 0 } = {}) {
+export function parseEvidenceQuery(query) {
   const refuse = (p) => ({ problems: [p], stages: [] });
   if (typeof query !== "string") return refuse("query is not a string — nothing to run");
   if (!query.trim()) return refuse("query is empty — nothing to run");
-  if (depth > 3) return refuse("nests command substitution more than 3 deep — refused as unreviewable");
   if (/\.git\/hooks/.test(query)) return refuse("mentions .git/hooks — a query that touches the hook directory is not evidence, it is persistence");
 
   const { tokens, problems } = lexShellQuery(query);
@@ -1357,17 +1393,26 @@ export function parseEvidenceQuery(query, { depth = 0 } = {}) {
   for (const seg of segments) {
     if (!seg.tokens.length) continue;
     const words = [];
+    // What the redirect operators in this segment mean, resolved here so the executor never re-reads the
+    // raw text. Only the forms the checks below ACCEPT are recorded; a refused redirect leaves this at its
+    // default, and the query does not run at all.
+    const redirects = { stdoutToNull: false, stderrToNull: false, stderrToStdout: false, stdinFile: null };
     for (let k = 0; k < seg.tokens.length; k += 1) {
       const t = seg.tokens[k];
       if (t.kind === "word") { words.push(t); continue; }
       const target = seg.tokens[k + 1]?.kind === "word" ? seg.tokens[k + 1] : null;
       if (REDIRECT_OUT.has(t.text)) {
         if (target?.text !== "/dev/null") out.push(`redirects output (\`${t.text}${target ? ` ${target.text}` : ""}\`) — an evidence query may only READ; the sole allowed target is /dev/null`);
+        else if (t.text.startsWith("&")) { redirects.stdoutToNull = true; redirects.stderrToNull = true; }
+        else if (t.fd === "2") redirects.stderrToNull = true;
+        else redirects.stdoutToNull = true;
         k += target ? 1 : 0;
         continue;
       }
       if (t.text === ">&" || t.text === "<&") {
         if (!target || !/^(\d+|\/dev\/null)$/.test(target.text)) out.push(`duplicates a file descriptor onto \`${target?.text ?? "?"}\` — only \`2>&1\`-style fd duplication and /dev/null are allowed`);
+        else if (target.text === "/dev/null") { if (t.fd === "2") redirects.stderrToNull = true; else redirects.stdoutToNull = true; }
+        else if (t.fd === "2" && target.text === "1") redirects.stderrToStdout = true;
         k += target ? 1 : 0;
         continue;
       }
@@ -1375,10 +1420,17 @@ export function parseEvidenceQuery(query, { depth = 0 } = {}) {
         // Reading a file in is a read — but ONLY a file, and only one this validator can see the name of.
         if (!target) {
           out.push("has a `<` with nothing after it — an input redirect must name a literal file");
-        } else if (target.nested.length || target.dynamic || target.text.includes(SUBST_PLACEHOLDER)) {
+        } else if (wordExpands(target)) {
           out.push(`takes its \`<\` input from an expansion (\`< ${target.text.replace(SUBST_PLACEHOLDER, "$(…)")}\`) — the source of a redirect must be a literal path, or the redirect smuggles in a command nobody checked`);
         } else if (REDIRECT_IN_REFUSED.test(target.text)) {
           out.push(`reads \`< ${target.text}\` — /dev/tcp, /dev/udp and gawk's /inet special files are SOCKETS, so an input redirect from one is an outbound connection, not a read (the sole device an evidence query may read is /dev/null)`);
+        } else if (!target.quoted && UNQUOTED_GLOB.test(target.text)) {
+          // Same family as the argument check below: a redirect target is a word a shell would have
+          // expanded too. Refused here rather than left to fail as a missing file at run time, so the
+          // operator reads one message about globs instead of two unrelated ones.
+          out.push(`takes its \`<\` input from the unquoted glob \`${target.text}\` — refused: the query runs in argv form with NO shell, so the pattern is not expanded and would be opened as a literal filename. Name the file.`);
+        } else {
+          redirects.stdinFile = target.text;
         }
         k += target ? 1 : 0;
         continue;
@@ -1388,15 +1440,24 @@ export function parseEvidenceQuery(query, { depth = 0 } = {}) {
     if (!words.length) continue;
 
     const cmd = words[0];
-    const built = cmd.nested.length > 0 || cmd.dynamic || cmd.text.includes(SUBST_PLACEHOLDER);
+    const built = wordExpands(cmd);
     const bare = /^[A-Za-z][A-Za-z0-9_.+-]*$/.test(cmd.text);
-    stages.push({ separator: seg.separator, command: !built && bare ? cmd.text : null, words: words.map((w) => w.text) });
-    for (const w of words) for (const n of w.nested) {
-      for (const p of parseEvidenceQuery(n, { depth: depth + 1 }).problems) out.push(`inside \`$(${n})\`: ${p}`);
-    }
+    stages.push({ separator: seg.separator, command: !built && bare ? cmd.text : null, words: words.map((w) => w.text), redirects });
     if (built) {
       out.push(`builds its command name by expansion (\`${cmd.text.replace(SUBST_PLACEHOLDER, "$(…)")}\`) — the command must be a literal name so it can be checked against the allowlist`);
       continue;
+    }
+    // DER-2836 — EVERY word, not only the command name. An argument built by expansion is an argument no
+    // rule below has read: `find . $(printf -- -delete)` reached find's `-delete` rule as the placeholder
+    // and passed it. Refused rather than passed through literally, because the query is now executed in
+    // argv form and nothing would expand it — running the literal text answers a different question than
+    // the one the operator wrote.
+    for (const w of words.slice(1)) {
+      if (wordExpands(w)) {
+        out.push(`builds the argument \`${w.text.replace(SUBST_PLACEHOLDER, "$(…)")}\` by expansion — refused: the query runs in argv form with NO shell, so nothing expands it, and a value produced at run time is a value no option rule here could check (\`$(printf -- -delete)\` is how \`find\`'s -delete rule was bypassed). Inline the literal value.`);
+      } else if (!w.quoted && UNQUOTED_GLOB.test(w.text)) {
+        out.push(`contains the unquoted glob \`${w.text}\` — refused: the query runs in argv form with NO shell, so the pattern is NOT expanded to matching files and the command would receive it literally. Quote it and let the command match (\`find . -name '*.mjs'\`, \`git ls-files 'src/**'\`), or name the files.`);
+      }
     }
     const name = cmd.text;
     if (!bare) {
@@ -1419,8 +1480,72 @@ export function parseEvidenceQuery(query, { depth = 0 } = {}) {
 // THE pure predicate behind the seam: the reasons a query may not be run, empty when it is read-only by
 // construction. Exported so the rules are unit-testable directly rather than only through a spawn — every
 // caller that only wants the verdict uses this rather than reaching for the parse.
-export function evidenceQueryShellProblems(query, { depth = 0 } = {}) {
-  return parseEvidenceQuery(query, { depth }).problems;
+export function evidenceQueryShellProblems(query) {
+  return parseEvidenceQuery(query).problems;
+}
+
+// ---------------------------------------------------------------------------
+// Executing an evidence query WITHOUT a shell (DER-2836)
+// ---------------------------------------------------------------------------
+// The validator above is a predicate over the text; this is what makes its verdict binding. Each stage is
+// spawned in argv form — `spawnSync(cmd, args)`, no `shell: true` — so the words the rules read are the
+// words execve receives. There is no second expansion pass for a `$(…)` to hide in.
+//
+// Pipes are BUFFERED, not concurrent: each stage runs to completion and its stdout becomes the next
+// stage's stdin. Two consequences, both deliberate and both harmless for evidence queries (bounded output,
+// one 60s budget for the whole pipeline): an upstream stage is not SIGPIPE'd when a downstream `head` has
+// seen enough, so it does all its work; and `2>&1` appends stderr after stdout rather than interleaving
+// them, because interleaving cannot be reconstructed from two captured buffers. Line COUNTS — the only
+// thing any caller reads out of this — are unaffected by either.
+//
+// `&&` / `||` short-circuit left-to-right off the previous stage's status, which is exactly the shell's
+// left-associative evaluation for a flat list; `;` and newline reset stdin. The pipeline's status and
+// stdout are the LAST EXECUTED stage's, matching the shell. Returns a spawnSync-SHAPED object so
+// `evaluateQueryRun` reads a run the same way whoever wrote it intended.
+export function runEvidenceQuery(query, { cwd = process.cwd(), timeout = 60_000 } = {}) {
+  const { problems, stages } = parseEvidenceQuery(query);
+  // Defense in depth, not the gate: `query-check` refuses before it ever calls this. A refused query
+  // reaching here is a bug in the caller, and it must fail rather than run.
+  if (problems.length) return { status: null, stdout: "", stderr: "", signal: null, error: new Error(`refused by the evidence-query policy, not executed: ${problems.join(" · ")}`) };
+
+  const deadline = Date.now() + timeout;
+  let input = "";
+  let prev = 0;
+  let last = { status: 0, stdout: "", stderr: "", signal: null, error: null };
+  for (const st of stages) {
+    if (st.separator === "&&" && prev !== 0) continue;
+    if (st.separator === "||" && prev === 0) continue;
+    if (st.separator !== "|") input = "";
+    // Unreachable while `problems` is empty — an expansion-built name is always a problem — but a null
+    // command here would otherwise spawn `undefined`, so it fails closed instead of being assumed.
+    if (!st.command) return { status: null, stdout: "", stderr: "", signal: null, error: new Error("a pipeline stage has no literal command name — refusing to guess at it") };
+
+    let stdin = input;
+    if (st.redirects.stdinFile) {
+      try { stdin = readFileSync(resolve(cwd, st.redirects.stdinFile), "utf8"); }
+      catch (e) {
+        // What a shell does with an unreadable `<` target: report it, do NOT run the command, exit nonzero.
+        prev = 1;
+        last = { status: 1, stdout: "", stderr: `${st.redirects.stdinFile}: ${e.code ?? e.message}\n`, signal: null, error: null };
+        continue;
+      }
+    }
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return { ...last, status: null, signal: "SIGTERM" };
+
+    const r = spawnSync(st.command, st.words.slice(1), { cwd, encoding: "utf8", timeout: remaining, input: stdin, shell: false });
+    if (r.error || r.signal) return { status: null, stdout: "", stderr: String(r.stderr ?? ""), signal: r.signal ?? null, error: r.error ?? null };
+
+    let stdout = String(r.stdout ?? "");
+    let stderr = String(r.stderr ?? "");
+    if (st.redirects.stderrToStdout) { stdout += stderr; stderr = ""; }
+    if (st.redirects.stderrToNull) stderr = "";
+    if (st.redirects.stdoutToNull) stdout = "";
+    prev = r.status ?? null;
+    input = stdout;
+    last = { status: prev, stdout, stderr, signal: null, error: null };
+  }
+  return last;
 }
 
 // ---------------------------------------------------------------------------
@@ -1850,12 +1975,14 @@ export async function runSubcommand(argv) {
       let failures = 0;
       for (const r of rows) {
         const label = `${r.id ?? "plan"} evidenceQueries[${r.index}]${r.q?.name ? ` "${r.q.name}"` : ""}`;
-        // Re-checked here, not only in validate: this is the line that actually spawns a shell, and it is
+        // Re-checked here, not only in validate: this is the line that actually spawns, and it is
         // reachable directly (`query-check <plan>`) without validate ever having run. The refusal must
-        // land BEFORE spawnSync — after it, the payload has already run.
+        // land BEFORE the spawn — after it, the payload has already run.
         const probs = [...evidenceQueryProblems(r.q), ...(r.q?.query?.trim?.() ? evidenceQueryShellProblems(r.q.query) : [])];
         if (probs.length) { failures += 1; lines.push(`🔴 ${label}: ${probs.join(" · ")}`); continue; }
-        const run = spawnSync(r.q.query, { shell: true, cwd: repoRoot, encoding: "utf8", timeout: 60_000 });
+        // Argv, not `shell: true` (DER-2836): a shell would expand the query a SECOND time, after the
+        // checks above, and hand the command arguments none of them read.
+        const run = runEvidenceQuery(r.q.query, { cwd: repoRoot, timeout: 60_000 });
         // Exit status FIRST — output alone is not a pass. `failed` is stamped alongside the count so
         // `validate` can refuse a blind pass rather than re-deriving one from a 0 it cannot interpret.
         const ev = evaluateQueryRun(run, r.q.expectAtLeast, r.q.query);
