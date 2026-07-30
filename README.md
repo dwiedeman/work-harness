@@ -281,6 +281,12 @@ These are the rules the harness enforces on itself. Each exists because breaking
 - **Evidence must name the head it covers.** A review recorded against an older commit is not evidence
   about the tree that would merge. The enqueue gate compares shas; it does not merely check that a
   review event exists.
+- **Evidence must agree with itself.** A review event carries both a blocker count and the findings that
+  count is about; the count is what authorizes the merge. It was believed for one release: an event
+  recording `blockers: 0` while carrying a live priority-1 finding read as a clean gate and merged. The
+  count must now exactly equal the priority-≤1 entries in its own findings list, checked at every read
+  and refused at write. **Both directions**, deliberately — the check that only catches the harmless
+  direction is the check that lets the harmful one through.
 - **A different sha is not a later sha.** Head movement is verified with `git merge-base --is-ancestor`,
   because a hand-off once carried an *ancestor* of the kickback sha and silently cleared five findings.
   A sha git *cannot resolve* is unverified, not new — it holds the kickback pending rather than clearing it.

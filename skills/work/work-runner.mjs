@@ -600,7 +600,7 @@ export function renderBrief({ issueId, title, worktree, branch, runId, runDir, r
     `${runner} review-usage --run ${runId ?? "<run>"} --runs-root ${appendRunsRoot} --issue ${issueId} --round 1 --reviewer codex --file /tmp/${issueId}-codex-review.json --log /tmp/${issueId}-codex-review.log`,
     "```",
     ``,
-    `That last command appends a \`review_findings\` event (the shepherd's machine-checkable proof the gate ran) AND prints the findings for you to act on. **Fix every P0/P1, then RE-RUN the gate on the new head.** \`ready\` blocks a PR whose latest gate event covers its head and still records \`blockers > 0\` (DER-2782) — an unfixed finding is no longer something a paragraph in the PR body can clear. If you believe a P0/P1 is WRONG, say so in the PR body **and ask the orchestrator to record a \`gate_adjudication\`**: ${GATE_ADJUDICATION_AUTHORITY} Appending one yourself is the offense, not a shortcut. Put \`Codex review: <verdict>, round N, 0 open blockers\` in the PR body.`,
+    `That last command appends a \`review_findings\` event (the shepherd's machine-checkable proof the gate ran) AND prints the findings for you to act on. **Fix every P0/P1, then RE-RUN the gate on the new head.** \`ready\` blocks a PR whose latest gate event covers its head and still records \`blockers > 0\` (DER-2782) — an unfixed finding is no longer something a paragraph in the PR body can clear. **The count is not taken on trust: \`blockers\` must EXACTLY equal the number of priority-≤1 entries in that same event's findings list (DER-2837), or the gate reads \`INCONSISTENT\` and blocks at both write and read time.** So hand-writing the event buys nothing — run \`review-usage\`, which derives the count from the findings. If you believe a P0/P1 is WRONG, say so in the PR body **and ask the orchestrator to record a \`gate_adjudication\`**: ${GATE_ADJUDICATION_AUTHORITY} Appending one yourself is the offense, not a shortcut. Put \`Codex review: <verdict>, round N, 0 open blockers\` in the PR body.`,
     ``,
     `⚠ It takes ~3–8 minutes and rides the **ChatGPT** subscription, not the Anthropic one — it does not spend your lead budget.`,
   );
@@ -1006,7 +1006,14 @@ export function parseCodexReview(payload, { repoRoot } = {}) {
 // because that is the only place that survives the session.
 export function reviewFindingsEvent(review, { issueId, round = 1, reviewer, actor, tokensTotal = null, sha = null } = {}) {
   if (!review || !Array.isArray(review.findings)) throw new Error("review-findings: expected a parsed review with findings[]");
-  const blockers = review.findings.filter((f) => f.priority != null && f.priority <= 1).length;
+  // DER-2837 — the count is DERIVED from the findings this event is about to carry, through the same
+  // `gateBlockerFindings` every reader uses. It used to be a second inline predicate applied to the
+  // UNMAPPED review, which is a drift waiting to happen between two lists that are not the same list:
+  // the readers count over `ev.findings`, so that is what the producer must count over. An event whose
+  // count disagrees with its own findings is now refused at every read, so a producer that could emit
+  // one would be a producer that can brick its own gate.
+  const findings = review.findings.map(({ title, priority, confidence, file, line_start, line_end }) => ({ title, priority, confidence, file, line_start, line_end }));
+  const blockers = gateBlockerFindings({ findings }).length;
   const ev = {
     actor: actor ?? (issueId ? `lead:${issueId}` : "lead"),
     type: "review_findings",
@@ -1016,7 +1023,7 @@ export function reviewFindingsEvent(review, { issueId, round = 1, reviewer, acto
     confidence: review.confidence,
     findings_total: review.findings.length,
     blockers,
-    findings: review.findings.map(({ title, priority, confidence, file, line_start, line_end }) => ({ title, priority, confidence, file, line_start, line_end })),
+    findings,
     tokens_total: tokensTotal,
     sha: sha ?? null,
     round,
@@ -1194,6 +1201,10 @@ export function parseChecksOutput({ exitCode, stdout = "", stderr = "" } = {}) {
 //   - gate sha != head, blockers > 0      → STALE-DIRTY. BLOCK. The only record of this PR's local gate
 //                                            says it had open blockers, and no evidence covers the tree
 //                                            that would merge. This is exactly DER-2513's shape.
+//   - blockers != the event's own count
+//     of priority-≤1 findings             → INCONSISTENT. BLOCK (DER-2837, gateBlockerCountVerdict) —
+//                                            and checked BEFORE every branch above, because an
+//                                            under-count reads clean on all three passing ones.
 //   - no gate event at all                → MISSING. BLOCK (DER-2603, below).
 //
 // DER-2782 — CURRENT used to mean `blocks: false` on `sha === head` with NO blockers check at all; the
@@ -1233,17 +1244,26 @@ export function gateEvidenceVerdict({ head, gate, adjudication = null, adjudicat
     };
   }
   const sha = gate.sha ?? null;
-  const blockers = Number(gate.blockers ?? 0);
+  const count = gateBlockerCountVerdict(gate);
+  const blockers = count.recorded ?? 0;
   // DER-2782 — an UNREADABLE count is not a zero count. `blockers > 0` is false for NaN, so a corrupt or
   // hand-written event carrying `blockers: "two"` used to read as a clean gate down every branch below.
   // That is the same fail-open shape as UNKNOWN-vs-ABSENT above, and it gets the same answer: block, and
   // say which of the two it is. `reviewFindingsEvent` always writes a number, so this can only fire on
   // evidence nothing in this harness produced — which is exactly when trusting it is worst.
-  if (!Number.isFinite(blockers) || blockers < 0) {
+  if (count.kind === "unreadable") {
+    return { state: "unreadable", blocks: true, label: `gate=UNREADABLE (${count.reason} — re-run the gate)` };
+  }
+  // DER-2837 — a READABLE count that contradicts the event's own findings is not evidence either, and it
+  // is checked HERE, ahead of every branch below, because three of those branches return `blocks: false`.
+  // `unstamped` and `stale-clean` both pass on a zero count, so a check placed after the sha comparison
+  // would leave two more doors open on the same lie. Measured at c477ee9: the same under-counted event
+  // read `current` on head, `stale-clean` off head, and `unstamped` with no sha — three passes.
+  if (!count.ok) {
     return {
-      state: "unreadable",
+      state: "inconsistent",
       blocks: true,
-      label: `gate=UNREADABLE (the review_findings event's blockers field is ${JSON.stringify(gate.blockers ?? null)}, not a count — re-run the gate)`,
+      label: `gate=INCONSISTENT (the review_findings event ${count.reason}) — its own count ${count.kind === "under" ? "UNDER" : "OVER"}-reports its own findings, so it is not evidence; re-run the gate`,
     };
   }
   if (!sha) return { state: "unstamped", blocks: false, label: "gate=UNSTAMPED (older review-usage — re-run to stamp a sha)" };
@@ -1308,11 +1328,57 @@ export function latestGateEvent(events, issueId) {
 export const GATE_ADJUDICATION_AUTHORITY =
   "AUTHORITY: only the ORCHESTRATOR or the human operator may record a gate_adjudication. A lead that adjudicates its own gate is a kickback offense.";
 
-// A gate finding is a BLOCKER at priority ≤ 1 — the same predicate `reviewFindingsEvent` counts into
-// `blockers`, kept in one place so the count and the list cannot drift apart.
+// A gate finding is a BLOCKER at priority ≤ 1 — the same predicate `reviewFindingsEvent` DERIVES its
+// `blockers` count from (DER-2837 made that literally true; it used to be a second inline predicate that
+// merely agreed), kept in one place so the count and the list cannot drift apart.
 export function gateBlockerFindings(gate) {
   const findings = Array.isArray(gate?.findings) ? gate.findings : [];
   return findings.filter((f) => f?.priority != null && Number(f.priority) <= 1);
+}
+
+// ── DER-2837: is a gate event's `blockers` count TRUE? ──────────────────────────────────────────
+// DER-2782 made a recorded `blockers > 0` block. It never asked whether the recorded number described
+// the event's own findings list, and the one place that did ask — `gateAdjudicationVerdict` — compared
+// `recorded > actual`, catching only an OVER-count. So a `review_findings` event carrying a live P1
+// while recording `blockers: 0` read `{state:"current", blocks:false}`: MERGEABLE, with the blocker
+// attached to the very event that authorized the merge.
+//
+// The two directions are not symmetric, and that is the whole reason this is a P1:
+//   - OVER-count → holds work that should ship. Loud, self-correcting, and someone chases it.
+//   - UNDER-count → ships an open blocker, and is INDISTINGUISHABLE from a clean gate. Nobody chases it.
+// A one-directional check is therefore the wrong shape even where the wrong direction is harmless: it is
+// the shape that lets the harmful direction through. The rule is EQUALITY, checked at every read and
+// enforced at every write.
+//
+// This does NOT require the event to be forged. Two predicates over the same findings (which is what
+// shipped: `reviewFindingsEvent` counted over the unmapped review, every reader counted over the mapped
+// event) drift on their own, and a hand-written or relayed event has no producer at all.
+//
+// UNREADABLE is kept distinct from INCONSISTENT on purpose — the same UNKNOWN-vs-ABSENT distinction the
+// gate verdict already draws. "Your count is not a number" and "your count contradicts your own findings"
+// are both fail-closed, but they oblige the operator to look at different things.
+//
+// The count must be a NUMBER, not a numeric string: `"0"` is not 0. `reviewFindingsEvent` writes a real
+// number and JSON round-trips it as one, so a string count can only come from something that hand-built
+// the event — exactly when guessing at its intent is worst. An ABSENT count is still the legacy zero (a
+// pre-`findings` ledger records nothing to contradict, and blocking those would strand every old run).
+export function gateBlockerCountVerdict(gate = null) {
+  const raw = gate?.blockers ?? null;
+  const actual = gateBlockerFindings(gate).length;
+  const unreadable = (reason) => ({ ok: false, kind: "unreadable", recorded: null, actual, reason });
+  if (raw !== null && typeof raw !== "number") return unreadable(`the review_findings event's blockers field is ${JSON.stringify(raw)}, not a count`);
+  const recorded = raw ?? 0;
+  if (!Number.isInteger(recorded) || recorded < 0) return unreadable(`the review_findings event's blockers field is ${JSON.stringify(raw)}, not a count`);
+  if (recorded !== actual) {
+    return {
+      ok: false,
+      kind: recorded < actual ? "under" : "over",
+      recorded,
+      actual,
+      reason: `records ${recorded} blocker(s) but its findings list holds ${actual} at priority ≤ 1`,
+    };
+  }
+  return { ok: true, kind: null, recorded, actual, reason: null };
 }
 
 // Findings carry no id — `reviewFindingsEvent` records {title, priority, confidence, file, line_start,
@@ -1351,8 +1417,10 @@ export function resolveGateFindingRef(ref, findings = []) {
 //     adjudication that references nothing is a blanket waiver, which is the hole, not the feature.
 //   - it must cover EVERY open blocker. This is the easiest clause to leave out, because a partial
 //     waiver still looks like a deliberate act: waiving 1 of 2 blockers would clear the whole gate.
-//   - the gate event must be SELF-CONSISTENT (its findings list must actually hold as many priority-≤1
-//     entries as its `blockers` count claims), or the coverage check above is checking nothing.
+//   - the gate event must be SELF-CONSISTENT (its findings list must hold EXACTLY as many priority-≤1
+//     entries as its `blockers` count claims), or the coverage check above is checking nothing. DER-2837
+//     made that clause an equality: as `>` it caught only an over-count, and an UNDER-counted event —
+//     the one that authorizes a merge over an open blocker — was waivable.
 export function gateAdjudicationVerdict({ gate = null, adjudication = null } = {}) {
   const bad = (reason) => ({ ok: false, reason, waived: [], sha: null, by: null, rationale: null });
   if (!adjudication) return { ok: false, reason: null, waived: [], sha: null, by: null, rationale: null };
@@ -1370,9 +1438,14 @@ export function gateAdjudicationVerdict({ gate = null, adjudication = null } = {
   if (!refs || !refs.length) return bad("`findings` is empty — name each finding you are waiving; a blanket waiver is exactly the hole this event exists to close");
   const findings = Array.isArray(gate.findings) ? gate.findings : [];
   const blockers = gateBlockerFindings(gate);
-  const recorded = Number(gate.blockers ?? 0) || 0;
-  if (recorded > blockers.length) {
-    return bad(`the gate event records ${recorded} blocker(s) but its findings list holds ${blockers.length} at priority ≤ 1 — that evidence is inconsistent with itself, so nothing can be verifiably waived; re-run the gate`);
+  // DER-2837 — EQUALITY, not `recorded > blockers.length`. The original clause caught only an over-count,
+  // so an event recording 0 blockers while carrying 2 could be "waived" by a waiver naming only what the
+  // count admitted to — and the coverage clause below was then checking references against a list the
+  // count itself disagreed with.
+  const count = gateBlockerCountVerdict(gate);
+  if (!count.ok) {
+    const what = count.kind === "unreadable" ? count.reason : `the gate event ${count.reason}`;
+    return bad(`${what} — that evidence is inconsistent with itself, so nothing can be verifiably waived; re-run the gate`);
   }
   const resolved = [];
   const unresolved = [];
@@ -4336,11 +4409,18 @@ export function materializeState(rawEvents, meta = {}) {
         // exists: an event from round 1 says nothing about the round-3 head (see gateEvidenceVerdict).
         it.gate_seen = true;
         it.gate_sha = e.sha ?? null;
-        it.gate_blockers = Number(e.blockers ?? 0) || 0;
-        // DER-2782 — `|| 0` turns an UNREADABLE count into a clean one, which is the same fail-open
-        // gateEvidenceVerdict now refuses. Kept as its own flag rather than by letting NaN into
-        // `gate_blockers`, which every existing consumer of that field reads as a number.
-        it.gate_blockers_unreadable = !Number.isFinite(Number(e.blockers ?? 0)) || Number(e.blockers ?? 0) < 0;
+        {
+          // DER-2782 — `|| 0` turns an UNREADABLE count into a clean one, which is the same fail-open
+          // gateEvidenceVerdict now refuses. Kept as its own flag rather than by letting NaN into
+          // `gate_blockers`, which every existing consumer of that field reads as a number.
+          // DER-2837 — and the fold trusted the NUMBER exactly as `ready` did, so an under-counted unit
+          // was missing from `gate_blocked` too: the board, which exists so the round is caught BEFORE
+          // enqueue, agreed with the lie. Same contract, one function, both readers.
+          const count = gateBlockerCountVerdict(e);
+          it.gate_blockers = count.recorded ?? 0;
+          it.gate_blockers_unreadable = count.kind === "unreadable";
+          it.gate_blockers_inconsistent = count.ok || count.kind === "unreadable" ? null : count.reason;
+        }
         it.gate_round = Number.isFinite(Number(e.round)) ? Number(e.round) : it.gate_round ?? null;
         it.gate_engine = e.engine ?? e.model ?? it.gate_engine ?? null;
         // DER-2782 — the WHOLE event, because an adjudication is checked against this event's findings
@@ -4714,11 +4794,17 @@ export function materializeState(rawEvents, meta = {}) {
     // own round-1 findings is not late, and a banner that is permanently red is a banner nobody reads.
     gate_blocked: Object.entries(issues)
       .filter(([, v]) => v.pr != null && (v.status === "pr_open" || v.status === "kickback")
-        && ((v.gate_blockers ?? 0) > 0 || v.gate_blockers_unreadable) && !v.gate_adjudicated)
+        && ((v.gate_blockers ?? 0) > 0 || v.gate_blockers_unreadable || v.gate_blockers_inconsistent) && !v.gate_adjudicated)
       .map(([k, v]) => ({
-        issue: k, pr: v.pr, status: v.status, blockers: v.gate_blockers_unreadable ? "UNREADABLE" : v.gate_blockers, sha: v.gate_sha, round: v.gate_round,
+        issue: k, pr: v.pr, status: v.status,
+        blockers: v.gate_blockers_unreadable ? "UNREADABLE" : v.gate_blockers_inconsistent ? "INCONSISTENT" : v.gate_blockers,
+        sha: v.gate_sha, round: v.gate_round,
         rejected_adjudication: v.gate_adjudication_rejected,
-        note: "the pre-PR gate's latest verdict still records OPEN blockers. `ready` will refuse this PR. Fix them and re-run the gate, or — orchestrator/operator ONLY — record a gate_adjudication naming every one.",
+        // DER-2837 — an inconsistent event gets its OWN sentence. "Fix your blockers" is the wrong
+        // instruction for evidence whose blocker count cannot be believed in the first place.
+        note: v.gate_blockers_inconsistent
+          ? `the pre-PR gate's latest verdict is INCONSISTENT WITH ITSELF — it ${v.gate_blockers_inconsistent}. \`ready\` will refuse this PR. Re-run the gate: an under-counted event would otherwise authorize a merge over an open blocker, and no waiver can cover findings the count denies.`
+          : "the pre-PR gate's latest verdict still records OPEN blockers. `ready` will refuse this PR. Fix them and re-run the gate, or — orchestrator/operator ONLY — record a gate_adjudication naming every one.",
       })),
     // Waived-findings banner (DER-2782). The AUDIT half, and the reason this list exists at all: a
     // waiver that shows up only as the absence of a block is the silent pass the adjudication event was
@@ -6980,10 +7066,11 @@ export async function runSubcommand(argv) {
     }
     case "append": {
       const event = JSON.parse(o.rest[0] ?? o.event ?? "{}");
-      // DER-2782 — `gate_adjudication` is the ONE type this generic relay validates before writing, and
-      // deliberately not by growing a new privileged path: it is the only event that can turn a blocking
-      // gate into a passing one, so a malformed waiver must fail HERE rather than be silently ignored at
-      // `ready` while the operator wonders why their PR is still held.
+      // DER-2782 — `gate_adjudication` is one of TWO types this generic relay validates before writing
+      // (DER-2837 added `review_findings` for the same reason), and deliberately not by growing a new
+      // privileged path: between them they are the only events that can turn a blocking gate into a
+      // passing one, so a malformed one must fail HERE rather than be silently ignored at `ready` while
+      // the operator wonders why their PR is still held.
       //
       // This is an affordance, NOT the enforcement. The enforcement is the read side —
       // `gateEvidenceLookup` and the `materializeState` fold re-run the same contract — because anyone
@@ -6991,6 +7078,21 @@ export async function runSubcommand(argv) {
       // RELAYED lines (already carrying an `event_id` minted by their origin host) skip the check for
       // that reason: refusing a relay would fork the ledger, and the read side still ignores a bad one.
       const relayed = typeof event?.event_id === "string" && event.event_id.length > 0;
+      // DER-2837 — a gate event whose `blockers` count disagrees with its own findings list is not
+      // evidence, and the write side says so at the moment it is authored. The read side refuses it
+      // anyway (that is where the enforcement lives — see below), but a lead that hand-appends one and
+      // learns nothing until `ready` holds its PR has been given a puzzle instead of an error.
+      if (event?.type === "review_findings" && !relayed) {
+        const count = gateBlockerCountVerdict(event);
+        if (!count.ok) {
+          const what = count.kind === "unreadable" ? count.reason : `it ${count.reason}`;
+          throw new Error(
+            `append: refusing to record this review_findings${event.issue ? ` for ${event.issue}` : ""} — ${what}.\n` +
+            "A gate event that disagrees with itself is not evidence: an UNDER-count would authorize a merge over an open blocker, " +
+            "and no gate_adjudication can waive a finding the count denies. Re-run the gate (`review-usage`) rather than hand-writing the event.",
+          );
+        }
+      }
       if (event?.type === "gate_adjudication" && !relayed) {
         if (!event.issue) {
           throw new Error(`append: a gate_adjudication must name its \`issue\` — an unattributed waiver could be read against any unit.\n${GATE_ADJUDICATION_AUTHORITY}`);
