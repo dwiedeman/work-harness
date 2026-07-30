@@ -600,7 +600,7 @@ export function renderBrief({ issueId, title, worktree, branch, runId, runDir, r
     `${runner} review-usage --run ${runId ?? "<run>"} --runs-root ${appendRunsRoot} --issue ${issueId} --round 1 --reviewer codex --file /tmp/${issueId}-codex-review.json --log /tmp/${issueId}-codex-review.log`,
     "```",
     ``,
-    `That last command appends a \`review_findings\` event (the shepherd's machine-checkable proof the gate ran) AND prints the findings for you to act on. Fix every P0/P1, or reject it IN WRITING in the PR body with a reason the shepherd can audit. Put \`Codex review: <verdict>, round N, 0 open blockers\` in the PR body.`,
+    `That last command appends a \`review_findings\` event (the shepherd's machine-checkable proof the gate ran) AND prints the findings for you to act on. **Fix every P0/P1, then RE-RUN the gate on the new head.** \`ready\` blocks a PR whose latest gate event covers its head and still records \`blockers > 0\` (DER-2782) — an unfixed finding is no longer something a paragraph in the PR body can clear. If you believe a P0/P1 is WRONG, say so in the PR body **and ask the orchestrator to record a \`gate_adjudication\`**: ${GATE_ADJUDICATION_AUTHORITY} Appending one yourself is the offense, not a shortcut. Put \`Codex review: <verdict>, round N, 0 open blockers\` in the PR body.`,
     ``,
     `⚠ It takes ~3–8 minutes and rides the **ChatGPT** subscription, not the Anthropic one — it does not spend your lead budget.`,
   );
@@ -1184,7 +1184,10 @@ export function parseChecksOutput({ exitCode, stdout = "", stderr = "" } = {}) {
 // that from the case where it was not.
 //
 // Precision matters here, or this becomes noise everyone learns to wave past:
-//   - gate sha == head                    → CURRENT. The evidence describes what ships.
+//   - gate sha == head, blockers == 0     → CURRENT. The evidence describes what ships, and it is clean.
+//   - gate sha == head, blockers > 0      → CURRENT-DIRTY. BLOCK (DER-2782, below).
+//   - gate sha == head, blockers > 0,
+//     with a matching gate_adjudication   → ADJUDICATED. Do not block — and say so LOUDLY.
 //   - gate sha != head, blockers == 0     → STALE-CLEAN. Report it; do not block. The clean verdict
 //                                            can only have been invalidated by the new commits, which
 //                                            the cloud bot reviews on head anyway.
@@ -1192,6 +1195,22 @@ export function parseChecksOutput({ exitCode, stdout = "", stderr = "" } = {}) {
 //                                            says it had open blockers, and no evidence covers the tree
 //                                            that would merge. This is exactly DER-2513's shape.
 //   - no gate event at all                → MISSING. BLOCK (DER-2603, below).
+//
+// DER-2782 — CURRENT used to mean `blocks: false` on `sha === head` with NO blockers check at all; the
+// `blockers > 0` branch was reachable only down the STALE path. So the gate that shipped enforced
+// "evidence must cover head" and not "the findings must be dealt with", while the shepherd's SKILL.md
+// promised "unresolved blockers = automatic kickback" in prose that nothing executed.
+//
+// That is not merely a missing check — it inverted the incentive the gate exists to create. FIXING
+// findings pushes commits, which moves the sha off head, which turns the gate STALE-DIRTY and BLOCKS.
+// IGNORING them leaves sha == head, which read CURRENT and PASSED. The lead who ignored its own
+// reviewer got the STRONGER gate state, and the only way to be punished by this instrument was to do
+// the right thing. (The fix does not remove that asymmetry by loosening STALE-DIRTY: the correct
+// sequence is fix → re-run the gate at the new head → CURRENT with blockers 0.)
+//
+// The "or reject it in writing" escape hatch is real — some P1s genuinely are wrong — so it survives as
+// a MACHINE-READABLE event rather than a paragraph in a PR body that nothing parses. See
+// gateAdjudicationVerdict for the contract and for why the control is audit surfacing, not enforcement.
 //
 // DER-2603 (three PRs in one shift, #1081 MERGED): ABSENT used to be `blocks: false` — "report; the cloud
 // bot is the gate of record". That made the ONE documented pre-enqueue check unable to return the failing
@@ -1204,7 +1223,7 @@ export function parseChecksOutput({ exitCode, stdout = "", stderr = "" } = {}) {
 // tell" both fail closed, but they oblige the operator to do DIFFERENT things (run the gate vs. make the
 // evidence readable), and a gate that cannot say which one it means is a gate operators learn to wave past.
 // `unknown` carries the reason; see gateEvidenceLookup for the four cases that produce it.
-export function gateEvidenceVerdict({ head, gate, unknown = null } = {}) {
+export function gateEvidenceVerdict({ head, gate, adjudication = null, adjudicationRejected = null, unknown = null } = {}) {
   if (unknown) return { state: "unknown", blocks: true, label: `gate=UNKNOWN (${unknown})` };
   if (!gate) {
     return {
@@ -1215,8 +1234,48 @@ export function gateEvidenceVerdict({ head, gate, unknown = null } = {}) {
   }
   const sha = gate.sha ?? null;
   const blockers = Number(gate.blockers ?? 0);
+  // DER-2782 — an UNREADABLE count is not a zero count. `blockers > 0` is false for NaN, so a corrupt or
+  // hand-written event carrying `blockers: "two"` used to read as a clean gate down every branch below.
+  // That is the same fail-open shape as UNKNOWN-vs-ABSENT above, and it gets the same answer: block, and
+  // say which of the two it is. `reviewFindingsEvent` always writes a number, so this can only fire on
+  // evidence nothing in this harness produced — which is exactly when trusting it is worst.
+  if (!Number.isFinite(blockers) || blockers < 0) {
+    return {
+      state: "unreadable",
+      blocks: true,
+      label: `gate=UNREADABLE (the review_findings event's blockers field is ${JSON.stringify(gate.blockers ?? null)}, not a count — re-run the gate)`,
+    };
+  }
   if (!sha) return { state: "unstamped", blocks: false, label: "gate=UNSTAMPED (older review-usage — re-run to stamp a sha)" };
-  if (head && sha === head) return { state: "current", blocks: false, label: `gate=CURRENT (${sha.slice(0, 10)}, blockers=${blockers})` };
+  if (head && sha === head) {
+    if (blockers > 0) {
+      // The waiver clears the block only for the tree it NAMES. An adjudication carried over from an
+      // earlier round describes findings on a tree that is no longer shipping — the same reasoning that
+      // makes STALE-DIRTY block, applied to the waiver instead of the review.
+      if (adjudication && adjudication.sha === sha) {
+        const waived = Array.isArray(adjudication.findings) ? adjudication.findings.length : 0;
+        // An adjudication is vetted upstream (gateEvidenceLookup / the materializeState fold), so these
+        // fields are normally present. Rendered defensively anyway: a waiver whose author is unreadable
+        // must still PRINT — reading it as a plain pass is the silent-pass failure this closes.
+        const by = String(adjudication.adjudicated_by ?? "").trim() || "UNNAMED";
+        const why = String(adjudication.rationale ?? "").trim();
+        return {
+          state: "adjudicated",
+          blocks: false,
+          label: `⚠ gate=ADJUDICATED (${waived} finding${waived === 1 ? "" : "s"} waived by ${by} at ${sha.slice(0, 10)}${why ? ` — "${why}"` : ""})`,
+        };
+      }
+      // A REJECTED waiver is named in the label. Otherwise the operator who just recorded one sees the
+      // gate still blocking with no way to tell whether it was ignored, mis-typed, or never arrived.
+      const tail = adjudicationRejected ? ` [a gate_adjudication was recorded and IGNORED: ${adjudicationRejected}]` : "";
+      return {
+        state: "current-dirty",
+        blocks: true,
+        label: `gate=CURRENT (${sha.slice(0, 10)}) with ${blockers} OPEN blocker(s) — fix them and re-run the gate, or have the ORCHESTRATOR record a gate_adjudication naming every one${tail}`,
+      };
+    }
+    return { state: "current", blocks: false, label: `gate=CURRENT (${sha.slice(0, 10)}, blockers=${blockers})` };
+  }
   if (blockers > 0) {
     return { state: "stale-dirty", blocks: true, label: `gate=STALE with ${blockers} open blocker(s) at ${sha.slice(0, 10)} ≠ head` };
   }
@@ -1234,6 +1293,129 @@ export function latestGateEvent(events, issueId) {
   return out;
 }
 
+// ── Gate adjudication (DER-2782) ────────────────────────────────────────────────────────────────
+// The written-rejection escape hatch, as an event the harness can read:
+//   { type: "gate_adjudication", issue, sha, findings: [...], rationale, adjudicated_by }
+//
+// AUTHORITY, stated plainly because the alternative is pretending. This rides `append`, which anyone
+// with filesystem access to the run dir can run — INCLUDING the lead whose blockers are being waived.
+// There is no hard enforcement available at that trust boundary (an actor who can write events.jsonl
+// never needed a subcommand), so the control is AUDIT SURFACING: only the orchestrator or the human
+// operator may adjudicate, a lead adjudicating its own gate is a kickback offense, and every waiver is
+// printed — at `append`, on the `ready` line, on the board (`state.gate_adjudicated`) and on every
+// `watch` wake. Trading "ignoring findings wins" for "self-adjudicating wins" would be no fix at all;
+// what makes this different from the prose it replaces is that a waiver can no longer be INVISIBLE.
+export const GATE_ADJUDICATION_AUTHORITY =
+  "AUTHORITY: only the ORCHESTRATOR or the human operator may record a gate_adjudication. A lead that adjudicates its own gate is a kickback offense.";
+
+// A gate finding is a BLOCKER at priority ≤ 1 — the same predicate `reviewFindingsEvent` counts into
+// `blockers`, kept in one place so the count and the list cannot drift apart.
+export function gateBlockerFindings(gate) {
+  const findings = Array.isArray(gate?.findings) ? gate.findings : [];
+  return findings.filter((f) => f?.priority != null && Number(f.priority) <= 1);
+}
+
+// Findings carry no id — `reviewFindingsEvent` records {title, priority, confidence, file, line_start,
+// line_end} — so a reference resolves against what the adjudicator actually has in front of them: the
+// 1-based position `review-usage` prints, or the finding's exact title. Returns the 0-based index, or
+// -1 for anything that does not resolve. Pure.
+export function resolveGateFindingRef(ref, findings = []) {
+  const list = Array.isArray(findings) ? findings : [];
+  if (typeof ref === "number") return Number.isInteger(ref) && ref >= 1 && ref <= list.length ? ref - 1 : -1;
+  if (typeof ref !== "string") return -1; // an object/array ref is not a reference; fail closed
+  const raw = ref.trim();
+  if (!raw) return -1;
+  const m = raw.match(/^#?(\d+)$/);
+  if (m) {
+    const i = Number(m[1]) - 1;
+    return i >= 0 && i < list.length ? i : -1;
+  }
+  const norm = (s) => String(s ?? "").trim().toLowerCase().replace(/\s+/g, " ");
+  const want = norm(raw);
+  return want ? list.findIndex((f) => norm(f?.title) === want) : -1;
+}
+
+// Is this adjudication one the harness may honour? Pure, and the SINGLE definition of the contract:
+// `append` calls it to refuse a malformed one at WRITE time (so the operator learns immediately rather
+// than watching `ready` keep blocking with no explanation), and `gateEvidenceLookup` + the
+// `materializeState` fold both call it at READ time. The read is the enforcement — an adjudication that
+// reached the ledger some other way (a hand-edited file, a relay) is still ignored here.
+//
+// Every clause closes a way to turn a waiver into a blanket pass. Returns `{ ok, reason }`, and the
+// reason is surfaced rather than swallowed: an adjudication that is silently dropped is only marginally
+// better than one that silently passes.
+//   - it must NAME THE TREE, and that tree must be the one the gate evidence covers.
+//   - it must NAME A HUMAN. `adjudicated_by` is the entire audit trail.
+//   - it must give a REASON. "Waived", unexplained, is indistinguishable from ignoring the gate.
+//   - `findings` must be NON-EMPTY and every entry must resolve to a finding on that gate event — an
+//     adjudication that references nothing is a blanket waiver, which is the hole, not the feature.
+//   - it must cover EVERY open blocker. This is the easiest clause to leave out, because a partial
+//     waiver still looks like a deliberate act: waiving 1 of 2 blockers would clear the whole gate.
+//   - the gate event must be SELF-CONSISTENT (its findings list must actually hold as many priority-≤1
+//     entries as its `blockers` count claims), or the coverage check above is checking nothing.
+export function gateAdjudicationVerdict({ gate = null, adjudication = null } = {}) {
+  const bad = (reason) => ({ ok: false, reason, waived: [], sha: null, by: null, rationale: null });
+  if (!adjudication) return { ok: false, reason: null, waived: [], sha: null, by: null, rationale: null };
+  if (!gate) return bad("there is no review_findings event for this unit — run the gate first; there is nothing to adjudicate");
+  const gateSha = gate.sha ?? null;
+  if (!gateSha) return bad("the gate event carries no `sha` (an older `review-usage`) — re-run the gate so the evidence names the tree it covers");
+  const sha = String(adjudication.sha ?? "").trim();
+  if (!sha) return bad("no `sha` — an adjudication must name the tree whose findings it waives");
+  if (sha !== gateSha) return bad(`it covers ${sha.slice(0, 10)} and the gate evidence covers ${gateSha.slice(0, 10)} — re-run the gate on the current head, then adjudicate what THAT finds`);
+  const by = String(adjudication.adjudicated_by ?? "").trim();
+  if (!by) return bad("no `adjudicated_by` — an unattributed waiver is not an audit trail");
+  const rationale = String(adjudication.rationale ?? "").trim();
+  if (!rationale) return bad("no `rationale` — a waiver with no stated reason is indistinguishable from ignoring the gate");
+  const refs = Array.isArray(adjudication.findings) ? adjudication.findings : null;
+  if (!refs || !refs.length) return bad("`findings` is empty — name each finding you are waiving; a blanket waiver is exactly the hole this event exists to close");
+  const findings = Array.isArray(gate.findings) ? gate.findings : [];
+  const blockers = gateBlockerFindings(gate);
+  const recorded = Number(gate.blockers ?? 0) || 0;
+  if (recorded > blockers.length) {
+    return bad(`the gate event records ${recorded} blocker(s) but its findings list holds ${blockers.length} at priority ≤ 1 — that evidence is inconsistent with itself, so nothing can be verifiably waived; re-run the gate`);
+  }
+  const resolved = [];
+  const unresolved = [];
+  for (const r of refs) {
+    const i = resolveGateFindingRef(r, findings);
+    if (i < 0) unresolved.push(typeof r === "string" || typeof r === "number" ? String(r) : JSON.stringify(r));
+    else resolved.push(i);
+  }
+  if (unresolved.length) {
+    return bad(`it names ${unresolved.length} finding(s) that are not on the gate event (${unresolved.slice(0, 3).join(", ")}) — reference each by its 1-based index or its exact title`);
+  }
+  const covered = new Set(resolved);
+  const missed = blockers.map((f) => findings.indexOf(f)).filter((i) => !covered.has(i));
+  if (missed.length) {
+    const named = missed.slice(0, 3).map((i) => `#${i + 1} ${findings[i]?.title ?? ""}`.trim()).join("; ");
+    return bad(`it leaves ${missed.length} of ${blockers.length} open blocker(s) un-named (${named}) — a partial waiver is not a clean gate`);
+  }
+  return {
+    ok: true,
+    reason: null,
+    sha: gateSha,
+    by,
+    rationale,
+    waived: [...covered].sort((a, b) => a - b).map((i) => findings[i]?.title || `#${i + 1}`),
+  };
+}
+
+// Latest `gate_adjudication` for an issue, in ledger order — preferring one that names `sha`, so an
+// out-of-order or superseded append cannot mask the waiver that actually covers this round. Pure, and
+// carrying `latestGateEvent`'s issue filter for the same reason: an adjudication belongs to ONE unit
+// and must never be attributed to a sibling's gate.
+export function latestGateAdjudication(events, issueId, { sha = null } = {}) {
+  let latest = null;
+  let matching = null;
+  for (const e of events ?? []) {
+    if (e?.type !== "gate_adjudication") continue;
+    if (issueId && e.issue !== issueId) continue;
+    latest = e;
+    if (sha && e.sha === sha) matching = e;
+  }
+  return matching ?? latest;
+}
+
 // DER-2603 — what the ledger LETS US SAY about one PR's pre-PR gate, separated from what the gate said.
 // Pure. Returns `{ gate, unknown }`: `unknown` non-null means the evidence is unreadable, NOT absent.
 //
@@ -1247,24 +1429,35 @@ export function latestGateEvent(events, issueId) {
 //   4. no `run_started` at all — a partial fold; the same reasoning as 3.
 // Anything else with no `review_findings` for the issue is genuinely ABSENT: the run COULD have recorded
 // one, this unit is tracked, and it did not. That is "you skipped it", and it is a different sentence.
+//
+// DER-2782 — it also reads the unit's `gate_adjudication`, VETTED here rather than by the caller. That
+// is deliberate: `ready`'s single production call site spreads this result straight into
+// gateEvidenceVerdict, so the waiver and the review it waives are read by ONE function and cannot be
+// threaded apart. A candidate that fails the contract comes back as `adjudicationRejected` (a reason
+// the verdict prints) and never as `adjudication`.
 export function gateEvidenceLookup({ events = null, issueId = null, ledgerRead = true } = {}) {
+  const none = { gate: null, adjudication: null, adjudicationRejected: null };
   if (!ledgerRead) {
-    return { gate: null, unknown: "`ready` ran without --run <id> — no ledger to attribute gate evidence from" };
+    return { ...none, unknown: "`ready` ran without --run <id> — no ledger to attribute gate evidence from" };
   }
   const evs = Array.isArray(events) ? events : [];
   if (!issueId) {
-    return { gate: null, unknown: "PR not tracked by this run's ledger — no unit owns it, so no unit's gate evidence may be attributed to it" };
+    return { ...none, unknown: "PR not tracked by this run's ledger — no unit owns it, so no unit's gate evidence may be attributed to it" };
   }
   const gate = latestGateEvent(evs, issueId);
-  if (gate) return { gate, unknown: null };
+  if (gate) {
+    const candidate = latestGateAdjudication(evs, issueId, { sha: gate.sha ?? null });
+    const adj = gateAdjudicationVerdict({ gate, adjudication: candidate });
+    return { gate, adjudication: adj.ok ? candidate : null, adjudicationRejected: adj.reason, unknown: null };
+  }
   const runStarted = evs.find((e) => e?.type === "run_started") ?? null;
   if (!runStarted) {
-    return { gate: null, unknown: `no run_started in this ledger — whether the run could record a gate for ${issueId} is unreadable` };
+    return { ...none, unknown: `no run_started in this ledger — whether the run could record a gate for ${issueId} is unreadable` };
   }
   if (!runStarted.harness_version) {
-    return { gate: null, unknown: "pre-stamp ledger (no harness_version on run_started) — a missing gate event is indistinguishable from a runner that never recorded one" };
+    return { ...none, unknown: "pre-stamp ledger (no harness_version on run_started) — a missing gate event is indistinguishable from a runner that never recorded one" };
   }
-  return { gate: null, unknown: null }; // genuinely ABSENT — the run could have recorded one and did not
+  return { ...none, unknown: null }; // genuinely ABSENT — the run could have recorded one and did not
 }
 
 // DER-2753 `allowMergeWithoutChecks`: a PUBLIC adopter repo often has NO required checks at all, so
@@ -3673,7 +3866,7 @@ export function materializeState(rawEvents, meta = {}) {
       // `spawn_failed*` (DER-2739) and `transcripts_forced` (DER-2744) are both TRI-STATE-ish on purpose:
       // `transcripts_forced: null` means UNKNOWN — a spawn event that carried no attestation — and unknown
       // is never the same as ok. See the transcripts_unverified banner.
-      issues[id] = { status: "queued", pr: null, worktree: null, branch: null, workspace_ref: null, kickback_count: 0, kickback_unactioned: false, kickback_sha: null, fileScope: [], host: null, bundle: null, tokens: 0, plan_scope_seen: false, gate_seen: false, gate_sha: null, gate_blockers: null, gate_round: null, gate_engine: null, budget: "ok", leadType: null, rotations: 0, rotate_pending: false, rotate_pct: null, rotate_disposition: null, spawn_failed: false, spawn_failed_count: 0, spawn_failed_note: null, spawn_failed_exit_code: null, transcripts_forced: null, reap_cleanup_ok: null, reap_failed: false, reap_leaks: [], reap_failed_note: null, _reports: {}, _kb_uncounted: false };
+      issues[id] = { status: "queued", pr: null, worktree: null, branch: null, workspace_ref: null, kickback_count: 0, kickback_unactioned: false, kickback_sha: null, fileScope: [], host: null, bundle: null, tokens: 0, plan_scope_seen: false, gate_seen: false, gate_sha: null, gate_blockers: null, gate_round: null, gate_engine: null, budget: "ok", leadType: null, rotations: 0, rotate_pending: false, rotate_pct: null, rotate_disposition: null, spawn_failed: false, spawn_failed_count: 0, spawn_failed_note: null, spawn_failed_exit_code: null, transcripts_forced: null, reap_cleanup_ok: null, reap_failed: false, reap_leaks: [], reap_failed_note: null, gate_adjudicated: null, gate_adjudication_rejected: null, _reports: {}, _kb_uncounted: false, _gate_event: null, _gate_adjs: [] };
     }
     return issues[id];
   };
@@ -3835,8 +4028,21 @@ export function materializeState(rawEvents, meta = {}) {
         it.gate_seen = true;
         it.gate_sha = e.sha ?? null;
         it.gate_blockers = Number(e.blockers ?? 0) || 0;
+        // DER-2782 — `|| 0` turns an UNREADABLE count into a clean one, which is the same fail-open
+        // gateEvidenceVerdict now refuses. Kept as its own flag rather than by letting NaN into
+        // `gate_blockers`, which every existing consumer of that field reads as a number.
+        it.gate_blockers_unreadable = !Number.isFinite(Number(e.blockers ?? 0)) || Number(e.blockers ?? 0) < 0;
         it.gate_round = Number.isFinite(Number(e.round)) ? Number(e.round) : it.gate_round ?? null;
         it.gate_engine = e.engine ?? e.model ?? it.gate_engine ?? null;
+        // DER-2782 — the WHOLE event, because an adjudication is checked against this event's findings
+        // list, not against the blocker COUNT. Kept private and dropped in the finalize pass below.
+        it._gate_event = e;
+        break;
+      case "gate_adjudication":
+        // DER-2782 — the machine-readable "rejected in writing" escape hatch. Collected raw and vetted
+        // in the finalize pass, so the fold does not depend on an adjudication happening to be appended
+        // AFTER the gate event it references (a ledger folded from two hosts orders by ts, not by intent).
+        it._gate_adjs.push(e);
         break;
       case "pr_opened":
         it.status = "pr_open";
@@ -3972,6 +4178,17 @@ export function materializeState(rawEvents, meta = {}) {
     v.tokens = Object.values(v._reports).reduce((s, n) => s + n, 0);
     delete v._reports;
     delete v._kb_uncounted;
+    // DER-2782 — vet the unit's latest gate_adjudication against its latest gate event, through the
+    // SAME contract `ready` uses. A rejected candidate is recorded with its reason rather than dropped:
+    // an operator who waived findings and still sees the unit blocked must be able to read why.
+    {
+      const candidate = latestGateAdjudication(v._gate_adjs, null, { sha: v._gate_event?.sha ?? null });
+      const adj = gateAdjudicationVerdict({ gate: v._gate_event, adjudication: candidate });
+      v.gate_adjudicated = adj.ok ? { sha: adj.sha, by: adj.by, rationale: adj.rationale, findings: adj.waived } : null;
+      v.gate_adjudication_rejected = adj.reason;
+      delete v._gate_event;
+      delete v._gate_adjs;
+    }
     const verdict = (n, warn, trip) => (n >= trip ? "tripped" : n >= warn ? "warn" : "ok");
     const byTokens = verdict(v.tokens, BUDGET.warnTokens, BUDGET.tripTokens);
     const byRounds = verdict(v.kickback_count, BUDGET.warnRounds, BUDGET.tripRounds);
@@ -4165,6 +4382,26 @@ export function materializeState(rawEvents, meta = {}) {
         issue: k, pr: v.pr, status: v.status, host: v.host,
         note: "no review_findings event — the pre-PR adversarial review gate never ran for this PR. `ready` will refuse it; gate it now (or record why codex is unavailable, WITH the probe output) rather than at enqueue time.",
       })),
+    // Open-blockers banner (DER-2782). The gate RAN and its latest verdict still records open blockers,
+    // with no adjudication clearing them. `ready` refuses these now, but — exactly as with gate_missing
+    // above — the refusal is only met at enqueue time, and the round is cheapest to fix before then.
+    // Scoped to handed-off units for the same reason gate_missing is: a lead mid-way through fixing its
+    // own round-1 findings is not late, and a banner that is permanently red is a banner nobody reads.
+    gate_blocked: Object.entries(issues)
+      .filter(([, v]) => v.pr != null && (v.status === "pr_open" || v.status === "kickback")
+        && ((v.gate_blockers ?? 0) > 0 || v.gate_blockers_unreadable) && !v.gate_adjudicated)
+      .map(([k, v]) => ({
+        issue: k, pr: v.pr, status: v.status, blockers: v.gate_blockers_unreadable ? "UNREADABLE" : v.gate_blockers, sha: v.gate_sha, round: v.gate_round,
+        rejected_adjudication: v.gate_adjudication_rejected,
+        note: "the pre-PR gate's latest verdict still records OPEN blockers. `ready` will refuse this PR. Fix them and re-run the gate, or — orchestrator/operator ONLY — record a gate_adjudication naming every one.",
+      })),
+    // Waived-findings banner (DER-2782). The AUDIT half, and the reason this list exists at all: a
+    // waiver that shows up only as the absence of a block is the silent pass the adjudication event was
+    // added to prevent. Listed for the whole run, including merged units — after the fact is precisely
+    // when someone asks which blockers shipped waived, and by whom.
+    gate_adjudicated: Object.entries(issues)
+      .filter(([, v]) => v.gate_adjudicated)
+      .map(([k, v]) => ({ issue: k, pr: v.pr, status: v.status, ...v.gate_adjudicated })),
     // Issues with an OPEN PR that never declared a file scope. DER-2161 shipped 98 files / +11,537
     // lines / 5 rounds having emitted no plan_scope at all — an unbounded unit nobody could have
     // caught in flight. A missing scope is itself the finding.
@@ -6080,6 +6317,39 @@ export async function runSubcommand(argv) {
     }
     case "append": {
       const event = JSON.parse(o.rest[0] ?? o.event ?? "{}");
+      // DER-2782 — `gate_adjudication` is the ONE type this generic relay validates before writing, and
+      // deliberately not by growing a new privileged path: it is the only event that can turn a blocking
+      // gate into a passing one, so a malformed waiver must fail HERE rather than be silently ignored at
+      // `ready` while the operator wonders why their PR is still held.
+      //
+      // This is an affordance, NOT the enforcement. The enforcement is the read side —
+      // `gateEvidenceLookup` and the `materializeState` fold re-run the same contract — because anyone
+      // who can bypass this check by appending to events.jsonl directly never needed the subcommand.
+      // RELAYED lines (already carrying an `event_id` minted by their origin host) skip the check for
+      // that reason: refusing a relay would fork the ledger, and the read side still ignores a bad one.
+      const relayed = typeof event?.event_id === "string" && event.event_id.length > 0;
+      if (event?.type === "gate_adjudication" && !relayed) {
+        if (!event.issue) {
+          throw new Error(`append: a gate_adjudication must name its \`issue\` — an unattributed waiver could be read against any unit.\n${GATE_ADJUDICATION_AUTHORITY}`);
+        }
+        const gate = latestGateEvent(await readEvents(runDir), event.issue);
+        const v = gateAdjudicationVerdict({ gate, adjudication: event });
+        if (!v.ok) {
+          throw new Error(`append: refusing to record this gate_adjudication for ${event.issue} — ${v.reason}.\n${GATE_ADJUDICATION_AUTHORITY}`);
+        }
+        const ev = await appendEvent(runDir, event);
+        return {
+          stdout: [
+            `⚠ GATE ADJUDICATION RECORDED — ${event.issue}: ${v.waived.length} finding(s) WAIVED by ${v.by} at ${String(v.sha).slice(0, 10)}`,
+            ...v.waived.map((t) => `    · ${t}`),
+            `  rationale: ${v.rationale}`,
+            `  ${GATE_ADJUDICATION_AUTHORITY}`,
+            "  This now prints on this PR's `ready` line, in state.gate_adjudicated, and on every watch wake.",
+          ].join("\n"),
+          event: ev,
+          adjudication: v,
+        };
+      }
       await appendEvent(runDir, event);
       return { stdout: "ok" };
     }
@@ -7011,6 +7281,14 @@ export async function runSubcommand(argv) {
               // alternative — the old behaviour — was that it surfaced nowhere and `ready` called it
               // enqueueable. Cleared only by the gate actually running (a `review_findings` event).
               gate_missing: (st.gate_missing ?? []).map((r) => r.issue),
+              // DER-2782: the gate RAN and its findings are still open. Same wake-level treatment as
+              // gate_missing — `ready` blocks it, so the orchestrator should see it long before enqueue.
+              gate_blocked: (st.gate_blocked ?? []).map((r) => r.issue),
+              // …and its audit counterpart, on EVERY wake while the unit is still in flight: the control
+              // on a waiver nobody can hard-block is that nobody can miss it before it merges. Scoped to
+              // non-terminal units here (the board keeps the permanent record) — a merged waiver nagging
+              // forever is how a loud banner becomes one operators skim, which would defeat the point.
+              gate_adjudicated: (st.gate_adjudicated ?? []).filter((r) => !DONE_STATUSES.has(r.status)).map((r) => r.issue),
               budget_tripped: (st.budget_trips ?? []).filter((t) => t.level === "tripped").map((t) => t.issue),
               // DER-2748: a version-skewed ledger surfaces on EVERY wake, not only when the orchestrator
               // happens to run `state`. It already blocks dispatch; this is how the operator learns why
