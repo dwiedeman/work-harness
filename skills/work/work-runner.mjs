@@ -35,7 +35,12 @@ export function parseArgs(argv) {
     // The sha/tree a review covered (review-usage). Defaults to the worktree HEAD when omitted.
     else if (a === "--sha") o.sha = argv[++i];
     // Re-score an already-scored (pr, round) in review-fidelity instead of returning the prior result.
+    // On `reap` it is the DESTRUCTIVE escape hatch (a synonym of --abandon) — see reapRefusal.
     else if (a === "--force") o.force = true;
+    // `reap --abandon`: deliberately destroy a unit that is still ACTIVE (kill its lead, remove its
+    // worktree with any uncommitted work in it). Needs its own explicit branch — as a bare boolean the
+    // `--xxx <value>` catch-all at the bottom would swallow the following DER-id as its value.
+    else if (a === "--abandon") o.abandon = true;
     else if (a === "--branch") o.branch = argv[++i];
     else if (a === "--slug") o.slug = argv[++i];
     else if (a === "--model") o.model = argv[++i];
@@ -4275,7 +4280,13 @@ export function reapCleanupOutcome(steps = []) {
   const attempted = steps.filter((x) => x && x.step);
   // `optional` is finally READ. It has been set on the AUTO_MERGE command since that helper was written
   // and no caller ever looked at it — a marker that meant nothing is indistinguishable from no marker.
-  const failed = attempted.filter((x) => Number(x.exit_code) !== 0 && !x.optional);
+  //
+  // DER-2775: exit code is no longer the only failure signal. A kill step carries a `probe` verdict from
+  // the postcondition check (classifyKillProbe), and a chain that finds the process STILL ALIVE exits 0 —
+  // so `exit_code` alone reads that as a clean teardown. Only `killed` passes; `survivor` and `unknown`
+  // both leak, because "I could not verify" must never be recorded as "it is gone".
+  const failed = attempted.filter((x) => !x.optional
+    && (Number(x.exit_code) !== 0 || (x.probe != null && x.probe !== "killed")));
   const leaks = failed.filter((x) => REAP_REQUIRED_STEPS.includes(x.step)).map((x) => x.step);
   return {
     ok: leaks.length === 0,
@@ -4283,6 +4294,7 @@ export function reapCleanupOutcome(steps = []) {
     failed_steps: failed.map((x) => x.step),
     steps: attempted.map((x) => ({
       step: x.step, exit_code: Number(x.exit_code) || 0, optional: Boolean(x.optional),
+      ...(x.probe != null ? { probe: x.probe } : {}),
       ...(x.stderr ? { stderr: String(x.stderr).slice(0, 400) } : {}),
     })),
   };
@@ -4291,7 +4303,7 @@ export function reapCleanupOutcome(steps = []) {
 // What each leaked step obliges the operator to do. A banner that names a step without saying what it
 // costs gets skimmed; the live-remote-lead case is the one that spends money while unattended.
 export const REAP_LEAK_NOTES = {
-  remote_pkill: "the remote claude may still be ALIVE and burning tokens — ssh to the host and pkill it by its brief path",
+  remote_pkill: "the remote claude is or may still be ALIVE and burning tokens (the post-kill pgrep probe did not come back clean) — ssh to the host and pkill it by its brief path, then confirm with pgrep",
   remote_worktree_remove: "the remote worktree is still registered — `git -C <repo> worktree remove --force <path>` on that host (a later run will REFUSE the path, not reclaim it)",
 };
 
@@ -4314,6 +4326,131 @@ export function reapRemoteCleanupCommand({ worktree, repo } = {}) {
   if (!worktree) return null;
   const wt = shellQuote(worktree);
   return `git -C ${wt} update-ref -d AUTO_MERGE 2>/dev/null; git -C ${shellQuote(repo ?? ".")} worktree remove --force ${wt}`;
+}
+
+// ---------------------------------------------------------------------------
+// Proving the kill (DER-2775)
+// ---------------------------------------------------------------------------
+//
+// Every remote teardown used to be `pkill -f <pat>; true`. Two independent masks: `; true` discards
+// pkill's exit code outright, and pkill's exit code never meant "it is gone now" — only "I matched
+// something and signalled it". So a lead that ignored, outlived, or never received the signal produced a
+// clean receipt. The postcondition has to be PRESENCE, measured AFTER the kill, in the same round trip.
+//
+// PORTABILITY — the probe must not see ITSELF, and the two pgrep families differ (verified live
+// 2026-07-30 on macOS 15 BSD pgrep and, in a container, procps-ng 4.0.4):
+//   * BSD/macOS pgrep excludes itself AND its ancestors, so a raw pattern is already clean there.
+//   * procps-ng excludes only itself. ssh runs the chain in a shell whose own cmdline contains the
+//     pattern, so `pgrep -f <raw>` matched that shell and reported RC=0 — a PHANTOM survivor on every
+//     probe, with no target running at all (measured). Left unescaped, this fix would make `rotate-lead`
+//     refuse to respawn on every Linux host, which is worse than the bug it closes.
+//   * Worse still, `pkill -f <raw>` run from inside that shell SIGTERMs its own parent: the raw chain
+//     printed no RC line at all and the shell exited 143 (measured). So the escape is required on the
+//     pkill half too, not only the probe half.
+// The fix is the `ps aux | grep '[s]shd'` trick. `[/]Users/x` is a regex matching the literal `/Users/x`,
+// so it still matches the TARGET's cmdline, while the probing shell's own cmdline holds the literal
+// characters `[/]Users/x`, which that regex does not match.
+//
+// A bracket expression whose single member is `^`, `]`, `-` or `\` is ambiguous or invalid across
+// implementations, so only unambiguous literals are bracketed; anything else falls through to the raw
+// pattern (fail-soft, and unreachable for the absolute paths every caller passes).
+const BRACKET_SAFE_CHAR = /[A-Za-z0-9_/.@+:,%=~]/;
+
+export function bracketEscapePattern(pattern) {
+  const s = String(pattern ?? "");
+  for (let i = 0; i < s.length; i += 1) {
+    if (BRACKET_SAFE_CHAR.test(s[i])) return `${s.slice(0, i)}[${s[i]}]${s.slice(i + 1)}`;
+  }
+  return s;
+}
+
+// One ssh round trip: kill, settle, then ASK whether it is still there. `echo RC=$?` is what makes the
+// answer readable — `pgrep` alone would only set an exit status that the trailing `echo` overwrites.
+export function remoteKillProbeCommand(pattern) {
+  // `pkill -f ''` matches EVERY process on the host. Nothing should ever call this with an empty
+  // pattern, which is exactly why an empty one has to be a loud bug and not a silent shell command.
+  if (!String(pattern ?? "").trim()) throw new Error("remoteKillProbeCommand: refusing to build a kill on an EMPTY pattern — `pkill -f ''` matches every process on the host");
+  const p = shellQuote(bracketEscapePattern(pattern));
+  return `pkill -f ${p} >/dev/null 2>&1; sleep 1; pgrep -f ${p} >/dev/null 2>&1; echo RC=$?`;
+}
+
+// The verdict, from the composite output of the chain above. Deliberately three-valued and fail-closed:
+// only a shell that ran AND answered `RC=1` (pgrep matched nothing) proves the process is gone. ssh
+// transport failure, a killed shell, a truncated read, or any other pgrep exit is `unknown` — which is
+// never treated as success anywhere, because "I could not look" and "it is dead" are different facts.
+export function classifyKillProbe({ exitCode, stdout } = {}) {
+  if (Number(exitCode) !== 0) return "unknown"; // ssh/transport failed — NOT evidence of death
+  // Take the LAST marker: a login shell can print a banner, and the chain's own echo is always last.
+  const all = String(stdout ?? "").match(/RC=(\d+)/g);
+  if (!all || all.length === 0) return "unknown";
+  const rc = all[all.length - 1].slice(3);
+  if (rc === "0") return "survivor"; // pgrep FOUND it — the kill did not take
+  if (rc === "1") return "killed"; // pgrep matched nothing — proven gone
+  return "unknown"; // pgrep usage/permission error
+}
+
+export const KILL_PROBE_NOTES = {
+  survivor: "the process is STILL RUNNING after the kill (pgrep still matches its brief path)",
+  unknown: "the kill could NOT be verified (the probe never returned a verdict — ssh, the remote shell, or pgrep itself failed)",
+};
+
+// The teardown step record for a kill-probe result. `exit_code` stays TRUTHFUL (a survivor is found by a
+// chain that exits 0); the verdict rides in `probe`, which reapCleanupOutcome reads as its own failure
+// condition. Encoding a survivor as a fake nonzero exit would have been a second instrument that lies.
+export function killProbeStep(step, res, { optional = false } = {}) {
+  const probe = classifyKillProbe(res ?? {});
+  return {
+    step, optional, probe,
+    exit_code: Number(res?.exitCode) || 0,
+    ...(res?.stderr ? { stderr: res.stderr } : {}),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Reap preconditions (DER-2775)
+// ---------------------------------------------------------------------------
+//
+// `reap` is the run's DESTRUCTIVE primitive — it kills the lead and `git worktree remove --force`s the
+// tree, so anything uncommitted in it is gone. It had no preconditions at all:
+//
+//   * `state.issues[id] ?? {}` meant an id that is not a unit of this run (a typo, an id from another
+//     run, a stale copy-paste) still appended a TERMINAL `reaped` for a PHANTOM unit — and `reaped` is
+//     deduped first-wins, so that phantom is permanent. (The teardown itself was a no-op for a phantom:
+//     no host ⇒ no pkill, no worktree ⇒ no removal. The harm is the ledger entry, so the fix is the
+//     REFUSAL, not more teardown.)
+//   * a unit still `in_progress`/`pr_open`/`kickback` was torn down exactly like a merged one, with a
+//     `cleanup_ok: true` receipt. That is a live lead's uncommitted work destroyed on a clean receipt.
+//
+// The gate is deliberately NOT "prove the PR merged at the expected SHA": reap has legitimate uses with
+// no PR at all (an abandoned unit, a dead lead that never opened one, a canceled issue), and a live-gh
+// precondition would make a run unable to end when gh is down. The rule is: a unit that is NOT active can
+// be reaped freely; an ACTIVE one needs the operator to say the destructive word.
+export const REAP_TERMINAL_ELIGIBLE = (status) => !ACTIVE_STATUSES.has(status);
+
+export function reapRefusal({ issueId, runId, unit, abandon = false } = {}) {
+  if (!issueId) return "reap needs an issue id: reap --run <r> <DER-id>";
+  if (!unit) {
+    return `reap: ${issueId} is not a unit in run ${runId ?? "<none>"} — refusing. Nothing is torn down (an ` +
+      "unknown id owns no worktree and no host), but the reap would append a TERMINAL `reaped` for a " +
+      "unit that does not exist, and `reaped` is deduped first-wins so the phantom is permanent. Check " +
+      "the id against `state --run <r>`; --abandon does NOT override this.";
+  }
+  if (REAP_TERMINAL_ELIGIBLE(unit.status)) return null;
+  if (abandon) return null;
+  const remote = unit.host && unit.host !== "local" ? unit.host : null;
+  const destroys = [
+    unit.worktree
+      ? `its worktree ${unit.worktree}${remote ? ` on ${remote}` : ""} — \`git worktree remove --force\`, so ANY UNCOMMITTED WORK IN IT IS DESTROYED`
+      : null,
+    remote ? `the lead process on ${remote} (pkill by brief path)` : null,
+    unit.workspace_ref ? `every CMUX workspace the issue ever had` : null,
+  ].filter(Boolean);
+  return `reap: ${issueId} is still ACTIVE (status \`${unit.status}\`${unit.pr != null ? `, PR #${unit.pr}` : ", no PR"}) — refusing. ` +
+    `This reap would destroy:\n  - ${destroys.length ? destroys.join("\n  - ") : "(nothing recorded — but the terminal `reaped` would still land)"}\n` +
+    "Reap AFTER the work lands: re-check `gh pr view` and let the `pr_merged` fold run first. If you " +
+    "really mean to throw this unit's work away (abandoned unit, dead lead with no PR, canceled issue), " +
+    "say so explicitly: re-run with --abandon, which records `abandoned: true` on the `reaped` event so " +
+    "an audit can tell deliberate destruction from post-merge cleanup.";
 }
 
 // ---------------------------------------------------------------------------
@@ -5482,8 +5619,20 @@ export async function runSubcommand(argv) {
         const priorRefs = workspaceRefsToClose(await readEvents(runDir), o.issueId);
         if (priorRefs.length) {
           if (remoteHost) {
+            // Same postcondition as rotate-lead (DER-2775), for the same reason and the same hazard: this
+            // branch only runs when a PREDECESSOR was recorded, and we are about to spawn its replacement
+            // onto the same worktree. `pkill …; true` let an unkilled predecessor survive into a second
+            // live lead. Refusing here is recoverable (retry the spawn); two writers are not.
             const briefMatch = `${remoteHost.ledgerRoot}/${o.runId}/briefs/${o.issueId}`;
-            await runCommand({ command: "ssh", args: [remoteHost.ssh, `pkill -f ${shellQuote(briefMatch)}; true`] });
+            const probe = classifyKillProbe(await runCommand({ command: "ssh", args: [remoteHost.ssh, remoteKillProbeCommand(briefMatch)] }));
+            if (probe !== "killed") {
+              throw new Error(
+                `spawn-lead: refusing to spawn ${o.issueId} on ${o.host} — its PREDECESSOR ${KILL_PROBE_NOTES[probe]}. ` +
+                  "Spawning now would put TWO leads on one worktree, which corrupts the branch. " +
+                  `Clear it first: ssh ${remoteHost.ssh} "pkill -f '${bracketEscapePattern(briefMatch)}'" ` +
+                  `then confirm with pgrep -f '${bracketEscapePattern(briefMatch)}' (SIGKILL it if it ignores TERM), and re-run this spawn.`,
+              );
+            }
           }
           for (const ref of priorRefs) {
             await runCommand({ command: cmuxBin(), args: ["close-workspace", "--workspace", ref] });
@@ -5936,13 +6085,21 @@ export async function runSubcommand(argv) {
       // lead's brief path in live process args (the same pattern reap/rotate pkill by).
       const probeProcess = async (issue, hostCfg) => {
         if (hostCfg) {
+          // DER-2775: bracket-escaped, same as the teardown probes. Un-escaped, this shape reports
+          // "alive" for EVERY lead on a procps host — the shell ssh spawned carries the pattern in its
+          // own cmdline and procps pgrep excludes only itself, so the probe matched itself. That reads as
+          // universal health, which is the direction that keeps a dead lead invisible.
           const pat = `${hostCfg.ledgerRoot}/${o.runId}/briefs/${issue}`;
-          const res = await runCommand({ command: "ssh", args: [hostCfg.ssh, `pgrep -f ${shellQuote(pat)} >/dev/null 2>&1; echo RC=$?`] });
-          if (res.exitCode !== 0) return "unknown"; // ssh itself failed — NOT evidence of death
-          const m = String(res.stdout ?? "").match(/RC=(\d+)/);
-          return m ? (m[1] === "0" ? "alive" : m[1] === "1" ? "dead" : "unknown") : "unknown";
+          const res = await runCommand({ command: "ssh", args: [hostCfg.ssh, `pgrep -f ${shellQuote(bracketEscapePattern(pat))} >/dev/null 2>&1; echo RC=$?`] });
+          // classifyKillProbe's verdicts map 1:1 onto this probe's — it is the same RC contract, minus
+          // the kill: `survivor` here just means the lead is alive, which is the healthy answer.
+          const v = classifyKillProbe(res);
+          return v === "survivor" ? "alive" : v === "killed" ? "dead" : "unknown";
         }
-        const res = await runCommand({ command: "pgrep", args: ["-f", `${runDir}/briefs/${issue}`] });
+        // Local: `pgrep` is spawned directly (no intermediate shell holding the pattern), so only pgrep
+        // itself could match — and every family excludes itself. Escaped anyway: the two branches must
+        // not be able to drift into meaning different things.
+        const res = await runCommand({ command: "pgrep", args: ["-f", bracketEscapePattern(`${runDir}/briefs/${issue}`)] });
         return res.exitCode === 0 ? "alive" : res.exitCode === 1 ? "dead" : "unknown";
       };
       const readings = [];
@@ -6082,7 +6239,22 @@ export async function runSubcommand(argv) {
       // 1. Close the workspace. The worktree SURVIVES — that is the whole difference from `reap`.
       if (!o.dryRun) {
         if (ssh) {
-          await runCommand({ command: "ssh", args: [ssh, `pkill -f ${shellQuote(`${hostCfg.ledgerRoot}/${o.runId}/briefs/${o.issueId}`)}; true`] });
+          // POSTCONDITION (DER-2775): the predecessor must be PROVEN gone before step 5 respawns onto the
+          // same worktree. `pkill …; true` proved nothing, so a lead that ignored the signal left TWO live
+          // leads on one worktree — the branch-corruption failure this whole close-then-respawn dance
+          // exists to prevent. `unknown` refuses too: an unverified kill is not a kill, and a rotation is
+          // always safe to retry, whereas a second writer on live uncommitted work is not recoverable.
+          const pat = `${hostCfg.ledgerRoot}/${o.runId}/briefs/${o.issueId}`;
+          const probe = classifyKillProbe(await runCommand({ command: "ssh", args: [ssh, remoteKillProbeCommand(pat)] }));
+          if (probe !== "killed") {
+            throw new Error(
+              `rotate-lead: refusing to respawn ${o.issueId} on ${host} — ${KILL_PROBE_NOTES[probe]}. ` +
+                "Respawning now would put TWO leads on one worktree (" + it.worktree + "), which corrupts " +
+                `the branch. Fix it on the host, then re-run: ssh ${ssh} "pkill -f '${bracketEscapePattern(pat)}'" ` +
+                `and confirm with pgrep -f '${bracketEscapePattern(pat)}' (no output = gone; SIGKILL it if it ignores TERM). ` +
+                "If the probe could not answer at all, the host or its ssh is the problem — `preflight` it first.",
+            );
+          }
         }
         if (it.workspace_ref) {
           await runCommand({ command: cmuxBin(), args: ["close-workspace", "--workspace", it.workspace_ref] });
@@ -6163,7 +6335,16 @@ export async function runSubcommand(argv) {
     }
     case "reap": {
       const state = materializeState(await readEvents(runDir), { run_id: o.runId });
-      const it = state.issues[o.issueId] ?? {};
+      // PRECONDITIONS IN (DER-2775) — before ANY teardown and before ANY ledger write, including on a
+      // --dry-run, because a preview of an illegal reap must refuse rather than rehearse it. `?? {}` is
+      // gone on purpose: an unknown id is a refusal, never an empty unit that folds a phantom `reaped`.
+      const it = state.issues[o.issueId];
+      const abandoned = Boolean(o.abandon || o.force);
+      const refusal = reapRefusal({ issueId: o.issueId, runId: o.runId, unit: it, abandon: abandoned });
+      if (refusal) throw new Error(refusal);
+      // Only load-bearing when the unit was ACTIVE — an --abandon on an already-merged unit is a no-op
+      // flag, and stamping `abandoned: true` there would claim a destruction that did not happen.
+      const abandonedActive = abandoned && !REAP_TERMINAL_ELIGIBLE(it.status);
       const remoteHost = it.host && it.host !== "local" ? getHosts()[it.host] : null;
       // DER-2740: every cleanup result is CAPTURED rather than discarded. Cleanup stays best-effort — the
       // run must still be able to end — but "best-effort" was silently doing double duty as "unrecorded".
@@ -6173,10 +6354,12 @@ export async function runSubcommand(argv) {
           // cmux close-workspace only drops the ssh connection — the remote claude survives (it
           // self-exits eventually, but non-deterministically). Kill it explicitly by its brief path
           // in the process args BEFORE removing the worktree it's cwd'd in, so a mini reap is clean.
+          // POSTCONDITION OUT (DER-2775): kill THEN probe in one round trip, and record what the probe
+          // found. `pkill …; true` reported success unconditionally — a survivor got a clean receipt.
           const briefMatch = `${remoteHost.ledgerRoot}/${o.runId}/briefs/${o.issueId}`;
-          const r = await runCommand({ command: "ssh", args: [remoteHost.ssh, `pkill -f ${shellQuote(briefMatch)}; true`] });
+          const r = await runCommand({ command: "ssh", args: [remoteHost.ssh, remoteKillProbeCommand(briefMatch)] });
           // REQUIRED: a failure here leaves the remote lead alive, spending, with nothing watching it.
-          cleanupSteps.push({ step: "remote_pkill", optional: false, exit_code: r.exitCode, stderr: r.stderr });
+          cleanupSteps.push(killProbeStep("remote_pkill", r));
         }
         if (it.worktree) {
           if (remoteHost) {
@@ -6210,6 +6393,9 @@ export async function runSubcommand(argv) {
         await appendEvent(runDir, {
           actor: "orch", type: "reaped", issue: o.issueId,
           cleanup_ok: cleanup.ok, cleanup: cleanup.steps,
+          // DER-2775: an audit must be able to tell post-merge cleanup from deliberate destruction. Only
+          // stamped when the escape hatch actually carried the reap past the ACTIVE guard.
+          ...(abandonedActive ? { abandoned: true, abandoned_from: it.status } : {}),
         });
         // A SEPARATE event, not a field on `reaped` alone: `dedupeTerminalEvents` keeps the first `reaped`
         // per issue, so a leak recorded only there could never be reported by a later re-reap. Appended
@@ -6218,12 +6404,20 @@ export async function runSubcommand(argv) {
           await appendEvent(runDir, {
             actor: "orch", type: "reap_failed", issue: o.issueId, host: it.host ?? null,
             leaks: cleanup.leaks, failed_steps: cleanup.failed_steps, cleanup: cleanup.steps,
-            reason: `required cleanup failed: ${cleanup.leaks.join(", ")}`,
+            // Name the VERDICT, not just the step: "the probe found it alive" and "the probe never
+            // answered" oblige the operator differently, and both used to read as a clean teardown.
+            reason: `required cleanup failed: ${cleanup.leaks
+              .map((l) => {
+                const s = cleanup.steps.find((x) => x.step === l);
+                return s?.probe && KILL_PROBE_NOTES[s.probe] ? `${l} (${KILL_PROBE_NOTES[s.probe]})` : l;
+              })
+              .join(", ")}`,
           });
         }
       }
       const leakNote = cleanup.ok ? "" : `\n  ⚠ NOT a clean teardown — ${cleanup.leaks.map((l) => REAP_LEAK_NOTES[l] ?? l).join("\n  ⚠ ")}`;
-      return { stdout: `reaped ${o.issueId}${o.dryRun ? " (dry-run: nothing closed, nothing recorded)" : ""}${leakNote}` };
+      const abandonNote = abandonedActive ? ` ⚠ ABANDONED from \`${it.status}\` — its uncommitted work is gone (recorded as abandoned:true)` : "";
+      return { stdout: `reaped ${o.issueId}${o.dryRun ? " (dry-run: nothing closed, nothing recorded)" : ""}${abandonNote}${leakNote}` };
     }
     case "ready": {
       // PER-PR ENQUEUE GATE (H5) — the run-dir ready.sh promoted to a harness primitive so it stops
@@ -6729,7 +6923,15 @@ same flag for a lead that never asked. state.lead_rotate_pending surfaces both. 
 axis (they are not kickback rounds) and are capped at ${ROTATION_CAP} — the next request is a budget trip.
 Design: the README's context-rotation section.
 
-  reap --run <r> <DER-id>                     git worktree remove + close EVERY workspace the issue ever had
+  reap --run <r> <DER-id> [--abandon]         git worktree remove + close EVERY workspace the issue ever had
+                                              REFUSES (DER-2775) an id that is not a unit of this run, and any
+                                              unit still ACTIVE (in_progress/pr_open/kickback) — that reap
+                                              DESTROYS its uncommitted work. Reap after the work lands.
+                                              --abandon (alias --force) says "destroy it anyway" out loud and
+                                              stamps abandoned:true on the reaped event; it does NOT make an
+                                              unknown id reapable. The remote kill is now kill-THEN-PROBE:
+                                              a lead still alive after pkill leaks (cleanup_ok:false), and an
+                                              unverifiable kill leaks too — never a clean receipt.
   ready --run <r> [PR…] [--json]              per-PR merge gate (H5): BOTH Codex surfaces author-filtered, checks
                                               captured once, throttled-null threads = UNKNOWN never 0, cancelled-run
                                               note, behind-main column (CI tests the MERGE tree — H11). Resolves the

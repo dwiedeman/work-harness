@@ -6058,7 +6058,30 @@ test("DER-2739/DER-2744 fields are NOT reachable from a PR comment", () => {
 // can never be corrected by appending a better one later. The sharpest harm is a failed remote `pkill`:
 // `close-workspace` only drops the ssh, so the mini's claude stays ALIVE burning tokens while the ledger
 // says the issue is reaped and nothing will ever look at it again.
-async function withReapStubs(failPattern, body) {
+// REWRITTEN for DER-2775. The original stubbed ssh TRANSPORT failure — `case "$*" in *pkill*) exit 9` —
+// and that is why the survivor defect stayed green through a whole suite written to catch exactly it. The
+// production teardown ran `pkill -f <pat>; true`: the `; true` makes the remote shell exit 0 no matter
+// what pkill did, so ssh returns 0 on EVERY real teardown, clean or not. A transport failure is a
+// scenario the old code could see; "the kill did not take" is the one it could not, and the only stub
+// shape that expresses it is the remote SHELL's own composite output. So this stub now answers as the
+// shell does — the `RC=<n>` line the kill-then-probe chain echoes:
+//   probe: "killed"    RC=1  pgrep matched nothing  → proven gone (the healthy answer)
+//   probe: "survivor"  RC=0  pgrep still matches it → the lead is ALIVE on a green transport
+//   probe: "silent"    no RC line at all            → the shell died / never answered (unknown)
+//   probe: "transport" ssh itself fails             → the OLD scenario, kept as one case among four
+// `worktreeExit` is the separate teardown step and stays an exit code, because that command's exit code
+// really is its verdict.
+const REAP_PROBE_CASES = {
+  killed: "printf 'RC=1\\n'; exit 0",
+  survivor: "printf 'RC=0\\n'; exit 0",
+  silent: "exit 0",
+  transport: "printf 'ssh: connect to host: Connection refused\\n' >&2; exit 255",
+};
+
+async function withReapStubs(opts, body) {
+  const { probe = "killed", worktreeExit = 0 } = opts ?? {};
+  const probeCase = REAP_PROBE_CASES[probe];
+  assert.ok(probeCase, `withReapStubs: unknown probe "${probe}" (have: ${Object.keys(REAP_PROBE_CASES).join(", ")})`);
   const dir = await mkdtemp(join(tmpdir(), "wr-d2740-"));
   const bin = join(dir, "bin");
   await mkdir(bin, { recursive: true });
@@ -6066,10 +6089,19 @@ async function withReapStubs(failPattern, body) {
   await writeFile(join(bin, "ssh"), [
     "#!/bin/sh",
     `printf '%s\\n' "$*" >> ${JSON.stringify(log)}`,
-    ...(failPattern ? [`case "$*" in *${failPattern}*) printf 'ssh: boom\\n' >&2; exit 9 ;; esac`] : []),
+    // Route on what the remote command DOES, not on the host arg: the kill-then-probe chain is the only
+    // one that runs pgrep, and the teardown is the only one that runs `git … worktree`.
+    'case "$*" in',
+    `  *pgrep*) ${probeCase} ;;`,
+    `  *worktree*) ${worktreeExit === 0 ? "exit 0" : `printf 'ssh: boom\\n' >&2; exit ${worktreeExit}`} ;;`,
+    "esac",
     "exit 0",
   ].join("\n") + "\n", "utf8");
   await chmod(join(bin, "ssh"), 0o755);
+  // scp is stubbed so a rotation CONTROL (one that gets past the guard and reaches spawn-lead) cannot
+  // reach the network for the fake `example-mini-host`.
+  await writeFile(join(bin, "scp"), "#!/bin/sh\nexit 0\n", "utf8");
+  await chmod(join(bin, "scp"), 0o755);
   const cmux = join(bin, "cmux");
   await writeStubBin(cmux, { exit: 0, out: "closed" });
   const prevPath = process.env.PATH;
@@ -6101,9 +6133,11 @@ test("DER-2740: a failed remote pkill is recorded — the reap does not claim a 
   const repoRoot = await mkRepoWithHosts();
   const { runsRoot, runDir } = await d2740Ledger();
   try {
-    await withReapStubs("pkill", async ({ cmux }) => {
+    // `--abandon` (DER-2775): this ledger's unit is `in_progress` with no PR, so the reap it has always
+    // driven IS a deliberate destruction. Saying so out loud is the honest form of what it was doing.
+    await withReapStubs({ probe: "transport" }, async ({ cmux }) => {
       await withEnv({ WORK_CMUX_BIN: cmux }, () =>
-        runSubcommand(["reap", "--run", "r1", "DER-1", "--runs-root", runsRoot, "--repo-root", repoRoot]));
+        runSubcommand(["reap", "--run", "r1", "DER-1", "--abandon", "--runs-root", runsRoot, "--repo-root", repoRoot]));
       const evs = await d2740Read(runDir);
       const reaped = evs.find((e) => e.type === "reaped");
       assert.ok(reaped, "the run must still be able to finish — reaped is still appended");
@@ -6127,9 +6161,9 @@ test("DER-2740: a failed remote worktree remove is recorded too (nothing re-deri
   const repoRoot = await mkRepoWithHosts();
   const { runsRoot, runDir } = await d2740Ledger();
   try {
-    await withReapStubs("worktree", async ({ cmux }) => {
+    await withReapStubs({ worktreeExit: 9 }, async ({ cmux }) => {
       await withEnv({ WORK_CMUX_BIN: cmux }, () =>
-        runSubcommand(["reap", "--run", "r1", "DER-1", "--runs-root", runsRoot, "--repo-root", repoRoot]));
+        runSubcommand(["reap", "--run", "r1", "DER-1", "--abandon", "--runs-root", runsRoot, "--repo-root", repoRoot]));
       const evs = await d2740Read(runDir);
       const failed = evs.find((e) => e.type === "reap_failed");
       assert.ok(failed, "a leaked registered worktree must be recorded");
@@ -6147,9 +6181,9 @@ test("DER-2740 CONTROL: an all-green reap records a CLEAN reaped and no failure 
   const repoRoot = await mkRepoWithHosts();
   const { runsRoot, runDir } = await d2740Ledger();
   try {
-    await withReapStubs(null, async ({ cmux }) => {
+    await withReapStubs({ probe: "killed" }, async ({ cmux }) => {
       await withEnv({ WORK_CMUX_BIN: cmux }, () =>
-        runSubcommand(["reap", "--run", "r1", "DER-1", "--runs-root", runsRoot, "--repo-root", repoRoot]));
+        runSubcommand(["reap", "--run", "r1", "DER-1", "--abandon", "--runs-root", runsRoot, "--repo-root", repoRoot]));
       const evs = await d2740Read(runDir);
       assert.equal(evs.find((e) => e.type === "reaped").cleanup_ok, true, "a clean teardown must read as clean");
       assert.equal(evs.some((e) => e.type === "reap_failed"), false, "no failure event on a healthy reap");
@@ -6189,9 +6223,9 @@ test("DER-2740: reap_failed is actionable, and --dry-run still records nothing",
   const repoRoot = await mkRepoWithHosts();
   const { runsRoot, runDir } = await d2740Ledger();
   try {
-    await withReapStubs("pkill", async ({ cmux, sshCalls }) => {
+    await withReapStubs({ probe: "transport" }, async ({ cmux, sshCalls }) => {
       await withEnv({ WORK_CMUX_BIN: cmux }, () =>
-        runSubcommand(["reap", "--run", "r1", "DER-1", "--runs-root", runsRoot, "--repo-root", repoRoot, "--dry-run"]));
+        runSubcommand(["reap", "--run", "r1", "DER-1", "--abandon", "--runs-root", runsRoot, "--repo-root", repoRoot, "--dry-run"]));
       const types = (await d2740Read(runDir)).map((e) => e.type);
       assert.deepEqual(types, ["run_started", "worktree_created", "lead_spawned"], "dry-run purity (DER-2514)");
       assert.deepEqual(await sshCalls(), [], "a preview must not ssh anywhere either");
@@ -6201,6 +6235,347 @@ test("DER-2740: reap_failed is actionable, and --dry-run still records nothing",
     await rm(repoRoot, { recursive: true, force: true });
     await applyRepoConfig("/nonexistent-reset");
   }
+});
+
+// ---- DER-2775: reap/rotate teardown — preconditions IN, postconditions OUT --------------------------
+// DER-2740 made the teardown RECORD what it achieved. It did not make the teardown check what it was
+// allowed to do, or measure whether the kill worked — so a clean receipt was still reachable two ways:
+//   IN   `state.issues[id] ?? {}` reaped an id this run never had (permanent phantom `reaped`), and a
+//        unit still in_progress/pr_open/kickback was `worktree remove --force`d exactly like a merged
+//        one, taking a live lead's uncommitted work with it.
+//   OUT  `pkill -f <pat>; true` — `; true` masks the exit code, and pkill's exit code only ever meant "I
+//        matched and signalled", never "it is gone". A lead that ignored the signal got cleanup_ok:true.
+// Both halves are the same failure: a destructive step that reports on its INTENT instead of its EFFECT.
+
+// A ledger whose unit reached a given status, so the ACTIVE-vs-terminal gate can be driven from both sides.
+async function d2775Ledger({ status = "in_progress" } = {}) {
+  const runsRoot = await mkdtemp(join(tmpdir(), "wr-d2775-runs-"));
+  const runDir = join(runsRoot, "r1");
+  await mkdir(runDir, { recursive: true });
+  const evs = [
+    { actor: "orch", type: "run_started", run_id: "r1" },
+    { actor: "orch", type: "worktree_created", issue: "DER-1", worktree: "/Users/example/agent-work/r1/DER-1", host: "mini" },
+    { actor: "orch", type: "lead_spawned", issue: "DER-1", host: "mini", workspace_ref: "workspace:7" },
+    ...(status === "pr_open" || status === "merged" ? [{ actor: "lead", type: "pr_opened", issue: "DER-1", pr: 77, host: "mini" }] : []),
+    ...(status === "merged" ? [{ actor: "shepherd", type: "pr_merged", issue: "DER-1", pr: 77, host: "mini" }] : []),
+  ];
+  await writeFile(join(runDir, "events.jsonl"),
+    `${evs.map((e) => JSON.stringify({ ...e, ts: "2026-07-29T01:00:00.000Z" })).join("\n")}\n`, "utf8");
+  const st = materializeState(await readEvents(runDir), { run_id: "r1" });
+  assert.equal(st.issues["DER-1"].status, status, "fixture must actually reach the status it claims");
+  return { runsRoot, runDir };
+}
+
+const d2775Reap = (runsRoot, repoRoot, ...extra) =>
+  ["reap", "--run", "r1", "DER-1", "--runs-root", runsRoot, "--repo-root", repoRoot, ...extra];
+
+test("DER-2775 (a): reap REFUSES an id that is not a unit of this run — no phantom terminal event", async () => {
+  const repoRoot = await mkRepoWithHosts();
+  const { runsRoot, runDir } = await d2775Ledger();
+  try {
+    await withReapStubs({ probe: "killed" }, async ({ cmux, sshCalls }) => {
+      const before = (await d2740Read(runDir)).length;
+      await assert.rejects(
+        () => withEnv({ WORK_CMUX_BIN: cmux }, () =>
+          runSubcommand(["reap", "--run", "r1", "DER-404", "--runs-root", runsRoot, "--repo-root", repoRoot])),
+        /DER-404 is not a unit in run r1/,
+        "an id this run never had must not be reapable",
+      );
+      const evs = await d2740Read(runDir);
+      assert.equal(evs.length, before, "a refused reap writes NOTHING to the ledger");
+      assert.equal(evs.some((e) => e.issue === "DER-404"), false,
+        "…and above all no TERMINAL `reaped` for a unit that does not exist — `reaped` is deduped first-wins, so a phantom is permanent");
+      assert.deepEqual(await sshCalls(), [], "…and it touches no host");
+      // The escape hatch is for DESTRUCTION, not for id validity: an unknown id owns nothing to destroy,
+      // so there is no version of this call that should be allowed to fold a phantom unit.
+      await assert.rejects(
+        () => withEnv({ WORK_CMUX_BIN: cmux }, () =>
+          runSubcommand(["reap", "--run", "r1", "DER-404", "--abandon", "--runs-root", runsRoot, "--repo-root", repoRoot])),
+        /DER-404 is not a unit in run r1/,
+        "--abandon must not override the existence check",
+      );
+      assert.equal((await d2740Read(runDir)).length, before, "still nothing written");
+    });
+  } finally {
+    await rm(runsRoot, { recursive: true, force: true });
+    await rm(repoRoot, { recursive: true, force: true });
+    await applyRepoConfig("/nonexistent-reset");
+  }
+});
+
+test("DER-2775 (b): reap REFUSES a still-ACTIVE unit, naming the work it would destroy", async () => {
+  const repoRoot = await mkRepoWithHosts();
+  const { runsRoot, runDir } = await d2775Ledger({ status: "in_progress" });
+  try {
+    await withReapStubs({ probe: "killed" }, async ({ cmux, sshCalls }) => {
+      await assert.rejects(
+        () => withEnv({ WORK_CMUX_BIN: cmux }, () => runSubcommand(d2775Reap(runsRoot, repoRoot))),
+        (err) => {
+          const m = String(err.message);
+          assert.match(m, /still ACTIVE/i, "the refusal must say WHY");
+          assert.match(m, /in_progress/, "…naming the status it read");
+          assert.match(m, /\/Users\/example\/agent-work\/r1\/DER-1/, "…and the worktree it would remove");
+          assert.match(m, /UNCOMMITTED/i, "…and that the work in it is DESTROYED, not merely that a tree goes away");
+          assert.match(m, /--abandon/, "…and how to say it deliberately");
+          return true;
+        },
+      );
+      const evs = await d2740Read(runDir);
+      assert.equal(evs.some((e) => e.type === "reaped"), false, "a refused reap records no terminal state");
+      assert.deepEqual(await sshCalls(), [], "…and kills nothing — the refusal is BEFORE any teardown");
+    });
+  } finally {
+    await rm(runsRoot, { recursive: true, force: true });
+    await rm(repoRoot, { recursive: true, force: true });
+    await applyRepoConfig("/nonexistent-reset");
+  }
+});
+
+test("DER-2775 (b): --abandon proceeds and RECORDS the destruction; a merged unit reaps with no flag and is not marked abandoned", async () => {
+  const repoRoot = await mkRepoWithHosts();
+  const active = await d2775Ledger({ status: "in_progress" });
+  const merged = await d2775Ledger({ status: "merged" });
+  try {
+    await withReapStubs({ probe: "killed" }, async ({ cmux }) => {
+      await withEnv({ WORK_CMUX_BIN: cmux }, () => runSubcommand(d2775Reap(active.runsRoot, repoRoot, "--abandon")));
+      const reaped = (await d2740Read(active.runDir)).find((e) => e.type === "reaped");
+      assert.ok(reaped, "the hatch must actually let the reap through — a gate with no way past it stops a run");
+      assert.equal(reaped.abandoned, true, "deliberate destruction of live work must be auditable as such");
+      assert.equal(reaped.abandoned_from, "in_progress", "…and say what it was destroyed out of");
+
+      // CONTROL — the ordinary post-merge reap. It needs no flag, and must NOT be tarred as abandoned:
+      // if every reap recorded `abandoned`, the field would distinguish nothing.
+      await withEnv({ WORK_CMUX_BIN: cmux }, () => runSubcommand(d2775Reap(merged.runsRoot, repoRoot)));
+      const clean = (await d2740Read(merged.runDir)).find((e) => e.type === "reaped");
+      assert.ok(clean, "a merged unit reaps with no ceremony");
+      assert.equal("abandoned" in clean, false, "post-merge cleanup is not destruction");
+
+      // …and the flag is a no-op on an already-terminal unit rather than a false destruction claim.
+      await withEnv({ WORK_CMUX_BIN: cmux }, () => runSubcommand(d2775Reap(merged.runsRoot, repoRoot, "--abandon")));
+      const reReaped = (await d2740Read(merged.runDir)).filter((e) => e.type === "reaped");
+      assert.equal(reReaped.some((e) => e.abandoned), false, "--abandon on a merged unit destroyed nothing, so it claims nothing");
+    });
+  } finally {
+    await rm(active.runsRoot, { recursive: true, force: true });
+    await rm(merged.runsRoot, { recursive: true, force: true });
+    await rm(repoRoot, { recursive: true, force: true });
+    await applyRepoConfig("/nonexistent-reset");
+  }
+});
+
+test("DER-2775 (c): pkill 'succeeds' but the process is STILL THERE — the reap records a leak, not a clean teardown", async () => {
+  const repoRoot = await mkRepoWithHosts();
+  const { runsRoot, runDir } = await d2775Ledger();
+  try {
+    await withReapStubs({ probe: "survivor" }, async ({ cmux, sshCalls }) => {
+      await withEnv({ WORK_CMUX_BIN: cmux }, () => runSubcommand(d2775Reap(runsRoot, repoRoot, "--abandon")));
+      const calls = await sshCalls();
+      assert.ok(calls.some((c) => /pgrep/.test(c)),
+        `the teardown must ASK whether the process is gone, in the same round trip: ${JSON.stringify(calls)}`);
+      const evs = await d2740Read(runDir);
+      const reaped = evs.find((e) => e.type === "reaped");
+      assert.ok(reaped, "the run must still be able to end");
+      assert.equal(reaped.cleanup_ok, false, "a lead still running after the kill is NOT a clean teardown");
+      const step = (reaped.cleanup ?? []).find((s) => s.step === "remote_pkill");
+      assert.equal(step.exit_code, 0,
+        "the sharp part: the shell exited 0 — exit code alone reads this as success, which is why the defect survived DER-2740");
+      assert.equal(step.probe, "survivor", "the recorded verdict must be the PRESENCE of the process");
+      const failed = evs.find((e) => e.type === "reap_failed");
+      assert.ok(failed, "a lead left alive and unwatched must be recorded, not discarded");
+      assert.ok((failed.leaks ?? []).includes("remote_pkill"), JSON.stringify(failed.leaks));
+      assert.match(String(failed.reason), /STILL RUNNING/i, "the reason must say the process is alive, not just name a step");
+      const banner = materializeState(evs, { run_id: "r1" }).reap_failures ?? [];
+      assert.equal(banner.length, 1, "and it must survive the issue going terminal");
+    });
+  } finally {
+    await rm(runsRoot, { recursive: true, force: true });
+    await rm(repoRoot, { recursive: true, force: true });
+    await applyRepoConfig("/nonexistent-reset");
+  }
+});
+
+test("DER-2775 (c): a kill that could not be VERIFIED leaks too — 'I could not look' is never 'it is dead'", async () => {
+  const repoRoot = await mkRepoWithHosts();
+  const { runsRoot, runDir } = await d2775Ledger();
+  try {
+    // The remote shell ran and exited 0 but never printed a verdict (killed mid-chain, truncated read,
+    // a login banner that ate the line). Exit code says success; nothing was actually measured.
+    await withReapStubs({ probe: "silent" }, async ({ cmux }) => {
+      await withEnv({ WORK_CMUX_BIN: cmux }, () => runSubcommand(d2775Reap(runsRoot, repoRoot, "--abandon")));
+      const evs = await d2740Read(runDir);
+      const reaped = evs.find((e) => e.type === "reaped");
+      assert.equal(reaped.cleanup_ok, false, "an unverified kill must not read as clean");
+      assert.equal((reaped.cleanup ?? []).find((s) => s.step === "remote_pkill").probe, "unknown");
+      assert.match(String(evs.find((e) => e.type === "reap_failed").reason), /could NOT be verified/i);
+    });
+  } finally {
+    await rm(runsRoot, { recursive: true, force: true });
+    await rm(repoRoot, { recursive: true, force: true });
+    await applyRepoConfig("/nonexistent-reset");
+  }
+});
+
+test("DER-2775 (d): rotate-lead REFUSES to respawn while the predecessor is still alive", async () => {
+  const repoRoot = await mkRepoWithHosts();
+  const { runsRoot, runDir } = await d2775Ledger();
+  const rot = (...extra) => ["rotate-lead", "--run", "r1", "DER-1", "--runs-root", runsRoot, "--repo-root", repoRoot, ...extra];
+  try {
+    await withReapStubs({ probe: "survivor" }, async ({ cmux, sshCalls }) => {
+      const before = (await d2740Read(runDir)).length;
+      await assert.rejects(
+        () => withEnv({ WORK_CMUX_BIN: cmux }, () => runSubcommand(rot())),
+        (err) => {
+          const m = String(err.message);
+          assert.match(m, /refusing to respawn DER-1/, "the rotation must stop, not proceed on an unproven kill");
+          assert.match(m, /STILL RUNNING/i, "…saying the predecessor is alive");
+          assert.match(m, /TWO leads on one worktree/, "…and why that matters — this is branch corruption, not tidiness");
+          return true;
+        },
+      );
+      assert.equal((await d2740Read(runDir)).length, before, "a refused rotation consumes no rotation slot and records nothing");
+      const calls = await sshCalls();
+      assert.equal(calls.filter((c) => /status --porcelain/.test(c)).length, 0,
+        "…and stops BEFORE the WIP checkpoint, i.e. before anything downstream touches the worktree");
+    });
+
+    // CONTROL — a PROVEN-dead predecessor must NOT be blocked. Without this the guard could be a
+    // constant `false` (which is exactly what an unescaped pgrep would produce on any procps host).
+    await withReapStubs({ probe: "killed" }, async ({ cmux, sshCalls }) => {
+      await withEnv({ WORK_CMUX_BIN: cmux }, async () => {
+        try { await runSubcommand(rot()); } catch (err) {
+          assert.doesNotMatch(String(err.message), /refusing to respawn/, `the guard must not fire on a proven kill: ${err.message}`);
+        }
+      });
+      const calls = await sshCalls();
+      assert.ok(calls.some((c) => /pgrep/.test(c)), "the probe still runs");
+      assert.ok(calls.some((c) => /status --porcelain/.test(c)),
+        `…and the rotation proceeded past the guard to the WIP checkpoint: ${JSON.stringify(calls)}`);
+    });
+  } finally {
+    await rm(runsRoot, { recursive: true, force: true });
+    await rm(repoRoot, { recursive: true, force: true });
+    await applyRepoConfig("/nonexistent-reset");
+  }
+});
+
+test("DER-2775 (d): spawn-lead refuses the same way — the predecessor sweep has the identical hazard", async () => {
+  const repoRoot = await mkRepoWithHosts();
+  const { runsRoot, runDir } = await d2775Ledger();
+  try {
+    await withReapStubs({ probe: "survivor" }, async ({ cmux, sshCalls }) => {
+      const before = (await d2740Read(runDir)).length;
+      await assert.rejects(
+        () => withEnv({ WORK_CMUX_BIN: cmux }, () => runSubcommand([
+          "spawn-lead", "--run", "r1", "DER-1", "--host", "mini",
+          "--worktree", "/Users/example/agent-work/r1/DER-1", "--kickback", "1",
+          "--runs-root", runsRoot, "--repo-root", repoRoot,
+        ])),
+        /its PREDECESSOR .*STILL RUNNING/is,
+        "a kickback respawn onto a live lead's worktree is the same two-writers failure as a rotation",
+      );
+      assert.equal((await d2740Read(runDir)).length, before, "no lead_spawned for a spawn that must not happen");
+      assert.equal((await sshCalls()).some((c) => /scp|mkdir/.test(c)), false, "…and it stops before staging the brief");
+    });
+  } finally {
+    await rm(runsRoot, { recursive: true, force: true });
+    await rm(repoRoot, { recursive: true, force: true });
+    await applyRepoConfig("/nonexistent-reset");
+  }
+});
+
+// ---- DER-2775: the probe must not see ITSELF (both pgrep families) ----------------------------------
+// This is the trap that makes the fix worth more than the bug. BSD/macOS pgrep excludes itself AND its
+// ancestors; procps/Linux pgrep excludes only itself — and ssh runs the chain in a shell whose own
+// cmdline contains the pattern. Verified live 2026-07-30 against procps-ng 4.0.4 in a container:
+//   raw probe, nothing running      → RC=0  (a PHANTOM survivor on EVERY probe)
+//   raw chain, nothing running      → no RC line at all; the shell exited 143, because `pkill -f <raw>`
+//                                     SIGTERMed its own parent
+//   bracket-escaped, nothing running→ RC=1
+// Left unescaped this fix would make rotate-lead refuse to respawn on every Linux host — worse than the
+// bug. The harness's own CI runs on ubuntu-latest, so the live test below exercises the procps family.
+test("DER-2775: bracketEscapePattern still matches the TARGET but never the probe's own command line", () => {
+  assert.equal(typeof WR.bracketEscapePattern, "function", "the escape must be a pure, testable seam");
+  const pat = "/Users/example/work-ledger/r1/briefs/DER-1";
+  const esc = WR.bracketEscapePattern(pat);
+  assert.equal(esc, "[/]Users/example/work-ledger/r1/briefs/DER-1");
+  // The property, stated as the two regex answers that matter — not as a string equality that would
+  // pass for any escape at all.
+  assert.match(`claude … --brief ${pat}`, new RegExp(esc), "the escaped pattern MUST still match a real lead's cmdline");
+  assert.doesNotMatch(`sh -c pkill -f ${esc}; sleep 1; pgrep -f ${esc}`, new RegExp(esc),
+    "…and MUST NOT match the probing shell's own cmdline, which is what carries the escaped literal");
+  // The control that makes those two answers mean something: the RAW pattern fails the second one.
+  assert.match(`sh -c pkill -f ${pat}; sleep 1; pgrep -f ${pat}`, new RegExp(pat),
+    "control: the RAW pattern DOES match the probing shell — that is the procps phantom, exactly");
+  assert.doesNotMatch("claude … --brief /other/run/briefs/DER-9", new RegExp(esc), "control: and it matches no unrelated lead");
+  // A bracket expression whose only member is one of these is invalid or ambiguous, so it is skipped.
+  assert.equal(WR.bracketEscapePattern("^abc"), "^[a]bc");
+  assert.equal(WR.bracketEscapePattern("---"), "---", "nothing safe to bracket ⇒ unchanged, never a broken regex");
+  for (const p of ["^abc", "---", "/x", "a", "", "]-^"]) {
+    assert.doesNotThrow(() => new RegExp(WR.bracketEscapePattern(p)), `escape produced an invalid regex for ${JSON.stringify(p)}`);
+  }
+});
+
+test("DER-2775: the kill-probe chain escapes BOTH halves, and classifyKillProbe is fail-closed", () => {
+  assert.equal(typeof WR.remoteKillProbeCommand, "function");
+  const pat = "/Users/example/work-ledger/r1/briefs/DER-1";
+  const cmd = WR.remoteKillProbeCommand(pat);
+  assert.equal(cmd.includes(`'${pat}'`), false,
+    "the pkill half must be escaped too — an unescaped pkill SIGTERMs its own shell on procps, so the probe never runs");
+  assert.equal((cmd.match(/\[\/\]Users/g) ?? []).length, 2, "both pkill and pgrep take the escaped pattern");
+  assert.match(cmd, /pkill -f .*; *sleep 1; *pgrep -f .*; *echo RC=\$\?/, "kill, settle, then ASK — one round trip");
+  assert.equal(cmd.includes("; true"), false, "the mask that started all of this must be gone");
+  // `pkill -f ''` matches every process on the host, so an empty pattern must be a loud bug.
+  for (const empty of ["", "   ", null, undefined]) {
+    assert.throws(() => WR.remoteKillProbeCommand(empty), /EMPTY pattern/, `an empty pattern (${JSON.stringify(empty)}) must never become a kill command`);
+  }
+
+  const c = WR.classifyKillProbe;
+  assert.equal(c({ exitCode: 0, stdout: "RC=1\n" }), "killed", "pgrep matched nothing ⇒ proven gone");
+  assert.equal(c({ exitCode: 0, stdout: "RC=0\n" }), "survivor", "pgrep matched ⇒ still alive");
+  // Everything else is unknown, and unknown is never success anywhere.
+  assert.equal(c({ exitCode: 255, stdout: "" }), "unknown", "ssh transport failure is not evidence of death");
+  assert.equal(c({ exitCode: 143, stdout: "" }), "unknown", "a shell killed mid-chain answered nothing");
+  assert.equal(c({ exitCode: 0, stdout: "" }), "unknown", "ran, but never answered");
+  assert.equal(c({ exitCode: 0, stdout: "RC=2\n" }), "unknown", "a pgrep usage/permission error is not a clean kill");
+  assert.equal(c({}), "unknown");
+  assert.equal(c({ exitCode: 0, stdout: "Last login: RC=0 nonsense\nRC=1\n" }), "killed",
+    "a login banner must not pre-empt the chain's own verdict — the LAST marker wins");
+  // And the classification is what the teardown records: unknown/survivor both leak, killed does not.
+  assert.equal(reapCleanupOutcome([WR.killProbeStep("remote_pkill", { exitCode: 0, stdout: "RC=1\n" })]).ok, true);
+  for (const stdout of ["RC=0\n", "", "RC=7\n"]) {
+    const out = reapCleanupOutcome([WR.killProbeStep("remote_pkill", { exitCode: 0, stdout })]);
+    assert.equal(out.ok, false, `a non-killed verdict must leak (stdout ${JSON.stringify(stdout)})`);
+    assert.deepEqual(out.leaks, ["remote_pkill"]);
+    assert.equal(out.steps[0].exit_code, 0, "…on a step whose exit code says success");
+  }
+});
+
+test("DER-2775 LIVE: the real chain detects a real survivor and does not hallucinate one (this host's pgrep)", async (t) => {
+  const have = spawnSync("sh", ["-c", "command -v pgrep >/dev/null && command -v pkill >/dev/null"]);
+  if (have.status !== 0) return t.skip("no pgrep/pkill on this host");
+  // Runs the PRODUCTION chain against real pgrep, so the family this host ships is the one under test.
+  // On macOS that is BSD pgrep; in CI (ubuntu-latest) it is procps, where the un-escaped form reports a
+  // phantom survivor on every probe and the un-escaped pkill kills the probing shell outright.
+  const marker = join(tmpdir(), `wr-d2775-${process.pid}-${Math.random().toString(36).slice(2)}`, "briefs", "DER-1");
+  const chain = WR.remoteKillProbeCommand(marker);
+  const run = () => String(spawnSync("sh", ["-c", chain], { encoding: "utf8" }).stdout ?? "");
+
+  assert.equal(WR.classifyKillProbe({ exitCode: 0, stdout: run() }), "killed",
+    "NEGATIVE CONTROL: with nothing running, the chain must report a clean kill — an un-escaped pattern reports a phantom survivor here on procps");
+
+  // POSITIVE CONTROL: a process that carries the marker AND ignores SIGTERM, so pkill cannot reap it.
+  // Without this half the probe could be a constant "killed" and the test would still pass.
+  const victim = spawn("/bin/sh", ["-c", 'trap "" TERM; sleep 30', marker], { stdio: "ignore" });
+  try {
+    await new Promise((r) => setTimeout(r, 500));
+    assert.equal(WR.classifyKillProbe({ exitCode: 0, stdout: run() }), "survivor",
+      "a process that survives the kill must be SEEN — this is the answer the old `pkill …; true` could never return");
+  } finally {
+    victim.kill("SIGKILL");
+    await new Promise((r) => victim.once("exit", r));
+  }
+  await new Promise((r) => setTimeout(r, 300));
+  assert.equal(WR.classifyKillProbe({ exitCode: 0, stdout: run() }), "killed", "and once it is really gone, clean again");
 });
 
 // ---- DER-2749: the configured commit identity must reach the cloud brief ----------------------------
