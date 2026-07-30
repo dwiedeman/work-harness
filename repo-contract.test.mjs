@@ -27,6 +27,23 @@ test("CI runs EVERY test suite in the repo — a new suite cannot be added witho
   assert.deepEqual(missing, [], `these suites exist but CI never runs them: ${missing.join(", ")}`);
 });
 
+test("install.sh verifies EVERY suite it copies into ~/.claude", async () => {
+  // Same rule as the CI test above, one layer down, and it caught a real gap: install.sh shipped
+  // session-end-telemetry.test.mjs and hooks/context-wrap-nudge.test.mjs into the destination and never
+  // ran them, so a broken hook would have installed reporting "clean". `install.sh` copies skills/ and
+  // hooks/ wholesale, so anything matching there is shipped and must be verified.
+  const sh = await read("install.sh");
+  const shipped = gitFiles("*.test.mjs").filter((f) => f.startsWith("skills/") || f.startsWith("hooks/"));
+  assert.ok(shipped.length >= 4, `expected the shipped suites to be tracked, found ${shipped.length}`);
+  const missing = shipped.filter((f) => !sh.includes(f));
+  assert.deepEqual(missing, [], `install.sh copies these into ~/.claude but never runs them: ${missing.join(", ")}`);
+  // And the converse: it must not claim to verify a suite that isn't shipped, or the install fails on a
+  // path that will never exist.
+  const claimed = [...sh.matchAll(/\$DEST\/([A-Za-z0-9/_.-]+\.test\.mjs)/g)].map((m) => m[1]);
+  const phantom = claimed.filter((c) => !shipped.includes(c));
+  assert.deepEqual(phantom, [], `install.sh runs suites that are not shipped: ${phantom.join(", ")}`);
+});
+
 test("CI gates cannot be defanged with continue-on-error", async () => {
   // The YAML spelling of DER-2743's `|| true`: a step that cannot fail the build is not a gate.
   const ci = await read(".github/workflows/ci.yml");

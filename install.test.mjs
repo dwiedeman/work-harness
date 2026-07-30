@@ -25,7 +25,7 @@ const RED = 'import { test } from "node:test";\nimport assert from "node:assert/
 // A fixture SRC tree shaped the way install.sh expects: its `find` line names every skill dir and the
 // hook, and under `set -euo pipefail` a missing path is fatal — so the fixture ships them all, and a
 // failure here is about the self-test, not about a missing fixture file.
-async function fixture({ runner = GREEN, metrics = GREEN, prep = GREEN } = {}) {
+async function fixture({ runner = GREEN, metrics = GREEN, prep = GREEN, telemetry = GREEN, hook = GREEN } = {}) {
   const dir = await mkdtemp(join(tmpdir(), "wh-install-"));
   const src = join(dir, "src");
   for (const d of ["skills/work", "skills/work-lead", "skills/work-shepherd", "skills/prep-for-work", "hooks"]) {
@@ -35,6 +35,10 @@ async function fixture({ runner = GREEN, metrics = GREEN, prep = GREEN } = {}) {
   await writeFile(join(src, "skills/work/work-runner.test.mjs"), runner, "utf8");
   await writeFile(join(src, "skills/work/work-metrics.test.mjs"), metrics, "utf8");
   await writeFile(join(src, "skills/prep-for-work/prep-runner.test.mjs"), prep, "utf8");
+  // The fixture must model every suite install.sh verifies, or the all-green control fails on a missing
+  // fixture file rather than on installer behaviour. repo-contract.test.mjs keeps the two lists aligned.
+  await writeFile(join(src, "skills/work/session-end-telemetry.test.mjs"), telemetry, "utf8");
+  await writeFile(join(src, "hooks/context-wrap-nudge.test.mjs"), hook, "utf8");
   await writeFile(join(src, "skills/work-lead/SKILL.md"), "# lead\n", "utf8");
   await writeFile(join(src, "skills/work-shepherd/SKILL.md"), "# shepherd\n", "utf8");
   await writeFile(join(src, "hooks/context-wrap-nudge.mjs"), "// hook\n", "utf8");
@@ -91,6 +95,30 @@ test("install.sh: a red PREP suite fails the install too (both self-tests are ga
     const r = await runInstall(f);
     assert.notEqual(r.code, 0, `a red prep-runner suite must fail the install\n${r.out}`);
     assert.match(r.out, /prep-runner\.test\.mjs|prep-for-work/, "the installer must say WHICH suite failed");
+  } finally {
+    await rm(f.dir, { recursive: true, force: true });
+  }
+});
+
+test("install.sh: a red HOOK suite fails the install too — every SHIPPED suite is verified, not just skills/", async () => {
+  // The installer copied hooks/ and skills/work/session-end-telemetry.test.mjs into ~/.claude and never
+  // ran them, so a broken hook installed reporting "clean". This is the control for that gap.
+  const f = await fixture({ hook: RED });
+  try {
+    const r = await runInstall(f);
+    assert.notEqual(r.code, 0, `a red hook suite must fail the install\n${r.out}`);
+    assert.match(r.out, /context-wrap-nudge|hooks/, "the installer must say WHICH suite failed");
+  } finally {
+    await rm(f.dir, { recursive: true, force: true });
+  }
+});
+
+test("install.sh: a red session-end-telemetry suite fails the install", async () => {
+  const f = await fixture({ telemetry: RED });
+  try {
+    const r = await runInstall(f);
+    assert.notEqual(r.code, 0, `a red telemetry suite must fail the install\n${r.out}`);
+    assert.match(r.out, /session-end-telemetry|skills\/work/, "the installer must say WHICH suite failed");
   } finally {
     await rm(f.dir, { recursive: true, force: true });
   }
