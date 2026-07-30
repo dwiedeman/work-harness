@@ -2475,8 +2475,16 @@ test("resolveContextWindow: the lead type's declared window wins over every infe
   // `[1m]` opt-in wins and the harness believes 1M — 276,659 tokens then read as 28%.
   assert.equal(resolveContextWindow({ leadTypeCfg: {}, model: "gpt-5.6-sol", settingsModel: "claude-opus-5[1m]" }), 1_000_000);
   assert.equal(resolveContextWindow({ leadTypeCfg: {}, model: "claude-sonnet-5" }), 1_000_000);
-  assert.equal(resolveContextWindow({ leadTypeCfg: {}, model: "claude-opus-5", settingsModel: "claude-opus-5" }), 200_000);
-  assert.equal(resolveContextWindow({ leadTypeCfg: { contextWindow: 0 } , model: "claude-opus-5" }), 200_000, "a zero/absent window must not be treated as declared");
+  // DER-2581: this asserted 200_000 for `claude-opus-5`, which is factually wrong — Opus 5 is natively
+  // 1M-window (1M is both its default and its maximum), as are Fable 5 and Opus 4.6/4.7/4.8. Only the
+  // Haiku tier is 200K. The old resolver had grown a `sonnet-5` special case and stopped there, so every
+  // other natively-1M family read as 200K — a 5× over-read of utilization, and the test pinned it.
+  assert.equal(resolveContextWindow({ leadTypeCfg: {}, model: "claude-opus-5", settingsModel: "claude-opus-5" }), 1_000_000);
+  // The point of this one survives unchanged: a zero/absent declared window must not be RETURNED. It now
+  // falls through to inference (1M for opus-5) instead of to the 200K floor.
+  assert.equal(resolveContextWindow({ leadTypeCfg: { contextWindow: 0 } , model: "claude-opus-5" }), 1_000_000, "a zero/absent window must not be treated as declared");
+  // …and the 200K floor is still reachable, via a model that genuinely has a 200K window.
+  assert.equal(resolveContextWindow({ leadTypeCfg: { contextWindow: 0 }, model: "claude-haiku-4-5" }), 200_000);
 });
 
 test("rotationBands: scale with window size, and a per-type override wins", () => {
@@ -3506,8 +3514,13 @@ test("materializeState (DER-2579): queue includes units that have events but are
 test("resolveContextWindow (DER-2547): the OBSERVED model's [1m] marker wins over a settings read", () => {
   // The 5x over-read: an Opus lead really on 1M, judged against 200K, lands in the rotate band at ~41%.
   assert.equal(resolveContextWindow({ model: "claude-opus-5[1m]", settingsModel: "" }), 1_000_000);
-  // Control: no marker anywhere ⇒ the conservative 200K default is unchanged.
-  assert.equal(resolveContextWindow({ model: "claude-opus-5", settingsModel: "" }), 200_000);
+  // DER-2581: this asserted 200_000 for a marker-less `claude-opus-5`. Opus 5 is natively 1M — the `[1m]`
+  // suffix is a deployment/routing identifier, not the thing that grants the window, so "no marker" never
+  // meant "200K" for this family. The conservative 200K default belongs to UNRECOGNISED ids (below), which
+  // is what keeps the inverse error (a 270K lead judged against 1M) out.
+  assert.equal(resolveContextWindow({ model: "claude-opus-5", settingsModel: "" }), 1_000_000);
+  assert.equal(resolveContextWindow({ model: "claude-haiku-4-5", settingsModel: "" }), 200_000);
+  assert.equal(resolveContextWindow({ model: "some-unknown-proxy-model", settingsModel: "" }), 200_000);
   // Control: a declared per-type window still outranks every inference.
   assert.equal(resolveContextWindow({ leadTypeCfg: { contextWindow: 270_000 }, model: "claude-opus-5[1m]" }), 270_000);
   // And the over-read it fixes, stated as the band it produced.
