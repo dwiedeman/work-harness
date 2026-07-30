@@ -4176,6 +4176,18 @@ export function watchPollMs() {
   return Math.min(60000, Math.max(5, Math.floor(raw)));
 }
 
+// How often `watch` runs its side-effect block (pull-hosts / reconcile-*). 45s in production; a seam only
+// so a test can drive MANY cycles without waiting 45 seconds each — the same shape as WORK_WATCH_POLL_MS
+// above. DER-2839: without it, the #16 "work per poll does not scale with history" invariant is
+// untestable on the `--pull-hosts` path, because a hermetic watch only ever reaches ONE cycle and a
+// per-cycle whole-ledger read is indistinguishable from a one-off. That is not a hypothetical — the first
+// version of this test bounded total reads, and a deliberately reintroduced per-cycle read passed it.
+export function watchPullIntervalMs() {
+  const raw = Number(process.env.WORK_WATCH_PULL_INTERVAL_MS);
+  if (!Number.isFinite(raw)) return 45000;
+  return Math.min(600000, Math.max(1, Math.floor(raw)));
+}
+
 // Parse raw ledger lines pulled from a remote host's local events.jsonl (the mini), tagging each with
 // its host if the remote append didn't. Pure — the pull-host subcommand appends the result to the
 // canonical ledger. Blank lines are skipped so a trailing newline doesn't create an empty event.
@@ -8369,7 +8381,7 @@ export async function runSubcommand(argv) {
       const reconcilePrEvents = !!o.reconcilePrEvents;
       const repoRoot = o.repoRoot ?? process.cwd();
       const pollMs = watchPollMs();
-      const PULL_INTERVAL_MS = 45000;
+      const PULL_INTERVAL_MS = watchPullIntervalMs();
       const started = Date.now();
       let lastSideEffect = 0; // 0 ⇒ run pull/reconcile immediately on entry, then every ~45s
       // DER-2839 (Codex review of that change, #1): `pullHostInto` now REPORTS a failed remote read, and
@@ -8383,16 +8395,18 @@ export async function runSubcommand(argv) {
       // the pre-start window before a remote host first writes its ledger is a legitimate failure, and
       // making it fatal would wedge the mini lane on a routine race.
       const pullFailures = new Map();
+      // Hosts this run has dispatched a lead to. Seeded LAZILY and at most ONCE per watch process, then
+      // kept current from the tail's fresh events below.
+      //
+      // DER-2741 (#16) is an explicit invariant of this loop — "work per poll scales with new activity,
+      // not with total history" — and the first draft of this evidence gate broke it by calling
+      // `readEvents` (a whole-ledger parse) on every ~45s side-effect cycle. On the 100k-event / 9.8 MB
+      // ledger that benchmark uses, a single 240s watch would have added ~6 full parses while completely
+      // idle. The existing idle-watch perf test did not catch it because it runs without `--pull-hosts`,
+      // so the side-effect block never executes there.
+      let dispatchHosts = null;
       for (;;) {
         if ((pullHostNames.length || reconcileMerged || reconcilePrEvents) && Date.now() - lastSideEffect >= PULL_INTERVAL_MS) {
-          // Which hosts this run actually EXPECTS a ledger from. `--pull-hosts auto` selects every
-          // ENABLED host, which is not the same set: a run that dispatched everything locally still polls
-          // an enabled `mini` whose ledger has never existed, and reporting that forever would put a
-          // permanent false alert on every wake (Codex round 2, #2). A banner that is always on is one
-          // operators learn to skim, which is how the signal added above would destroy itself.
-          const dispatchedTo = new Set(
-            (await readEvents(runDir)).filter((e) => e.type === "lead_spawned" && e.host).map((e) => e.host),
-          );
           for (const h of pullHostNames) {
             try {
               const pulled = await pullHostInto(runDir, h, o.runId);
@@ -8400,10 +8414,19 @@ export async function runSubcommand(argv) {
               // Surface only with positive evidence that a readable ledger should exist: we have read
               // from this host before (a cursor past 0, or a held fragment), or the run dispatched a lead
               // there. Otherwise the failure is indistinguishable from "that host has not started yet",
-              // which is a routine race and not news. Note the evidence is MONOTONIC — once either holds
-              // it keeps holding — so a genuine failure cannot be suppressed after the first real read.
+              // which is a routine race and not news. `--pull-hosts auto` selects every ENABLED host,
+              // which is not the same set as the hosts a run USES — without this gate a run that
+              // dispatched everything locally carries a failure banner for an idle `mini` on every wake,
+              // forever, and a banner that is always on is one operators learn to skim (Codex round 2,
+              // #2). The ledger is consulted only on the failure path, and only until the answer is
+              // known — a healthy run never reads it here at all.
               const everRead = (pulled.cursor ?? 0) > 0 || pulled.held != null;
-              if (everRead || dispatchedTo.has(h)) pullFailures.set(h, pulled.pull_error || `exit ${pulled.exitCode ?? "?"}`);
+              if (!everRead && dispatchHosts === null) {
+                dispatchHosts = new Set(
+                  (await readEvents(runDir)).filter((e) => e.type === "lead_spawned" && e.host).map((e) => e.host),
+                );
+              }
+              if (everRead || dispatchHosts?.has(h)) pullFailures.set(h, pulled.pull_error || `exit ${pulled.exitCode ?? "?"}`);
               else pullFailures.delete(h);
             } catch (err) {
               // A throw is also "the pull did not happen" — it must not be quieter than a nonzero exit.
@@ -8495,6 +8518,10 @@ export async function runSubcommand(argv) {
         if (step.events.length) {
           const fresh = dedupeLedgerEvents(step.events);
           if (fresh.length) cursorId = tail.lastEventId ?? cursorId;
+          // Keep the pull-failure evidence set current from the NEW bytes we already parsed, so a lead
+          // dispatched to a host mid-watch is recognised without a second whole-ledger read (DER-2741's
+          // invariant). Only when the set has been seeded — otherwise the lazy seed below picks it up.
+          if (dispatchHosts) for (const e of fresh) if (e.type === "lead_spawned" && e.host) dispatchHosts.add(e.host);
           if (!wakeSet || fresh.some((e) => wakeSet.has(e.type))) {
             return {
               stdout: await wakePayload("event", {

@@ -881,6 +881,15 @@ test("`watch --pull-hosts` stays SILENT about a host the run never used (DER-283
   assert.equal(failures.length, 1,
     `once the run dispatched to that host, an unreadable ledger IS news, got ${JSON.stringify(failures)}`);
   assert.equal(failures[0].host, "mini");
+
+  // …and it CLEARS on the next successful pull. Without this the latch could be write-only: a signal that
+  // arrives correctly and then never goes away is a permanent banner by another route. (Codex round 3, #4
+  // — an earlier draft of the CHANGELOG claimed this was covered when it was not.)
+  await R.writeRemote(PH_LINE1);
+  const healed = await R.watch();
+  succeeded(healed);
+  assert.deepEqual(JSON.parse(healed.stdout).pending.pull_failed, [],
+    `a successful pull must clear the latch, got ${healed.stdout}`);
 });
 
 // The path is interpolated into a string the REMOTE SHELL evaluates. A `ledgerRoot` containing a space is

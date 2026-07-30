@@ -84,21 +84,33 @@ would otherwise conclude the file had drifted.
   (b) `--pull-hosts auto` selects every ENABLED host, not every host the run USES, so an enabled `mini`
   that was never dispatched to reported a failed read on **every wake, forever** — a permanent banner on a
   healthy run, which is how a new signal destroys itself. It is now raised only on positive evidence that
-  a readable ledger should exist (a cursor past 0, a held fragment, or a `lead_spawned` on that host); the
-  evidence is monotonic, so a real failure cannot be suppressed after the first successful read. A throw
-  is still reported unconditionally — that is a harness fault, not the not-started race.
+  a readable ledger should exist (a cursor past 0, a held fragment, or a `lead_spawned` on that host). A
+  throw is still reported unconditionally — that is a harness fault, not the not-started race.
+  *The bound this gate actually has, stated precisely rather than as "monotonic":* `lead_spawned` is an
+  append-only ledger event, so once a run has dispatched to a host the evidence is permanent, and every
+  production dispatch (`spawn-lead --host <h>`) writes one. The other two witnesses are weaker — a hold is
+  deleted when its line completes, and a cursor reads 0 again if the file is removed — so a hand-built run
+  state with no host-tagged `lead_spawned`, a zeroed cursor, and no hold would suppress a real failure.
+  Production cannot reach that state; a manually reset run dir can.
   (c) The hold reader checked that the record PARSED, but `{}` parses: it reported as a hold in good
   standing with a null age. The bar is now the one `readHeldFragments` already sets for the family — a
   record it cannot DATE is stale.
   (d) The "the reason must describe the ACTUAL failure" assertion listed `exit \d+` among its accepted
   matches — the generic no-stderr fallback, i.e. it accepted the exact placeholder its own message
   forbade, and would have stayed green if `2>/dev/null` came back. It now rejects that form explicitly.
-  (e) `skills/work/SKILL.md` carries an exhaustive list of the `pending` block's keys, read by the
-  unattended agent consumer, and adding `pull_failed` to the payload without adding it there left the one
-  reader that acts on it unaware the signal exists.
-  **Stated limit:** the per-host failure latch clears on the next successful pull, and that clearing is
-  covered across separate `watch` processes but not within a single long-lived one (each pull cycle is
-  ~45s apart, which no hermetic test should wait for).
+  (e) `skills/work/SKILL.md` carries the list of the `pending` block's keys, read by the unattended agent
+  consumer, and adding `pull_failed` to the payload without adding it there left the one reader that acts
+  on it unaware the signal exists. A third round then caught that the same list had been missing
+  `gate_missing`, `gate_blocked` and `gate_adjudicated` since before this change; all sixteen keys the
+  payload emits are now documented, checked by enumerating them from the source rather than by eye.
+  **A third round also caught a performance regression introduced by (b)**: the evidence gate called
+  `readEvents` — a whole-ledger parse — on every ~45s side-effect cycle, against DER-2741 (#16)'s explicit
+  invariant that work per poll scales with new activity, not total history. On that benchmark's
+  100k-event / 9.8 MB ledger a single idle 240s watch would have added ~6 full parses. The existing
+  idle-watch perf test did not catch it because it runs without `--pull-hosts`, so the block never
+  executes there. The set is now seeded lazily (at most once per watch process, and only on the failure
+  path — a healthy run never reads the ledger here) and kept current from the bytes the tail has already
+  parsed.
   **Repo-wide sweep** (the acceptance criterion): two `|| true` sites remain in command construction and
   both were verified fail-closed against their masked paths rather than reasoned about. `install.sh:41`
   masks a *display* grep of the suite summary — load-bearing under the file's `set -euo pipefail`, and
