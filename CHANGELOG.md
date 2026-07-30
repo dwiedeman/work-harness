@@ -113,6 +113,18 @@ places this file and its neighbors described those gaps as still open after they
 
 ### Added
 
+- **DER-2837 — `SECURITY.md`: the trust boundary is now stated instead of implied.** The harness runs
+  with the operator's own credentials and is a control plane for authorized work, not a sandbox around an
+  adversary. Supported use is supervised sessions in trusted repositories; unattended operation against
+  semi-trusted issue/plan/PR text is explicitly NOT supported. Two limits are named rather than left to
+  be inferred: privileged event **authority is a documented convention, not authentication** (anything
+  that can write the run directory can write any ledger event — `gate_adjudication` is shape-validated
+  and surfaced loudly, but `adjudicated_by` is an unauthenticated string), and evidence queries are
+  ultimately **executed by a shell**, so the read-only policy is defence-in-depth against mistakes, not a
+  sandbox. Authenticated privileged-event ingress was considered and is deliberately out of scope for
+  now — the decision, and what it implies for adopters, is recorded rather than silently carried. Also
+  adds a private vulnerability-reporting route and a hardening roadmap. (Codex cold-eyes finding #4.)
+
 - **DER-2830 — a fault-injection E2E suite (`e2e.test.mjs`), hermetic tier wired into CI.** The unit
   suites prove the predicates; this drives `work-runner.mjs` as a real subprocess and INDUCES the
   failures the harness exists to survive — a torn ledger tail, harness-version skew, a foreign wire
