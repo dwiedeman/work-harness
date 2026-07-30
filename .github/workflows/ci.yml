@@ -57,6 +57,9 @@ jobs:
         with:
           node-version: "22"
 
+      - name: Static-check tooling
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck zsh
+
       - name: node --check every .mjs
         run: |
           fail=0
@@ -66,11 +69,18 @@ jobs:
           exit $fail
         shell: bash
 
-      - name: bash -n every .sh
+      # Syntax-check each script with the interpreter its OWN shebang names. `bash -n` on the two
+      # `#!/bin/zsh` cmux scripts was checking them against the wrong grammar — it happened to pass, which
+      # is worse than failing, because it reported a clean bill of health it had no basis for.
+      - name: Syntax-check every .sh with its own interpreter
         run: |
           fail=0
           while IFS= read -r f; do
-            bash -n "$f" || { echo "bash -n FAILED: $f"; fail=1; }
+            if head -1 "$f" | grep -q 'zsh'; then
+              zsh -n "$f" || { echo "zsh -n FAILED: $f"; fail=1; }
+            else
+              bash -n "$f" || { echo "bash -n FAILED: $f"; fail=1; }
+            fi
           done < <(git ls-files '*.sh')
           exit $fail
         shell: bash
@@ -78,10 +88,33 @@ jobs:
       # ShellCheck at --severity=error: a real blocking gate, deliberately scoped to errors rather than
       # style. Tightening to `warning` is a follow-up (see CHANGELOG "Known follow-ups") — a gate that
       # is red on arrival for style nits teaches operators to ignore CI, which is worse than no gate.
-      - name: ShellCheck (errors)
+      #
+      # ShellCheck supports sh/bash/dash/ksh ONLY: pointed at a `#!/bin/zsh` script it emits SC1071 as an
+      # ERROR and exits nonzero, so the un-scoped version of this gate could never pass. Scope it — and
+      # then SAY which files that excluded, because a silent exclusion reads as coverage it isn't.
+      - name: ShellCheck (errors, sh/bash/dash/ksh only)
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
-          git ls-files '*.sh' | xargs shellcheck --severity=error
+          fail=0
+          checked=0
+          skipped=""
+          while IFS= read -r f; do
+            if head -1 "$f" | grep -q 'zsh'; then
+              skipped="$skipped $f"
+              continue
+            fi
+            shellcheck --severity=error "$f" || fail=1
+            checked=$((checked + 1))
+          done < <(git ls-files '*.sh')
+          if [ -n "$skipped" ]; then
+            echo "NOT shellcheck'd — zsh is unsupported (SC1071), syntax-checked with 'zsh -n' instead:$skipped"
+          fi
+          if [ "$checked" -eq 0 ]; then
+            echo "FAIL: shellcheck examined 0 files — a gate that checked nothing is not a gate." >&2
+            exit 1
+          fi
+          echo "shellcheck examined $checked file(s) at --severity=error"
+          exit $fail
+        shell: bash
 
   security-regression:
     # DER-2737 (#1) is the one defect class that is live-exploitable on a PUBLIC repo: unauthenticated

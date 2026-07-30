@@ -102,7 +102,10 @@ test("install.sh: an all-green suite still installs cleanly — exit 0, counts p
   try {
     const r = await runInstall(f);
     assert.equal(r.code, 0, `a green suite must install cleanly\n${r.out}`);
-    assert.match(r.out, /# pass /, "the test counts stay visible");
+    // Both reporter shapes: `node --test` emits TAP (`# pass 2`) on Node 20/22 for a non-TTY stdout, and
+    // the spec reporter (`ℹ pass 2`) on Node 24. install.sh's grep already accepts either — asserting only
+    // the TAP form made this test, not the installer, the thing that broke on Node 24 in CI.
+    assert.match(r.out, /(?:#|ℹ) pass /, "the test counts stay visible");
     assert.doesNotMatch(r.out, /INSTALL FAILED/i);
     assert.match(r.out, /Next:/, "the post-install instructions still print");
   } finally {

@@ -52,6 +52,13 @@ Each fix below landed with a regression test that was **observed failing on the 
   but nothing stops a merge that ignores it.
 - **ShellCheck runs at `--severity=error`,** not `warning`. Tightening it is a follow-up; a gate that
   arrives red on style nits teaches operators to ignore CI, which is worse than no gate.
+- **`skills/work/cmux-look.sh` and `cmux-say.sh` are not ShellCheck'd** — they are `#!/bin/zsh`, and
+  ShellCheck supports sh/bash/dash/ksh only (SC1071). CI syntax-checks them with `zsh -n` and prints the
+  exclusion rather than passing over it silently. Porting them to bash would bring them under the linter.
+- **The first CI run found two defects in this PR itself,** which is the argument for the workflow: Node 24
+  switched `node --test`'s default non-TTY reporter from TAP to spec, so an installer test that asserted
+  the TAP shape failed there (the installer already accepted both); and the ShellCheck gate as first
+  written pointed at zsh scripts, so it could never have passed.
 - **Harness version is not yet recorded in the ledger** (`run_started` / host heartbeats) and mixed-version
   runs are not yet detected or refused — see DER-2748.
 
