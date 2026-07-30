@@ -21,8 +21,43 @@ The 2026-07-30 cold-eyes remediation wave: nine fixes against the 21 findings of
 `2c3ecbe`, closing the gaps 0.2.0 shipped with, plus this entry itself (DER-2780), which corrects four
 places this file and its neighbors described those gaps as still open after they were closed.
 
+**A SECOND cold-eyes review, of `fbb8631`, ran the same day and its fixes land in this same section** —
+DER-2836 (P0), DER-2837, DER-2838, DER-2839 so far. They are listed below alongside the first wave's,
+which is why the entry count under `### Security` exceeds the nine named above. Recording it because the
+paragraph above was written when this section held one wave, and a reader counting entries against it
+would otherwise conclude the file had drifted.
+
 ### Security
 
+- **DER-2839 (P1) — a remote read that FAILED was reported as a remote that was EMPTY, and that erased a
+  completion-blocking damage signal.** The remote ledger tail ran as
+  `tail -n +N <path> 2>/dev/null || true`. That suffix answers every question with success: a MISSING
+  remote ledger, an UNREADABLE one, and a failed read all exited 0 with empty stdout — byte-for-byte what
+  a healthy remote with nothing new returns. `pullHostInto` then took the empty-body path and called
+  `recordHeldFragment(…, {fragment: null})`, whose documented contract is "nothing is held any more:
+  DELETE the record". So a read that never happened destroyed the held-fragment record — the exact
+  inversion DER-2776 was written to prevent, arriving through the shell instead of the parser. The
+  existing `exitCode !== 0` guard could not help: `|| true` had already guaranteed exit 0.
+  **The construction appeared TWICE, and the review named only one of them** — the executing path, and
+  the `pull-host --dry-run` preview that printed a separately-written copy of the same string. Both now
+  come from one builder (`remoteLedgerTailCommand`), so the preview cannot drift from what runs, and
+  neither suppresses stderr nor masks the exit status: `tail`'s status propagates through ssh, and the
+  remote's stderr survives as `pull_error` to say WHY. On failure the pull preserves the cursor **and**
+  the hold, and READS THE HOLD BACK to report it — returning `held: null` there would have laundered "I
+  did not look" into "nothing is held" one layer above the shell defect itself.
+  Regressions in `e2e.test.mjs` drive a real `pull-host` subprocess against a real `ssh` stub with a real
+  `tail`. Observed RED on the parent (`116bc69`) for a missing remote ledger, for an unreadable one, and
+  for the stale dry-run preview; the empty-but-successful control passed on the parent and still passes,
+  which is what stops the fix from being "call every pull a failure" — a change that would wedge the mini
+  lane while looking like a security improvement.
+  **Repo-wide sweep** (the acceptance criterion): two `|| true` sites remain in command construction and
+  both were verified fail-closed against their masked paths rather than reasoned about. `install.sh:41`
+  masks a *display* grep of the suite summary — load-bearing under the file's `set -euo pipefail`, and
+  the actual gate is the `node --test` exit status captured on the line above, so it cannot pass a red
+  suite. `.github/workflows/ci.yml:157` masks `grep -c` counting matched security tests: replaying the
+  exact construction, zero matches yields `0` and a grep error yields `""`, and `[ "${ran:-0}" -lt 1 ]`
+  fails the job on both — against a control with a real match, which passes. Every other hit in the repo
+  is prose describing the banned construction, not the construction.
 - **DER-2837 (P1) — an UNDER-counted `blockers` field authorized a merge.** `gateEvidenceVerdict` read
   the `review_findings` event's `blockers` number and never asked whether it described that event's own
   `findings` list. The one consistency check that existed — in `gateAdjudicationVerdict` — compared

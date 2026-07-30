@@ -28,7 +28,7 @@
 // prevent: a check that cannot fail is not evidence.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, writeFile, appendFile, readFile, rm, access } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, appendFile, readFile, rm, access, chmod } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
@@ -595,6 +595,143 @@ test("query-check pipes stage-to-stage without a shell (DER-2836)", async (t) =>
   const r = await S.run();
   assert.equal(r.code, 0, `a two-stage pipeline must still run:\n${r.out}`);
   assert.match(r.out, /1 ≥ 1/, `the second stage must have consumed the first's output:\n${r.out}`);
+});
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// DER-2839 — a remote read that FAILED must not be reported as a remote that was EMPTY
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+//
+// The remote tail used to end in `2>/dev/null || true`. That suffix collapses three different remote
+// answers — "the file is missing", "I am not allowed to read it", "the read failed" — into the single
+// answer "it read fine and there was nothing there". The empty-body path then calls recordHeldFragment
+// with a null fragment, which DELETES the held-fragment record: the completion-blocking damage signal
+// DER-2776 exists to preserve is erased by a read that never happened.
+//
+// This is the inversion DER-2776 was written to prevent, arriving through the shell instead of the
+// parser: uncertainty laundered into a clean receipt. The harness already draws the distinction it
+// needed here — classifyKillProbe's "'I could not look' and 'it is dead' are different facts" — so the
+// fix is to let the read FAIL (propagate tail's exit status) and preserve both the cursor and the hold.
+//
+// The fixture is a real `pull-host` subprocess against a real ssh stub that runs the remote command
+// locally with a real `tail`, so what is under test is the command the harness actually builds.
+
+// A run whose config declares a `mini` host, plus a stub `ssh` that executes the remote command against
+// a local directory standing in for the remote ledger root.
+async function newPullHostRun(t) {
+  const runsRoot = await mkdtemp(join(tmpdir(), "wh-e2e-ph-runs-"));
+  const repoRoot = await mkdtemp(join(tmpdir(), "wh-e2e-ph-repo-"));
+  const remoteRoot = await mkdtemp(join(tmpdir(), "wh-e2e-ph-remote-"));
+  t.after(() => Promise.all([runsRoot, repoRoot, remoteRoot].map((d) => rm(d, { recursive: true, force: true }))));
+
+  await mkdir(join(repoRoot, ".claude"), { recursive: true });
+  await writeFile(join(repoRoot, ".claude", "work.config.json"), JSON.stringify({
+    hosts: {
+      local: { cap: 2 },
+      mini: { enabled: true, cap: 2, ssh: "example-mini-host", ledgerRoot: remoteRoot },
+    },
+  }), "utf8");
+
+  // `ssh <host> <command>` → run <command> locally. Real /bin/sh, real tail, real exit codes: the point
+  // of this fixture is that the harness's own command string is what decides the outcome.
+  const bin = join(remoteRoot, "bin");
+  await mkdir(bin, { recursive: true });
+  const sshStub = join(bin, "ssh");
+  await writeFile(sshStub, '#!/bin/sh\nexec /bin/sh -c "$2"\n', "utf8");
+  await chmod(sshStub, 0o755);
+
+  const env = { PATH: `${bin}:${process.env.PATH}` };
+  const init = await cli(["init-run", "--project", "sandbox", "--runs-root", runsRoot, "--repo-root", repoRoot], { env });
+  succeeded(init);
+  const runId = init.stdout.trim().split("\n").filter(Boolean).pop();
+  const runDir = join(runsRoot, runId);
+  const remoteDir = join(remoteRoot, runId);
+  await mkdir(remoteDir, { recursive: true });
+  const remoteLedger = join(remoteDir, "events.jsonl");
+  const heldPath = join(runDir, "sync-held.mini.json");
+
+  return {
+    runId, runDir, remoteLedger, heldPath,
+    writeRemote: (text) => writeFile(remoteLedger, text, "utf8"),
+    pull: (extra = []) => cli(
+      ["pull-host", "--run", runId, "--host", "mini", "--repo-root", repoRoot, "--runs-root", runsRoot, ...extra],
+      { env },
+    ),
+    cursor: async () => Number.parseInt(await readFile(join(runDir, "sync-cursor.mini"), "utf8").catch(() => "0"), 10) || 0,
+    // Tolerant: a missing hold file must fail as an ASSERTION about behaviour, not as an ENOENT. A test
+    // that crashes on the parent proves nothing about what the parent does.
+    held: async () => JSON.parse(await readFile(heldPath, "utf8").catch(() => "null")),
+  };
+}
+
+const PH_LINE1 = `${JSON.stringify({ actor: "lead:DER-9", type: "lead_spawned", issue: "DER-9", ts: "2026-07-30T10:00:00.000Z" })}\n`;
+const PH_TORN = '{"actor":"lead:DER-9","type":"pr_opened","issue":"DER-9","pr":';
+
+// Two ways for the remote read to fail. Both used to exit 0 with empty stdout, and both therefore looked
+// identical to a clean pull that found nothing new. Parameterised because a fix that only handles the
+// missing file leaves the unreadable one laundered — the "incomplete change across a family" shape.
+for (const [mode, breakRemote] of [
+  ["the remote ledger is MISSING", async (R) => rm(R.remoteLedger, { force: true })],
+  ["the remote ledger is UNREADABLE", async (R) => chmod(R.remoteLedger, 0o000)],
+]) {
+  test(`FAULT ${mode}: the pull FAILS, and does not clear the held fragment or move the cursor (DER-2839)`, async (t) => {
+    const R = await newPullHostRun(t);
+
+    // Set the scene with a real torn tail, so there is a hold worth destroying.
+    await R.writeRemote(`${PH_LINE1}${PH_TORN}`);
+    succeeded(await R.pull());
+    const before = await R.held();
+    assert.ok(before?.first_seen_at,
+      `CONTROL: the fixture must actually produce a hold, or the assertion below is vacuous — got ${JSON.stringify(before)}`);
+    assert.equal(await R.cursor(), 1, "CONTROL: the one complete line was merged");
+
+    await breakRemote(R);
+    const r = await R.pull();
+
+    // 1. THE ASSERTION THAT FAILS ON THE PARENT COMMIT. On the parent the hold file was deleted here, by
+    //    a pull that read nothing at all.
+    const after = await R.held();
+    assert.ok(after?.first_seen_at,
+      `a read that FAILED must not clear the held fragment — the hold is gone, got ${JSON.stringify(after)}`);
+    assert.equal(after.first_seen_at, before.first_seen_at, "…and must not restart the hold's age clock");
+
+    // 2. And the failure is REPORTED as a failure, not as a clean empty pull.
+    assert.equal(r.timedOut, false, "pull-host TIMED OUT — UNKNOWN, not a failure");
+    const rep = JSON.parse(r.stdout);
+    assert.equal(rep.pull_failed, true, `a failed read must say so rather than reporting a clean zero:\n${r.out}`);
+    assert.equal(rep.pulled, 0);
+    assert.equal(await R.cursor(), 1, "a pull that read nothing must not move the cursor");
+  });
+}
+
+// THE CONTROL that stops the two cases above from being satisfied by a fix that simply calls every pull a
+// failure — which would wedge the mini lane while looking like a security improvement.
+test("a genuinely empty-but-successful remote read still succeeds and holds nothing (DER-2839 control)", async (t) => {
+  const R = await newPullHostRun(t);
+  await R.writeRemote(PH_LINE1); // one complete line, no tear
+  succeeded(await R.pull());
+  assert.equal(await R.cursor(), 1);
+  assert.equal(await R.held(), null, "a clean pull holds nothing");
+
+  const r = await R.pull(); // nothing new past the cursor: a real, successful, empty read
+  succeeded(r);
+  const rep = JSON.parse(r.stdout);
+  assert.notEqual(rep.pull_failed, true, `an empty-but-successful read is NOT a failure:\n${r.out}`);
+  assert.equal(rep.pulled, 0);
+  assert.equal(await R.cursor(), 1, "…and it does not move the cursor either");
+});
+
+// The second site. `pull-host --dry-run` PRINTS the command instead of running it, and printed a
+// separately-written copy of the same string — so the operator's preview could drift from what executes.
+// Asserting they are the same string is what makes one builder the only way to keep this green.
+test("the dry-run preview prints the SAME command the pull executes, with no `|| true` (DER-2839)", async (t) => {
+  const R = await newPullHostRun(t);
+  const r = await R.pull(["--dry-run"]);
+  succeeded(r);
+  assert.match(r.stdout, /tail -n \+1 /, `the preview must show the real tail command:\n${r.out}`);
+  assert.doesNotMatch(r.stdout, /\|\|\s*true/,
+    `the preview still carries the laundering suffix — it is either stale or the fix missed this site:\n${r.out}`);
+  assert.doesNotMatch(r.stdout, /2>\s*\/dev\/null/,
+    `suppressing the remote's stderr discards the only account of WHY a read failed:\n${r.out}`);
 });
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────

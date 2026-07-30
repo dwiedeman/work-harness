@@ -3821,10 +3821,24 @@ function heldFragmentPathFor(runDir, host) {
   return join(runDir, `${LEDGER_HELD_FILE_PREFIX}${host}${LEDGER_HELD_FILE_SUFFIX}`);
 }
 
+// One host's current hold, or null. DER-2839: the failure path needs to REPORT the hold it is preserving
+// — returning `held: null` there would launder "I did not look" into "there is nothing held" one layer
+// above the shell defect this exists to close.
+async function readHeldFragmentFor(runDir, host) {
+  try {
+    const rec = JSON.parse(await readFile(heldFragmentPathFor(runDir, host), "utf8"));
+    return rec && typeof rec === "object" && !Array.isArray(rec) ? rec : null;
+  } catch { return null; }
+}
+
 // `fragment: null` ⇒ nothing is held any more: the record is DELETED, which is how the signal
 // self-clears the moment the writer finishes the line. `cursor` is the post-pull cursor, i.e. the identity
 // of the held line — a fragment at a NEW cursor is a different line and starts its own clock, so a host
 // that tears one line after another cannot inherit an ancient first-seen time.
+//
+// CALLER CONTRACT (DER-2839): only ever call this after a read that SUCCEEDED. `fragment: null` means
+// "the remote had no partial line", which is a fact only a completed read can establish — a failed read
+// knows nothing, and passing null for it deletes a live damage signal.
 async function recordHeldFragment(runDir, host, { fragment, cursor }) {
   const path = heldFragmentPathFor(runDir, host);
   if (fragment == null) {
@@ -5819,18 +5833,43 @@ async function readCursor(runDir, host) {
 // append the new events (host-tagged), advance the cursor. Exactly-once; shared by the `pull-host`
 // subcommand and the folded-in `watch` pull. Real ssh — callers gate it (subcommand invocation / the
 // watch --pull-hosts flag), and watch treats a throw as best-effort (the mini is never a hard dep).
+// THE remote read command — one builder, because `pull-host --dry-run` prints it and the pull executes
+// it, and a separately-written second copy is a preview that can drift from what actually runs.
+//
+// DER-2839: this used to end in `2>/dev/null || true`. That suffix answers every question with success:
+// a MISSING remote ledger, an UNREADABLE one, and a failed read all exited 0 with empty stdout, which is
+// byte-for-byte what a healthy remote with nothing new returns. The pull then took the empty-body path
+// and called `recordHeldFragment(…, {fragment: null})`, DELETING the held-fragment record — so a read
+// that never happened erased the completion-blocking damage signal DER-2776 exists to preserve. That is
+// the exact inversion DER-2776 was written to prevent, arriving through the shell instead of the parser.
+//
+// So: no suppression and no laundering. `tail`'s exit status propagates through ssh, "I could not read
+// it" and "it was empty" become different facts — the distinction `classifyKillProbe` already draws for
+// the kill probe — and the remote's stderr survives to say WHY.
+function remoteLedgerTailCommand(remotePath, cursor) {
+  return `tail -n +${cursor + 1} ${remotePath}`;
+}
+
 async function pullHostInto(runDir, hostName, runId) {
   const host = getHosts()[hostName];
   if (!host) throw new Error(`unknown host "${hostName}"`);
   const cursor = await readCursor(runDir, hostName);
   const remotePath = `${host.ledgerRoot}/${runId}/events.jsonl`;
-  const remote = `tail -n +${cursor + 1} ${remotePath} 2>/dev/null || true`;
-  const res = await runCommand({ command: "ssh", args: [host.ssh, remote] });
-  // The remote command ends in `|| true`, so a nonzero exit is ssh ITSELF failing — nothing was read.
-  // Return without touching the cursor OR the held-fragment record: clearing the latter here would
-  // restart a stuck line's age clock on every network flap, which is how an age signal becomes a lie.
+  const res = await runCommand({ command: "ssh", args: [host.ssh, remoteLedgerTailCommand(remotePath, cursor)] });
+  // A nonzero exit is now either ssh itself failing OR the remote read failing — and the two are the same
+  // fact for this caller: NOTHING WAS READ. Return without touching the cursor OR the held-fragment
+  // record. Clearing the latter here would restart a stuck line's age clock on every network flap (and,
+  // before this fix, delete it outright on a remote that had simply not been created yet), which is how
+  // an age signal becomes a lie. The hold is READ BACK and reported rather than reported as null: this
+  // pull learned nothing about it, and "null" here would mean "nothing is held".
   if (res.exitCode !== 0) {
-    return { host: hostName, pulled: 0, quarantined: 0, cursor, held: null, pull_failed: true };
+    const held = await readHeldFragmentFor(runDir, hostName);
+    const why = String(res.stderr ?? "").trim().split("\n").filter(Boolean).pop() || `exit ${res.exitCode}`;
+    return {
+      host: hostName, pulled: 0, quarantined: 0, cursor,
+      held: held ? { bytes: held.bytes, first_seen_at: held.first_seen_at } : null,
+      pull_failed: true, pull_error: why,
+    };
   }
   const body = String(res.stdout ?? "");
   // DER-2776 — two arithmetic facts this line used to get wrong, both of which lose events:
@@ -8221,8 +8260,10 @@ export async function runSubcommand(argv) {
       const host = getHosts()[o.host];
       if (!host) throw new Error(`unknown host "${o.host}"`);
       if (o.dryRun) {
+        // Same builder as the executing path (DER-2839) — a hand-written second copy is a preview that
+        // silently stops describing what runs.
         const cursor = await readCursor(runDir, o.host);
-        const remote = `tail -n +${cursor + 1} ${host.ledgerRoot}/${o.runId}/events.jsonl 2>/dev/null || true`;
+        const remote = remoteLedgerTailCommand(`${host.ledgerRoot}/${o.runId}/events.jsonl`, cursor);
         return { stdout: `ssh ${host.ssh} ${shellQuote(remote)}` };
       }
       return { stdout: JSON.stringify(await pullHostInto(runDir, o.host, o.runId)) };
