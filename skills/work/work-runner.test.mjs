@@ -33,7 +33,7 @@ import {
   wipCommitCommand, remoteProbeCommand, probeWorktreeContext, renderContextBanner, modelMismatches, leadTypeForModel,
   sortEventsByTs, workspaceRefsToClose, sweepPlan, carvedOutIds,
   codexCommentSha, codexOnHead, parseChecksOutput, readyVerdict,
-  assertExistingRunDir, gateEvidenceVerdict, latestGateEvent,
+  assertExistingRunDir, gateEvidenceVerdict, latestGateEvent, gateEvidenceLookup,
   shaDescendsFrom, annotateShaAncestry, deliveredVsAssigned,
   pendingKickbackFindings, REMOTE_PATH_PRELUDE,
   UNIT_ID_RE, isSpecUnitId,
@@ -3596,10 +3596,19 @@ test("gateEvidenceVerdict (DER-2588): a stale gate with open blockers BLOCKS; st
   const staleClean = gateEvidenceVerdict({ head, gate: { sha: "bbbbbbbbbb22", blockers: 0 } });
   assert.equal(staleClean.state, "stale-clean");
   assert.equal(staleClean.blocks, false);
-  // Control B — same blockers, but the evidence covers head: the gate did its job and was acted on.
+  // Control B — same blockers, evidence covering HEAD. REWRITTEN by DER-2782. This control used to read
+  // "the gate did its job and was acted on" and assert `blocks: false`, which pinned the defect as
+  // intended behaviour: nothing had been acted on, the findings were simply still open on the tree that
+  // would merge. Under the old pair of rules the only way to be BLOCKED by this instrument was to FIX
+  // the findings (pushing commits moves the sha off head → STALE-DIRTY → blocks); ignoring them held the
+  // sha at head and passed.
   const current = gateEvidenceVerdict({ head, gate: { sha: head, blockers: 1 } });
-  assert.equal(current.state, "current");
-  assert.equal(current.blocks, false);
+  assert.equal(current.state, "current-dirty");
+  assert.equal(current.blocks, true, "an open blocker on the tree that WOULD MERGE is the strongest possible reason to hold");
+  // Control B′ — the actually-acted-on shape: the gate re-run at head with nothing left open.
+  const clean = gateEvidenceVerdict({ head, gate: { sha: head, blockers: 0 } });
+  assert.equal(clean.state, "current");
+  assert.equal(clean.blocks, false);
   // Control C/D — absent and unstamped are distinguishable, and neither is silently a pass.
   // UPDATED by DER-2603. This test used to assert ONLY `.state` here, under a comment claiming "neither is
   // silently a pass" — and `absent` WAS silently a pass (`blocks: false`), which is how #1081 merged with no
@@ -3616,8 +3625,11 @@ test("gateEvidenceVerdict (DER-2588): a stale gate with open blockers BLOCKS; st
   const held = readyVerdict({ draft: false, threads: 0, onHead: true, checks: "pass", shardsPass: 4, shardsTotal: 4, gate: staleDirty });
   assert.equal(held.ready, false);
   assert.match(held.why, /STALE with 1 open blocker/);
-  const ok = readyVerdict({ draft: false, threads: 0, onHead: true, checks: "pass", shardsPass: 4, shardsTotal: 4, gate: current });
-  assert.equal(ok.ready, true, "an otherwise-green PR with current gate evidence still enqueues");
+  const heldAtHead = readyVerdict({ draft: false, threads: 0, onHead: true, checks: "pass", shardsPass: 4, shardsTotal: 4, gate: current });
+  assert.equal(heldAtHead.ready, false, "the enqueue decision, not just the verdict, must refuse open blockers at head (DER-2782)");
+  assert.match(heldAtHead.why, /OPEN blocker/);
+  const ok = readyVerdict({ draft: false, threads: 0, onHead: true, checks: "pass", shardsPass: 4, shardsTotal: 4, gate: clean });
+  assert.equal(ok.ready, true, "an otherwise-green PR with CLEAN current gate evidence still enqueues");
 });
 
 test("latestGateEvent: returns the LAST review_findings for the issue, ignoring siblings", () => {
@@ -3762,6 +3774,296 @@ test("DER-2603: state.gate_missing puts an un-gated PR on the board, and watch r
     const wake2 = JSON.parse((await runSubcommand(["watch", "--run", runId, "--runs-root", root, "--since", "99", "--nudge-since", "0", "--timeout", "1"])).stdout);
     assert.deepEqual(wake2.pending.gate_missing, []);
   } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+// ---- DER-2782: review-gate blockers must BLOCK on the current head ----
+// `gateEvidenceVerdict` returned `{state:"current", blocks:false}` for `sha === head` with NO blockers
+// check — the `blockers > 0` branch was reachable only down the STALE path. The shepherd SKILL promised
+// "unresolved blockers = automatic kickback" in prose nothing executed, and the incentive ran BACKWARDS:
+// fixing findings pushes commits → sha leaves head → STALE-DIRTY → blocked; ignoring them → CURRENT →
+// passed. Every test below was observed FAILING on the parent commit (7b8e1ca).
+const D2782_HEAD = "d3adb33fc0".repeat(4);
+const D2782_FINDINGS = [
+  { title: "guard is bypassable", priority: 0, file: "a.ts", line_start: 10, line_end: 12 },
+  { title: "Tenant filter dropped", priority: 1, file: "b.ts", line_start: 3, line_end: 3 },
+  { title: "nit: rename this", priority: 3, file: "c.ts", line_start: 1, line_end: 1 },
+];
+const d2782Gate = (over = {}) => ({ type: "review_findings", issue: "DER-1", sha: D2782_HEAD, blockers: 2, round: 1, findings: D2782_FINDINGS, ...over });
+const d2782Adj = (over = {}) => ({
+  type: "gate_adjudication", issue: "DER-1", sha: D2782_HEAD,
+  findings: ["1", "Tenant filter dropped"], rationale: "both misread the seat-scoped helper", adjudicated_by: "derrek", ...over,
+});
+
+test("DER-2782: a CURRENT gate with OPEN blockers blocks; only an adjudication naming THAT tree clears it", () => {
+  // (a) The defect, stated as the contract. Same sha as head, findings still open ⇒ BLOCK.
+  const open = gateEvidenceVerdict({ head: D2782_HEAD, gate: { sha: D2782_HEAD, blockers: 2 } });
+  assert.equal(open.state, "current-dirty");
+  assert.equal(open.blocks, true, "the tree that would merge has 2 open blockers — nothing about it being CURRENT makes that acceptable");
+  assert.match(open.label, /OPEN blocker/);
+  // (b) An adjudication covering the SAME tree clears the block — and says so loudly. `blocks: false`
+  //     with a quiet `gate=CURRENT` label would just be the old defect with extra steps.
+  const waived = gateEvidenceVerdict({ head: D2782_HEAD, gate: { sha: D2782_HEAD, blockers: 2 }, adjudication: { sha: D2782_HEAD, findings: ["1", "2"], adjudicated_by: "derrek", rationale: "both wrong" } });
+  assert.equal(waived.state, "adjudicated");
+  assert.equal(waived.blocks, false);
+  assert.match(waived.label, /gate=ADJUDICATED \(2 findings waived by derrek/, "a waiver must NAME its author in the line an operator actually reads");
+  assert.match(waived.label, /⚠/, "never fold an adjudication into a silent pass");
+  // (c) An adjudication of a DIFFERENT tree is not an adjudication of this one — the same reasoning
+  //     that makes STALE-DIRTY block, applied to the waiver instead of to the review.
+  const other = gateEvidenceVerdict({ head: D2782_HEAD, gate: { sha: D2782_HEAD, blockers: 2 }, adjudication: { sha: "f".repeat(40), findings: ["1", "2"], adjudicated_by: "derrek", rationale: "r" } });
+  assert.equal(other.blocks, true, "a waiver carried over from an earlier round describes findings on a tree that is no longer shipping");
+  assert.equal(other.state, "current-dirty");
+  // A REJECTED candidate is named in the label: an operator who just recorded one must be able to tell
+  // "ignored" from "never arrived".
+  const withReason = gateEvidenceVerdict({ head: D2782_HEAD, gate: { sha: D2782_HEAD, blockers: 2 }, adjudicationRejected: "no `rationale`" });
+  assert.match(withReason.label, /IGNORED: no `rationale`/);
+  // An UNREADABLE count is not a zero count. `blockers > 0` is false for NaN, so without this a
+  // corrupt event reads as a clean gate — the fail-open version of the very defect above.
+  for (const raw of ["two", null, -1, {}]) {
+    const v = gateEvidenceVerdict({ head: D2782_HEAD, gate: { sha: D2782_HEAD, blockers: raw } });
+    if (raw === null) { assert.equal(v.state, "current", "an ABSENT blockers field is still the legacy zero — only a NON-NUMBER is unreadable"); continue; }
+    assert.equal(v.state, "unreadable", `blockers=${JSON.stringify(raw)} must not read as clean`);
+    assert.equal(v.blocks, true);
+  }
+  // CONTROL — none of this touches the clean path, or the gate becomes one operators switch off.
+  assert.equal(gateEvidenceVerdict({ head: D2782_HEAD, gate: { sha: D2782_HEAD, blockers: 0 } }).blocks, false);
+  // CONTROL — and an adjudication cannot manufacture a pass where no gate ran at all.
+  assert.equal(gateEvidenceVerdict({ head: D2782_HEAD, gate: null, adjudication: { sha: D2782_HEAD } }).blocks, true);
+});
+
+test("DER-2782: the go-ahead word is what the shepherd greps — so the block, and the WAIVER, land on that line", () => {
+  const line = (gate) => {
+    const verdict = readyVerdict({ ...D2603_CLEAN, gate });
+    return WR.readyLine({
+      pr: 12, head: D2782_HEAD, draft: false, threads: 0, onHead: true, checks: "pass", shards: "4/4", behind: 0,
+      gate: gate.state, gateLabel: gate.label, ...verdict,
+      mergeAction: WR.mergeAction({ mode: "direct", strategy: "squash", pr: 12, verdict, expectedHead: D2782_HEAD }),
+    });
+  };
+  const blocked = line(gateEvidenceVerdict({ head: D2782_HEAD, gate: { sha: D2782_HEAD, blockers: 2 } }));
+  assert.doesNotMatch(blocked, /ENQUEUEABLE|MERGEABLE/, "a PR with 2 open blockers on its head must show NO go-ahead word");
+  assert.match(blocked, /hold \(gate=CURRENT .* with 2 OPEN blocker/);
+
+  // The waived PR DOES get the go-ahead word — and the waiver rides the same line. A waiver that let the
+  // line render identically to a clean gate would be the silent pass, just spelled differently.
+  const waived = line(gateEvidenceVerdict({ head: D2782_HEAD, gate: { sha: D2782_HEAD, blockers: 2 }, adjudication: { sha: D2782_HEAD, findings: ["1", "2"], adjudicated_by: "derrek", rationale: "both wrong" } }));
+  assert.match(waived, /\*\*\* MERGEABLE \(direct\) \*\*\*/, "a valid waiver must still let the work through");
+  assert.match(waived, /⚠ gate=ADJUDICATED \(2 findings waived by derrek/);
+  const clean = line(gateEvidenceVerdict({ head: D2782_HEAD, gate: { sha: D2782_HEAD, blockers: 0 } }));
+  assert.match(clean, /\*\*\* MERGEABLE \(direct\) \*\*\*/);
+  assert.doesNotMatch(clean, /ADJUDICATED/, "…and a genuinely clean gate must NOT read like a waived one");
+});
+
+test("DER-2782: the adjudication contract — every clause can return the refusing answer", () => {
+  assert.equal(typeof WR.gateAdjudicationVerdict, "function", "the waiver contract must be a pure seam, or none of this is testable");
+  const gate = d2782Gate();
+  // POSITIVE CONTROL FIRST — without it every refusal below could be a constant `false`.
+  const ok = WR.gateAdjudicationVerdict({ gate, adjudication: d2782Adj() });
+  assert.equal(ok.ok, true, `a well-formed adjudication must be accepted (got: ${ok.reason})`);
+  assert.deepEqual(ok.waived, ["guard is bypassable", "Tenant filter dropped"], "references resolve by 1-based index AND by exact title");
+  assert.equal(ok.by, "derrek");
+  // Titles are matched case/whitespace-insensitively — an operator retyping a title must not be silently
+  // dropped into a rejection they cannot see.
+  assert.equal(WR.gateAdjudicationVerdict({ gate, adjudication: d2782Adj({ findings: ["  GUARD  IS   bypassable ", 2] }) }).ok, true);
+
+  const refusals = [
+    ["no gate event at all", { gate: null, adjudication: d2782Adj() }, /nothing to adjudicate|no review_findings/],
+    ["gate carries no sha", { gate: d2782Gate({ sha: null }), adjudication: d2782Adj() }, /no `sha`/],
+    ["waiver names no sha", { gate, adjudication: d2782Adj({ sha: "" }) }, /must name the tree/],
+    ["waiver names another sha", { gate, adjudication: d2782Adj({ sha: "b".repeat(40) }) }, /covers .* and the gate evidence covers/],
+    ["no adjudicated_by", { gate, adjudication: d2782Adj({ adjudicated_by: "  " }) }, /unattributed/],
+    ["no rationale", { gate, adjudication: d2782Adj({ rationale: "" }) }, /no `rationale`/],
+    ["empty findings — the blanket waiver", { gate, adjudication: d2782Adj({ findings: [] }) }, /blanket waiver/],
+    ["findings not an array", { gate, adjudication: d2782Adj({ findings: "everything" }) }, /blanket waiver/],
+    ["names a finding that does not exist", { gate, adjudication: d2782Adj({ findings: ["1", "9"] }) }, /not on the gate event/],
+    ["names a free-text excuse instead of a finding", { gate, adjudication: d2782Adj({ findings: ["all of them"] }) }, /not on the gate event/],
+    ["PARTIAL waiver — 1 of 2 blockers", { gate, adjudication: d2782Adj({ findings: ["1"] }) }, /leaves 1 of 2 open blocker/],
+    ["waives only the non-blocker", { gate, adjudication: d2782Adj({ findings: ["3"] }) }, /leaves 2 of 2 open blocker/],
+    ["gate evidence inconsistent with itself", { gate: d2782Gate({ blockers: 5 }), adjudication: d2782Adj() }, /inconsistent with itself/],
+    ["blocker count with no findings list", { gate: d2782Gate({ findings: [] }), adjudication: d2782Adj() }, /inconsistent with itself/],
+  ];
+  for (const [label, input, re] of refusals) {
+    const v = WR.gateAdjudicationVerdict(input);
+    assert.equal(v.ok, false, `${label}: must be refused`);
+    assert.match(v.reason, re, `${label}: the refusal must SAY which clause failed — a silently dropped waiver is barely better than a silently honoured one`);
+  }
+  // No adjudication at all is not a refusal to report: `reason` stays null so nothing prints "IGNORED"
+  // on a PR where nobody ever tried to waive anything.
+  const none = WR.gateAdjudicationVerdict({ gate, adjudication: null });
+  assert.equal(none.ok, false);
+  assert.equal(none.reason, null);
+});
+
+test("DER-2782: `ready` reads the waiver from the LEDGER, and only for the unit that owns it", async () => {
+  // Bind to the PRODUCTION call site first. Everything below proves properties of pure functions; none
+  // of it proves `ready` reads the waiver, and a threaded-nowhere parameter is exactly the shape that
+  // stays green while the shipped path ignores it. `ready` must SPREAD the lookup — passing only
+  // `gate:` would drop `adjudication`/`adjudicationRejected` silently, since both default to null.
+  const src = await readFile(new URL("./work-runner.mjs", import.meta.url), "utf8");
+  const readyBody = src.slice(src.indexOf('case "ready":'), src.indexOf('case "preflight":'));
+  assert.ok(readyBody.length > 1000, "the ready subcommand body must be locatable for this to prove anything");
+  assert.match(readyBody, /gateEvidenceVerdict\(\{ head, \.\.\.gateEvidenceLookup\(/,
+    "`ready` must spread the whole lookup into the verdict, or the waiver it read never reaches the decision");
+
+  const base = [D2603_STAMPED, { type: "pr_opened", issue: "DER-1", pr: 12 }, d2782Gate()];
+  const blocked = gateEvidenceVerdict({ head: D2782_HEAD, ...gateEvidenceLookup({ events: base, issueId: "DER-1" }) });
+  assert.equal(blocked.blocks, true, "gate event with open blockers on head, no waiver ⇒ hold");
+  assert.equal(readyVerdict({ ...D2603_CLEAN, gate: blocked }).ready, false);
+
+  const cleared = gateEvidenceVerdict({ head: D2782_HEAD, ...gateEvidenceLookup({ events: [...base, d2782Adj()], issueId: "DER-1" }) });
+  assert.equal(cleared.state, "adjudicated");
+  assert.equal(readyVerdict({ ...D2603_CLEAN, gate: cleared }).ready, true, "a valid waiver must let healthy work through, or it is a gate people route around");
+
+  // A MALFORMED waiver in the ledger is not an adjudication — and the reason surfaces rather than
+  // vanishing, which is the difference between "ignored" and "never arrived".
+  const partial = gateEvidenceLookup({ events: [...base, d2782Adj({ findings: ["1"] })], issueId: "DER-1" });
+  assert.equal(partial.adjudication, null);
+  assert.match(partial.adjudicationRejected, /leaves 1 of 2/);
+  assert.equal(gateEvidenceVerdict({ head: D2782_HEAD, ...partial }).blocks, true);
+
+  // A SIBLING unit's waiver must never reach this PR — the same cross-attribution hole DER-2603 closed
+  // for gate events themselves.
+  const sibling = gateEvidenceLookup({ events: [...base, d2782Adj({ issue: "DER-9" })], issueId: "DER-1" });
+  assert.equal(sibling.adjudication, null, "DER-9 cannot waive DER-1's blockers");
+  assert.equal(gateEvidenceVerdict({ head: D2782_HEAD, ...sibling }).blocks, true);
+
+  // A waiver of round 1 must not survive into round 2: the later gate event is the one that counts, and
+  // the stale waiver is reported as rejected rather than quietly honoured.
+  const round2Sha = "9".repeat(40);
+  const round2 = gateEvidenceLookup({
+    events: [...base, d2782Adj(), d2782Gate({ sha: round2Sha, blockers: 1, round: 2, findings: [D2782_FINDINGS[0]] })],
+    issueId: "DER-1",
+  });
+  assert.equal(round2.adjudication, null);
+  assert.match(round2.adjudicationRejected, /covers .* and the gate evidence covers/);
+  assert.equal(gateEvidenceVerdict({ head: round2Sha, ...round2 }).blocks, true);
+});
+
+test("DER-2782: the board carries open blockers AND every waiver, and watch re-surfaces both", async () => {
+  const base = [D2603_STAMPED, { type: "lead_spawned", issue: "DER-1" }, { type: "pr_opened", issue: "DER-1", pr: 12 }, d2782Gate()];
+  const s = materializeState(base, { run_id: "R" });
+  assert.deepEqual((s.gate_blocked ?? []).map((g) => g.issue), ["DER-1"], "a handed-off PR whose gate findings are still open belongs on the board, not only at enqueue time");
+  assert.equal(s.gate_blocked[0].blockers, 2);
+  assert.deepEqual(s.gate_adjudicated, []);
+  assert.equal(s.issues["DER-1"].gate_adjudicated, null);
+
+  // A valid waiver clears the blocked banner and lands in the AUDIT banner. It must never do the first
+  // without the second — that is precisely the silent pass this unit exists to remove.
+  const waived = materializeState([...base, d2782Adj()], { run_id: "R" });
+  assert.deepEqual(waived.gate_blocked, []);
+  assert.deepEqual(waived.gate_adjudicated.map((g) => [g.issue, g.by, g.findings.length]), [["DER-1", "derrek", 2]]);
+  assert.equal(waived.issues["DER-1"].gate_adjudicated.rationale, "both misread the seat-scoped helper");
+  assert.ok(!("_gate_event" in waived.issues["DER-1"]) && !("_gate_adjs" in waived.issues["DER-1"]), "fold scratch must not leak into state.json");
+
+  // Order-independence: a ledger folded from two hosts sorts by ts, not by intent, so a waiver appended
+  // BEFORE the gate event it references must still be honoured.
+  const reordered = materializeState([D2603_STAMPED, { type: "pr_opened", issue: "DER-1", pr: 12 }, d2782Adj(), d2782Gate()], { run_id: "R" });
+  assert.deepEqual(reordered.gate_blocked, []);
+  assert.equal(reordered.gate_adjudicated.length, 1);
+
+  // A rejected waiver leaves the unit blocked, with the reason on the board.
+  const bad = materializeState([...base, d2782Adj({ rationale: "" })], { run_id: "R" });
+  assert.deepEqual(bad.gate_blocked.map((g) => g.issue), ["DER-1"]);
+  assert.match(bad.gate_blocked[0].rejected_adjudication, /no `rationale`/);
+  assert.deepEqual(bad.gate_adjudicated, []);
+
+  // CONTROL — a lead still building is not listed (the banner must not be permanently red), and a clean
+  // gate clears it.
+  assert.deepEqual(materializeState([D2603_STAMPED, { type: "lead_spawned", issue: "DER-2" }, d2782Gate({ issue: "DER-2" })]).gate_blocked, []);
+  assert.deepEqual(materializeState([...base, d2782Gate({ sha: "z".repeat(40), blockers: 0, findings: [] })]).gate_blocked, []);
+
+  const root = await mkdtemp(join(tmpdir(), "work-d2782-watch-"));
+  try {
+    const { runId } = await runSubcommand(["init-run", "--issues", "DER-1", "--runs-root", root]);
+    const dir = join(root, runId);
+    for (const e of base.slice(1)) await appendEvent(dir, e);
+    const wake = JSON.parse((await runSubcommand(["watch", "--run", runId, "--runs-root", root, "--since", "99", "--nudge-since", "0", "--timeout", "1"])).stdout);
+    assert.deepEqual(wake.pending.gate_blocked, ["DER-1"], "open gate findings must re-surface on EVERY wake, like a pending kickback");
+    assert.deepEqual(wake.pending.gate_adjudicated, []);
+    await appendEvent(dir, d2782Adj());
+    const wake2 = JSON.parse((await runSubcommand(["watch", "--run", runId, "--runs-root", root, "--since", "99", "--nudge-since", "0", "--timeout", "1"])).stdout);
+    assert.deepEqual(wake2.pending.gate_blocked, []);
+    assert.deepEqual(wake2.pending.gate_adjudicated, ["DER-1"], "a waiver nobody can hard-block must be impossible to miss");
+    // Once the unit is terminal the WAKE stops nagging (a permanently-red banner is one operators skim)
+    // while the BOARD keeps the record — after the fact is exactly when someone asks what shipped waived.
+    await appendEvent(dir, { type: "pr_merged", issue: "DER-1", pr: 12 });
+    const wake3 = JSON.parse((await runSubcommand(["watch", "--run", runId, "--runs-root", root, "--since", "99", "--nudge-since", "0", "--timeout", "1"])).stdout);
+    assert.deepEqual(wake3.pending.gate_adjudicated, []);
+    const merged = materializeState(await readEvents(dir), { run_id: runId });
+    assert.deepEqual(merged.gate_adjudicated.map((g) => g.issue), ["DER-1"], "the audit record must survive the merge");
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("DER-2782: an UNREADABLE blockers count reaches the board too (the fold's `|| 0` said 'clean')", () => {
+  const base = [D2603_STAMPED, { type: "lead_spawned", issue: "DER-1" }, { type: "pr_opened", issue: "DER-1", pr: 12 }];
+  const s = materializeState([...base, d2782Gate({ blockers: "two", findings: [] })], { run_id: "R" });
+  assert.deepEqual(s.gate_blocked.map((g) => [g.issue, g.blockers]), [["DER-1", "UNREADABLE"]]);
+  assert.equal(s.issues["DER-1"].gate_blockers_unreadable, true);
+  // CONTROL — a real zero is not unreadable, and does not land on the banner.
+  const ok = materializeState([...base, d2782Gate({ blockers: 0, findings: [] })], { run_id: "R" });
+  assert.deepEqual(ok.gate_blocked, []);
+  assert.equal(ok.issues["DER-1"].gate_blockers_unreadable, false);
+});
+
+test("DER-2782: `append` refuses a malformed gate_adjudication and shouts about a valid one", async () => {
+  const root = await mkdtemp(join(tmpdir(), "work-d2782-append-"));
+  try {
+    const { runId } = await runSubcommand(["init-run", "--issues", "DER-1", "--runs-root", root]);
+    const dir = join(root, runId);
+    await appendEvent(dir, d2782Gate());
+    const append = (ev) => runSubcommand(["append", "--run", runId, "--runs-root", root, JSON.stringify(ev)]);
+
+    await assert.rejects(() => append(d2782Adj({ findings: [] })), /blanket waiver/, "an empty-findings waiver must not reach the ledger");
+    await assert.rejects(() => append(d2782Adj({ findings: ["1"] })), /leaves 1 of 2/);
+    await assert.rejects(() => append(d2782Adj({ issue: undefined })), /must name its `issue`/);
+    await assert.rejects(() => append(d2782Adj({ sha: "e".repeat(40) })), /gate evidence covers/);
+    assert.equal((await readEvents(dir)).filter((e) => e.type === "gate_adjudication").length, 0, "a refused waiver leaves NOTHING behind");
+
+    const out = await append(d2782Adj());
+    assert.match(out.stdout, /GATE ADJUDICATION RECORDED/);
+    assert.match(out.stdout, /2 finding\(s\) WAIVED by derrek/);
+    assert.match(out.stdout, /guard is bypassable/, "name what was waived, not just how many");
+    assert.match(out.stdout, /kickback offense/, "the authority rule prints where the waiver is recorded");
+    assert.equal((await readEvents(dir)).filter((e) => e.type === "gate_adjudication").length, 1);
+
+    // CONTROL — every OTHER event type still relays untouched; this must not become a validating chokepoint.
+    assert.equal((await append({ type: "orch_note", issue: "DER-1", note: "hi" })).stdout, "ok");
+    // A RELAYED line (already stamped by its origin host) is not re-validated — refusing it would fork
+    // the ledger — but the READ side still ignores it, which is where the enforcement actually lives.
+    await append({ ...d2782Adj({ findings: ["1"] }), event_id: "0192f000-0000-7000-8000-000000000001", source_id: "mini", seq: 1, schema_version: 1 });
+    const st = materializeState(await readEvents(dir), { run_id: runId });
+    assert.equal(st.issues["DER-1"].gate_adjudicated, null, "a relayed but INVALID waiver must be ignored by the fold — write-side validation is an affordance, the read is the enforcement");
+    assert.match(st.issues["DER-1"].gate_adjudication_rejected, /leaves 1 of 2/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("DER-2782: the lead brief and the shepherd skill state the rule the code now enforces", async () => {
+  // The copy is the ONLY control on who adjudicates — FS access means no hard enforcement is possible —
+  // so it is asserted, not trusted. Bound to the brief GENERATOR, which is what leads actually read.
+  const brief = renderBrief({ issueId: "DER-1", worktree: "/wt", runId: "r", runDir: "/run" });
+  assert.match(brief, /gate_adjudication/, "the brief must name the only mechanism that clears a blocker without fixing it");
+  assert.match(brief, /kickback offense/, "…and that a lead recording its own is an offense");
+  assert.doesNotMatch(brief, /Fix every P0\/P1, or reject it IN WRITING/, "the superseded prose escape hatch must be gone, not merely supplemented");
+  assert.match(WR.GATE_ADJUDICATION_AUTHORITY, /ORCHESTRATOR or the human operator/);
+
+  const skillsDir = fileURLToPath(new URL("..", import.meta.url));
+  const shepherd = await readFile(join(skillsDir, "work-shepherd", "SKILL.md"), "utf8");
+  assert.match(shepherd, /gate_adjudication/);
+  assert.match(shepherd, /gate_blocked/);
+  assert.doesNotMatch(shepherd, /blockers explicitly rejected in writing in the PR body/,
+    "the un-machine-checkable escape hatch this unit replaced must not still be promised to the shepherd");
+  assert.match(shepherd, /ESCALATE/, "the shepherd is neither the orchestrator nor the operator — it must be told to escalate, not to self-record");
+  const lead = await readFile(join(skillsDir, "work-lead", "SKILL.md"), "utf8");
+  assert.match(lead, /kickback offense/, "the lead must be told the authority rule, since nothing can enforce it");
+
+  // The printed command is the failure class this repo has already paid for twice: copy that reads fine
+  // and does not WORK as printed. Pull the SKILL's own JSON out and run it through the real contract.
+  const example = (shepherd.match(/'(\{"actor":"orch","type":"gate_adjudication".*?\})'/s) ?? [])[1];
+  assert.ok(example, "the shepherd SKILL must print a copy-pasteable gate_adjudication, as ONE single-quoted argument");
+  const parsed = JSON.parse(example); // an unquoted/split JSON blob would not survive this
+  const gate = d2782Gate({ issue: parsed.issue, sha: parsed.sha, blockers: 2, findings: D2782_FINDINGS });
+  const v = WR.gateAdjudicationVerdict({ gate, adjudication: parsed });
+  assert.equal(v.ok, true, `the documented shape must satisfy the contract it documents (got: ${v.reason})`);
+  assert.equal(v.by, parsed.adjudicated_by);
 });
 
 test("shaDescendsFrom (DER-2559): exit 0 = descendant, exit 1 = NOT, self is never a descendant", async () => {
