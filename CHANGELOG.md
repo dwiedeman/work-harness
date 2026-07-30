@@ -113,6 +113,19 @@ places this file and its neighbors described those gaps as still open after they
 
 ### Added
 
+- **DER-2830 — a fault-injection E2E suite (`e2e.test.mjs`), hermetic tier wired into CI.** The unit
+  suites prove the predicates; this drives `work-runner.mjs` as a real subprocess and INDUCES the
+  failures the harness exists to survive — a torn ledger tail, harness-version skew, a foreign wire
+  version, a reap of a phantom unit, an unfinished run. The gap it closes: almost every fix since 0.1.0
+  is a *failure handler*, so a happy-path run exercises none of them and still returns green. Tier A is
+  hermetic (no network, no model calls, no `gh`) and runs on every PR in ~3s; Tier B is opt-in behind
+  `WORK_E2E_LIVE=1` and never runs in PR CI. The file also carries **defect pins** asserting four
+  known-live fold bugs (DER-2323, DER-2602, DER-2810, DER-2824): a pin going red means the bug was
+  FIXED and the pin must be inverted, so an all-green E2E is never mistaken for "no known defects".
+  Each case was validated by a mutation audit — neuter the guard, observe the matching test go red —
+  and one mutation that produced byte-identical output was discarded as a no-op rather than counted as
+  coverage.
+
 - **DER-2781 — `complete-run --run <r>`, a machine-checkable end to a run.** `materializeState` set
   `status: meta.status ?? "running"`, no call site ever passed a status, no terminal run event existed,
   and nothing read the field — a run had no way to record that it was finished, so a successor couldn't

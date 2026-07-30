@@ -316,6 +316,31 @@ node --test ~/.claude/skills/work/work-runner.test.mjs ~/.claude/skills/work/wor
 node --test ~/.claude/skills/prep-for-work/prep-runner.test.mjs
 ```
 
+### Fault-injection E2E
+
+The unit suites prove the *predicates*. `e2e.test.mjs` proves the *program*: it drives `work-runner.mjs`
+as a real subprocess and **induces** the failures the harness exists to survive — a torn ledger tail,
+version skew, a foreign wire version, a phantom reap, an unfinished run.
+
+That distinction matters here more than usual. Almost every fix since 0.1.0 is a *failure handler*, so a
+happy-path run — green CI, intact ledger, clean reap — exercises none of them and still returns green.
+
+```bash
+# Tier A — hermetic. No network, no model calls, no `gh`. ~3s. Runs in CI on every PR.
+node --test e2e.test.mjs
+
+# Tier B — live. Real model calls, real GitHub, real cost. Never runs in PR CI.
+WORK_E2E_LIVE=1 node --test e2e.test.mjs
+```
+
+Run Tier A after installing, to confirm your copy behaves correctly under fault. Run Tier B when you want
+end-to-end proof against your own credentials and repo.
+
+**On failures in this file:** it carries deliberate *defect pins* — assertions of currently-broken
+behavior, each naming the issue that will fix it. A pin going **red means the bug was fixed**. Invert the
+pin; do not change the harness to satisfy it. Pins exist so that an all-green E2E is never mistaken for
+"no known defects", which is the failure this suite was written to avoid.
+
 ---
 
 ## License
