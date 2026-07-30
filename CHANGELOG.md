@@ -23,6 +23,29 @@ places this file and its neighbors described those gaps as still open after they
 
 ### Security
 
+- **DER-2836 (P0) — the evidence-query policy was decorative, because a shell re-expanded the query
+  AFTER it was validated.** `query-check` handed the raw text to `spawnSync(…, {shell: true})`, so the
+  arguments a command finally received were not the arguments any rule had read. `find . $(printf --
+  -delete)` passed every check and deleted files: the substitution was validated on its own (`printf` is
+  read-only and allowlisted), then collapsed to a placeholder, so `find`'s `-delete` rule was applied to a
+  word that was not yet `-delete`. The same hole was `sed $(printf -- -i) …`, `sort $(printf -- -o) …`,
+  `awk $(printf -- -f) …` — and, with no substitution at all, `$'-delete'`, a bare `$EVIL`, and an
+  unquoted glob in a repo containing a file *named* `-delete`. It defeated the option allowlists by
+  construction rather than by finding a hole in one, so widening those lists could not have fixed it.
+  **Fixed by removing the expander, not by enumerating expansions**: `runEvidenceQuery` executes the
+  parsed pipeline in argv form — `spawnSync(cmd, args)`, one stage at a time, stdout buffered into the
+  next stage, `&&`/`||` short-circuiting off the previous status, redirects resolved by the parser — so
+  there is no second expansion pass for anything to hide in. An enumeration is only as complete as its
+  author; this is a property of the execution model. Words carrying an expansion, and unquoted globs, are
+  now refused in every position (not just the command name) as defense in depth and because nothing would
+  expand them — a literal `$(git rev-parse HEAD)` would silently answer a different question. **This
+  reverses a documented allowance:** substitution was previously permitted when its contents were
+  themselves read-only, which was the bug — `printf`/`echo`/`cat` are all read-only *and* all emit
+  arbitrary text. Verified by fault injection in `e2e.test.mjs`: six payloads, each planting a canary file
+  that the parent commit actually deleted, plus controls proving legitimate pipelines still run. A
+  mutation audit with **both** the validator and the executor's refusal neutered confirms the canary still
+  survives — the argv execution is what protects, the refusal is the second layer. (DER-2836)
+
 - **DER-2777 — the evidence-query sandbox closes four outbound channels that were all validated
   "read-only."** `git ls-remote` was in the read-subcommand allowlist and its nested `$(...)` re-validated
   by the same rule; the awk/gawk option parser skipped every content check on any `-`-prefixed argument,

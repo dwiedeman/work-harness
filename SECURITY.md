@@ -61,20 +61,30 @@ between hosts, which trades a trust problem for a correctness problem. So the ha
 authorized it**. If authorization matters in your setting, review the waivers — they are surfaced
 specifically so they can be reviewed.
 
-### Evidence queries execute through a shell
+### Evidence queries execute WITHOUT a shell, and read whatever you can read
 
 The pre-run planning tool (`prep-for-work`) validates operator-supplied evidence queries against a
-read-only command policy before running them. The validator is defense-in-depth against *mistakes* and
-plausible-looking bad queries. **It is not a sandbox and must not be treated as one:** query text is
-ultimately executed by a shell with your credentials, and shell metaprogramming can construct arguments
-the validator did not evaluate.
+read-only command policy, then executes them **in argv form — `spawnSync(cmd, args)`, one pipeline stage
+at a time, with no shell**. Because nothing expands the query a second time, the arguments the policy
+evaluated are the arguments the command receives.
 
-There is a known unfixed weakness of exactly this kind. It is tracked and being fixed; the details are
-withheld here rather than published as a working recipe against an unpatched release.
+That was not true before DER-2836. Queries reached `spawnSync(…, { shell: true })`, so the shell re-expanded
+the text *after* validation and could hand a command arguments no rule had seen — `find . $(printf --
+-delete)` passed the policy and deleted files. The same hole was reachable without any substitution at
+all, via `$'…'`, a bare `$VAR`, or an unquoted glob matching a file whose name begins with a dash. It was
+fixed by removing the expander rather than by enumerating expansions, because an enumeration is only ever
+as complete as its author. Queries carrying an expansion or an unquoted glob are now refused outright:
+nothing would expand them, and running the literal text would silently answer a different question.
 
-**What this means for you:** only run evidence queries you wrote or read. Do not feed the planner query
-text that arrived from an untrusted source, and do not rely on the validator as the thing standing
-between a hostile plan and your filesystem.
+**This still is not a general sandbox.** The policy's subject is *what a command does*, not *what it may
+reach*. Every allowlisted command is one that reads and prints, and outbound channels are closed
+(no `curl`/`ssh`, no `git ls-remote`/`fetch`, no gawk `/inet/…`, no `< /dev/tcp/…`) — but a read-only
+command still reads **any file your account can read**, including outside the repo. A hostile query
+cannot write, execute, or dial out; it can still name a path it has no business naming.
+
+**What this means for you:** prefer evidence queries you wrote or read. If query text arrived from an
+untrusted source, the policy will now stop it from writing or exfiltrating — but review it before
+treating its *result* as evidence, and treat the ability to read arbitrary paths as the remaining risk.
 
 ## Reporting a vulnerability
 
