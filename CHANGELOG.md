@@ -59,8 +59,15 @@ Each fix below landed with a regression test that was **observed failing on the 
   switched `node --test`'s default non-TTY reporter from TAP to spec, so an installer test that asserted
   the TAP shape failed there (the installer already accepted both); and the ShellCheck gate as first
   written pointed at zsh scripts, so it could never have passed.
-- **Harness version is not yet recorded in the ledger** (`run_started` / host heartbeats) and mixed-version
-  runs are not yet detected or refused — see DER-2748.
+- **Harness version IS now recorded in the ledger and mixed-version runs are refused** (DER-2748).
+  `run_started` and the new `heartbeat` subcommand stamp `harness_version` read from `VERSION`; every
+  event carries `schema_version` / `event_id` (uuid v7) / `source_id` / `seq` / `received_at`; a ledger
+  holding two harness versions or a `schema_version` this build does not implement refuses `spawn-lead` /
+  `spawn-shepherd` / `spawn-orch` / `rotate-*` (harness skew is overridable with `--allow-version-skew`,
+  a foreign schema is not), and the skew shows in `state.protocol` and on every `watch` wake. Residual
+  gap: `install.sh` does not copy `VERSION` to `$CLAUDE_HOME`, so a host running from an install rather
+  than a checkout reports `harness_version: "unknown"` unless `WORK_HARNESS_VERSION` is set — two such
+  hosts look same-version to each other.
 
 ## [0.1.0] — 2026-07-29
 

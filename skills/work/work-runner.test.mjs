@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, mkdir, rm, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 
 import {
   parseArgs, slugify, buildRunId,
@@ -4051,4 +4051,370 @@ test("DER-2753: work.config.example.json documents every new merge key (it is th
     assert.ok(k in example.repo, `work.config.example.json repo.${k} is undocumented`);
   }
   assert.equal(example.repo.allowMergeWithoutChecks, false, "the shipped example must show the conservative default");
+});
+
+// ---------------------------------------------------------------------------
+// DER-2748 — ledger wire protocol: schema_version / event_id / source_id / seq / received_at
+// ---------------------------------------------------------------------------
+// Before this, `appendEvent` stamped exactly one field (`ts`). Every integrity property the harness
+// needed had to be faked downstream: dedup by ad-hoc content hashing, the watch cursor by line COUNT,
+// and mixed-harness-version detection not at all. These controls pin the wire shape, and each one is
+// written so it can RETURN THE FAILING ANSWER (a blocked mixed-version run, a dropped duplicate, a
+// legacy ledger that still folds) rather than passing on an absent field.
+
+// A hand-written ledger line with the protocol fields SET BY HAND — deliberately not built from any new
+// export, so a must-fail run of these tests fails on BEHAVIOUR (what the runner did with the line), not
+// on a missing import.
+const d2748Line = (o) => `${JSON.stringify(o)}\n`;
+const d2748Id = (n) => `01900000-0000-7000-8000-${String(n).padStart(12, "0")}`;
+
+test("DER-2748: appendEvent stamps the wire protocol (schema_version, event_id, source_id, seq, received_at)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "wr-d2748-stamp-"));
+  try {
+    await appendEvent(dir, { actor: "orch", type: "run_started" });
+    await appendEvent(dir, { actor: "lead:DER-1", type: "pr_opened", pr: 7, issue: "DER-1" });
+    const evs = await readEvents(dir);
+    assert.equal(evs.length, 2);
+    for (const e of evs) {
+      assert.equal(e.schema_version, 1, "every appended event must declare the ledger schema it was written under");
+      assert.match(String(e.event_id), /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+        "event_id must be a uuid v7 (time-ordered, so a later cursor can sort/range on it)");
+      assert.equal(typeof e.source_id, "string");
+      assert.ok(e.source_id.length, "source_id must name the WRITER (host:pid:nonce) — (source_id, seq) is an identity");
+      assert.ok(Number.isInteger(e.seq) && e.seq > 0, `seq must be a positive integer, got ${e.seq}`);
+      assert.match(String(e.received_at), /^\d{4}-\d{2}-\d{2}T/, "received_at is when THIS ledger accepted the line");
+      assert.ok(e.ts, "ts (event time) is unchanged");
+    }
+    assert.equal(evs[0].source_id, evs[1].source_id, "one process is one source");
+    assert.equal(evs[1].seq, evs[0].seq + 1, "seq is monotonic per source");
+    assert.notEqual(evs[0].event_id, evs[1].event_id);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("DER-2748: duplicate delivery of the same event_id folds ONCE", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "wr-d2748-dup-"));
+  try {
+    // The real path: pullHostInto tails a mini's ledger, mergeRemoteEvents parses the lines, and each is
+    // appendEvent'd into the canonical ledger. Reset the per-host sync cursor (or re-pull after a crash)
+    // and the SAME lines arrive twice. Before event_id there was no way to tell that from new news.
+    const remote = d2748Line({
+      ts: "2026-07-29T10:00:00.000Z", actor: "lead:DER-1", type: "pr_opened", issue: "DER-1", pr: 900,
+      schema_version: 1, event_id: d2748Id(1), source_id: "mini:4242:ab12", seq: 3,
+    });
+    for (const e of mergeRemoteEvents({ remoteLines: [remote.trim()], host: "mini" })) await appendEvent(dir, e);
+    for (const e of mergeRemoteEvents({ remoteLines: [remote.trim()], host: "mini" })) await appendEvent(dir, e);
+    const raw = (await readFile(join(dir, "events.jsonl"), "utf8")).split("\n").filter((l) => l.trim());
+    assert.equal(raw.length, 2, "the ledger file is append-only — BOTH copies are still on disk");
+    const evs = await readEvents(dir);
+    assert.equal(evs.length, 1, "every reader must see the duplicate delivery ONCE");
+    assert.equal(evs[0].event_id, d2748Id(1));
+    // A duplicate is not news: the watch cursor must not wake on it, and readEvents().length must never
+    // go backwards (DER-2520's cursor contract).
+    const st = materializeState(evs, { run_id: "R1" });
+    assert.equal(st.issues["DER-1"].pr, 900);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("DER-2748: a relayed event keeps its ORIGIN identity and gets a LOCAL received_at", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "wr-d2748-relay-"));
+  try {
+    const remote = {
+      ts: "2026-07-29T09:00:00.000Z", received_at: "2026-07-29T09:00:00.100Z",
+      actor: "lead:DER-2", type: "handed_off", issue: "DER-2", pr: 901,
+      schema_version: 1, event_id: d2748Id(2), source_id: "mini:99:ffff", seq: 12,
+    };
+    await appendEvent(dir, remote);
+    const [e] = await readEvents(dir);
+    assert.equal(e.event_id, d2748Id(2), "identity is minted at ORIGIN and never re-minted by a relay");
+    assert.equal(e.source_id, "mini:99:ffff");
+    assert.equal(e.seq, 12, "a relay must not renumber another source's sequence");
+    assert.notEqual(e.received_at, "2026-07-29T09:00:00.100Z", "received_at is the RECEIVING ledger's clock, not the sender's");
+    assert.equal(e.ts, "2026-07-29T09:00:00.000Z", "event time is the sender's and is preserved");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("DER-2748: concurrent appenders never collide on event_id or (source_id, seq)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "wr-d2748-concurrent-"));
+  try {
+    const runsRoot = join(dir, "runs");
+    const runDir = join(runsRoot, "R1");
+    await mkdir(runDir, { recursive: true });
+    // (a) IN-PROCESS concurrency: 24 appends racing on one file descriptor.
+    await Promise.all(Array.from({ length: 24 }, (_, i) => appendEvent(runDir, { actor: "orch", type: "probe", n: i })));
+    let evs = await readEvents(runDir);
+    assert.equal(evs.length, 24, "no line lost, no line torn");
+    assert.equal(new Set(evs.map((e) => e.event_id)).size, 24, "24 distinct event_ids");
+    assert.equal(new Set(evs.map((e) => `${e.source_id}#${e.seq}`)).size, 24, "seq must be handed out before the first await, or two racing appends share one");
+    // (b) CROSS-PROCESS concurrency: 4 separate runner processes appending to the same ledger at once.
+    // Each is its own SOURCE, which is exactly why per-source seq needs no lock file.
+    const runner = new URL("./work-runner.mjs", import.meta.url).pathname;
+    await Promise.all([0, 1, 2, 3].map((i) => new Promise((res, rej) => {
+      const ch = spawn(process.execPath, [runner, "append", "--run", "R1", "--runs-root", runsRoot,
+        JSON.stringify({ actor: "orch", type: "cross_probe", n: i })], { cwd: dir, stdio: "ignore" });
+      ch.on("error", rej);
+      ch.on("exit", (code) => (code === 0 ? res() : rej(new Error(`child ${i} exited ${code}`))));
+    })));
+    evs = await readEvents(runDir);
+    const cross = evs.filter((e) => e.type === "cross_probe");
+    assert.equal(cross.length, 4, "all four cross-process appends survived");
+    assert.equal(new Set(cross.map((e) => e.source_id)).size, 4, "four processes must be four distinct sources (pid alone recycles)");
+    assert.equal(new Set(cross.map((e) => e.event_id)).size, 4);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("DER-2748: CLOCK SKEW must not drop a real event (a strict max-seq rule loses data)", async () => {
+  // The issue's acceptance says "a lower seq from a source than already seen is ignored". Implemented
+  // literally, that DELETES data: readEvents sorts by effective ts (DER-2520), so a source whose clock
+  // steps BACKWARD emits seq 1,2,3 with ts 3 < ts 2 and folds as 1,3,2 — the strict rule would drop
+  // seq 2, a real event, forever. So the drop rule is EXACT-IDENTITY replay only: an event_id already
+  // seen, or a (source_id, seq) pair already seen. A lower-but-unseen seq is a late arrival and is kept,
+  // and reported as out-of-order instead of being silently discarded.
+  const dir = await mkdtemp(join(tmpdir(), "wr-d2748-skew-"));
+  try {
+    const src = "mini:7:cafe";
+    const lines = [
+      { ts: "2026-07-29T10:00:00.000Z", type: "lead_online", issue: "DER-3", schema_version: 1, event_id: d2748Id(11), source_id: src, seq: 1 },
+      { ts: "2026-07-29T10:00:30.000Z", type: "plan_scope", issue: "DER-3", fileScope: ["a/**"], schema_version: 1, event_id: d2748Id(12), source_id: src, seq: 2 },
+      // clock stepped back 20s between seq 2 and seq 3
+      { ts: "2026-07-29T10:00:10.000Z", type: "pr_opened", issue: "DER-3", pr: 903, schema_version: 1, event_id: d2748Id(13), source_id: src, seq: 3 },
+    ];
+    await writeFile(join(dir, "events.jsonl"), lines.map(d2748Line).join(""), "utf8");
+    const evs = await readEvents(dir);
+    assert.equal(evs.length, 3, "a backwards clock step must not cost an event");
+    assert.deepEqual(evs.map((e) => e.seq), [1, 3, 2], "ts order (DER-2520) puts seq 3 before seq 2 — that is skew, not a replay");
+    const st = materializeState(evs, { run_id: "R" });
+    assert.equal(st.issues["DER-3"].pr, 903);
+    assert.deepEqual(st.issues["DER-3"].fileScope, ["a/**"], "the out-of-order plan_scope still folded");
+    // ...and the skew is REPORTED, not swallowed.
+    const v = WR.ledgerProtocolVerdict(evs);
+    assert.equal(typeof v, "object");
+    assert.deepEqual(v.out_of_order, [{ source_id: src, seq: 2, after: 3 }],
+      "an out-of-order arrival must be visible as a diagnostic");
+    assert.equal(v.ok, true, "skew alone is not a protocol incompatibility");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("DER-2748: run_started records the harness version, read from the VERSION file", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "wr-d2748-version-"));
+  try {
+    const version = (await readFile(new URL("../../VERSION", import.meta.url), "utf8")).trim();
+    assert.equal(WR.getHarnessVersion(), version, "VERSION at the repo root is the single source of truth — never hardcode it");
+    const root = join(dir, "runs");
+    const res = await runSubcommand(["init-run", "--project", "p", "--runs-root", root, "--repo-root", dir]);
+    const started = (await readEvents(join(root, res.runId))).find((e) => e.type === "run_started");
+    assert.equal(started.harness_version, version,
+      "without this, two hosts run different harness code against ONE ledger with no way to detect the skew");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("DER-2748: `heartbeat` appends a host_heartbeat carrying this host's harness version", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "wr-d2748-heartbeat-"));
+  try {
+    const runsRoot = join(dir, "runs");
+    const runDir = join(runsRoot, "R1");
+    await mkdir(runDir, { recursive: true });
+    const res = await runSubcommand(["heartbeat", "--run", "R1", "--runs-root", runsRoot, "--repo-root", dir, "--host", "mini"]);
+    const [hb] = (await readEvents(runDir)).filter((e) => e.type === "host_heartbeat");
+    assert.ok(hb, "heartbeat must leave an event — it is the only per-host version signal for a host that never runs init-run");
+    assert.equal(hb.host, "mini");
+    assert.equal(hb.harness_version, WR.getHarnessVersion(), "the version is the APPENDING process's own — a heartbeat cannot vouch for someone else");
+    assert.equal(hb.schema_version, 1);
+    assert.ok(hb.source_id && hb.event_id);
+    assert.equal(res.harnessVersion, WR.getHarnessVersion());
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("DER-2748: mixed harness versions BLOCK a dispatch; a same-version run is NOT blocked", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "wr-d2748-skew-block-"));
+  try {
+    const runsRoot = join(dir, "runs");
+    const runDir = join(runsRoot, "R1");
+    await mkdir(runDir, { recursive: true });
+    const ledger = (v1, v2) => writeFile(join(runDir, "events.jsonl"), [
+      d2748Line({ ts: "2026-07-29T00:00:00.000Z", actor: "orch", type: "run_started", run_id: "R1", mode: "project", harness_version: v1, schema_version: 1, event_id: d2748Id(21), source_id: "alpha:1:a1", seq: 1 }),
+      d2748Line({ ts: "2026-07-29T00:01:00.000Z", actor: "orch", type: "host_heartbeat", host: "mini", harness_version: v2, schema_version: 1, event_id: d2748Id(22), source_id: "beta:2:b2", seq: 1 }),
+    ].join(""), "utf8");
+    const dispatch = (extra = []) => runSubcommand(["spawn-orch", "--run", "R1", "--project", "s", "--runs-root", runsRoot, "--repo-root", dir, "--dry-run", ...extra]);
+
+    // BLOCKS — and the message must NAME both versions, or the operator cannot act on it.
+    await ledger("0.2.0", "0.1.0");
+    await assert.rejects(dispatch(), (err) => {
+      assert.match(err.message, /harness version/i);
+      assert.match(err.message, /0\.1\.0/);
+      assert.match(err.message, /0\.2\.0/);
+      assert.match(err.message, /mini|beta:2:b2/, "name WHERE the other version is running");
+      return true;
+    }, "a mixed-version run must be refused, not silently dispatched");
+    // The same skew is visible in `state` and on every `watch` wake — a refusal the operator only meets
+    // at dispatch time is a refusal they meet at 3am.
+    const st = (await runSubcommand(["state", "--run", "R1", "--runs-root", runsRoot, "--repo-root", dir])).state;
+    assert.equal(st.protocol.ok, false);
+    assert.deepEqual(st.protocol.harness_versions, ["0.1.0", "0.2.0"]);
+    const wake = JSON.parse((await runSubcommand(["watch", "--run", "R1", "--runs-root", runsRoot, "--repo-root", dir, "--since", "99", "--nudge-since", "0", "--timeout", "1"])).stdout);
+    assert.equal(wake.pending.protocol_skew, true);
+
+    // DOES NOT BLOCK a same-version run. Without this control the gate could be a constant `throw`.
+    await ledger("0.2.0", "0.2.0");
+    const ok = await dispatch();
+    assert.match(ok.stdout, /work resume|cmux/, "a same-version run must dispatch exactly as before");
+    const st2 = (await runSubcommand(["state", "--run", "R1", "--runs-root", runsRoot, "--repo-root", dir])).state;
+    assert.equal(st2.protocol.ok, true);
+
+    // Overridable ONLY explicitly (fail closed by default, degrade on request).
+    await ledger("0.2.0", "0.1.0");
+    const forced = await dispatch(["--allow-version-skew"]);
+    assert.match(forced.stdout, /work resume|cmux/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("DER-2748: a FOREIGN or unparseable schema_version fails CLOSED; a legacy ledger does not", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "wr-d2748-foreign-"));
+  try {
+    const runsRoot = join(dir, "runs");
+    const runDir = join(runsRoot, "R1");
+    await mkdir(runDir, { recursive: true });
+    const write = (...evs) => writeFile(join(runDir, "events.jsonl"), evs.map(d2748Line).join(""), "utf8");
+    const dispatch = () => runSubcommand(["spawn-orch", "--run", "R1", "--project", "s", "--runs-root", runsRoot, "--repo-root", dir, "--dry-run"]);
+    const base = { ts: "2026-07-29T00:00:00.000Z", actor: "orch", type: "run_started", run_id: "R1", mode: "project" };
+
+    // A schema this build cannot interpret ⇒ refuse. Reading it "best effort" is how a newer host's
+    // events get silently mis-folded.
+    await write({ ...base, schema_version: 99, event_id: d2748Id(31), source_id: "a:1:a", seq: 1 });
+    await assert.rejects(dispatch(), /schema_version/, "a future schema must be refused, not guessed at");
+    await assert.rejects(dispatch(), /99/);
+    // Unparseable is FOREIGN, not "probably fine".
+    await write({ ...base, schema_version: "one", event_id: d2748Id(32), source_id: "a:1:a", seq: 1 });
+    await assert.rejects(dispatch(), /schema_version/);
+    await write({ ...base, schema_version: 0, event_id: d2748Id(33), source_id: "a:1:a", seq: 1 });
+    await assert.rejects(dispatch(), /schema_version/);
+    // ABSENT is the legacy pre-0.2.0 shape — KNOWN, tolerated, and must never block.
+    await write({ ...base });
+    const ok = await dispatch();
+    assert.match(ok.stdout, /work resume|cmux/, "a legacy ledger must still dispatch");
+    const v = WR.ledgerProtocolVerdict(await readEvents(runDir));
+    assert.equal(v.ok, true);
+    assert.equal(v.legacy_events, 1, "legacy lines are COUNTED so the skew is visible without being fatal");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("DER-2748 CONTROL: a LEGACY ledger (no schema_version, no event_id) still reads and folds correctly", async () => {
+  // BACKWARD COMPATIBILITY IS THE HARD REQUIREMENT: real ledgers written before this change exist, and
+  // every line in them lacks every protocol field. Reading one must not crash, must not drop a line, and
+  // must fold to exactly the state it folded to before. Two of the harness's own producers — the
+  // SessionEnd telemetry hook and the context-report hook — still write raw legacy lines with
+  // appendFileSync, so this is the LIVE shape, not just history.
+  const dir = await mkdtemp(join(tmpdir(), "wr-d2748-legacy-"));
+  try {
+    const legacy = [
+      { ts: "2026-07-20T01:00:00.000Z", run_id: "R0", actor: "orch", type: "run_started", project: "p", mode: "project" },
+      { ts: "2026-07-20T01:01:00.000Z", actor: "orch", type: "worktree_created", issue: "DER-9", worktree: "/w/DER-9", branch: "der-9-work" },
+      { ts: "2026-07-20T01:02:00.000Z", actor: "orch", type: "lead_spawned", issue: "DER-9", workspace_ref: "ws1" },
+      { ts: "2026-07-20T01:03:00.000Z", actor: "lead:DER-9", type: "plan_scope", issue: "DER-9", fileScope: ["src/**"] },
+      { ts: "2026-07-20T01:04:00.000Z", actor: "lead:DER-9", type: "pr_opened", issue: "DER-9", pr: 700 },
+      // ts-less line: the carry-forward case DER-2520 pinned. Still must keep its file position.
+      { actor: "lead:DER-9", type: "handed_off", issue: "DER-9", pr: 700 },
+      { ts: "2026-07-20T01:06:00.000Z", actor: "shepherd", type: "pr_merged", issue: "DER-9", pr: 700 },
+      { ts: "2026-07-20T01:07:00.000Z", actor: "orch", type: "reaped", issue: "DER-9" },
+    ];
+    await writeFile(join(dir, "events.jsonl"), legacy.map(d2748Line).join(""), "utf8");
+    const evs = await readEvents(dir);
+    assert.equal(evs.length, legacy.length, "a legacy ledger must not lose a single line to id/seq dedup");
+    assert.deepEqual(evs.map((e) => e.type), legacy.map((e) => e.type), "and must not be reordered");
+    const st = materializeState(evs, { run_id: "R0" });
+    assert.equal(st.issues["DER-9"].status, "reaped");
+    assert.equal(st.issues["DER-9"].pr, 700);
+    assert.deepEqual(st.done, ["DER-9"]);
+    assert.equal(st.protocol.ok, true, "legacy is a KNOWN version, not a foreign one");
+    assert.equal(st.protocol.legacy_events, legacy.length);
+    // A new append onto a legacy ledger is stamped, and the legacy lines are untouched.
+    await appendEvent(dir, { actor: "orch", type: "note", issue: "DER-9" });
+    const mixed = await readEvents(dir);
+    assert.equal(mixed.length, legacy.length + 1);
+    assert.equal(mixed.at(-1).schema_version, 1);
+    assert.equal(mixed[0].schema_version, undefined, "an old line is never rewritten — the file is append-only");
+    assert.equal(materializeState(mixed, { run_id: "R0" }).issues["DER-9"].status, "reaped");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("DER-2748: the content-hash dedup key EXCLUDES every stamped field (or DER-2519's 129 duplicates return)", async () => {
+  // The class bug this change could introduce. reconcile-pr-events computes eventSeenKey on a FRESH
+  // derivation (unstamped) and compares it against keys built from STORED events (stamped). For a
+  // pr-less event that key is a content hash — so if the hash sees event_id/seq/received_at, the stored
+  // and fresh keys can NEVER match, the suppression set stops working, and the measured failure returns:
+  // 129 byte-identical plan_scope events, 11.6% of a 1,114-event ledger, manufacturing a liveness
+  // signal for a lead that had been dead 90 minutes.
+  const dir = await mkdtemp(join(tmpdir(), "wr-d2748-hash-"));
+  try {
+    const fresh = { actor: "lead:DER-4", host: "cloud", type: "plan_scope", issue: "DER-4", fileScope: ["x/**"] };
+    await appendEvent(dir, { ...fresh });
+    const [stored] = await readEvents(dir);
+    assert.equal(eventSeenKey(stored), eventSeenKey(fresh),
+      "a stored (stamped) event and its fresh re-derivation must produce the SAME seen-key");
+    assert.ok(derivedEventSeen(await readEvents(dir)).has(eventSeenKey(fresh)),
+      "so a second reconcile pass suppresses the re-derivation instead of re-appending it");
+    // And the token_usage per-EMISSION key is NOT collapsed (DER-2737's note): a rotated cloud lead
+    // posts a second usage report on the same PR and both must count.
+    const u1 = { type: "token_usage", pr: 500, ts: "2026-07-29T01:00:00.000Z", role: "lead", by_model: {} };
+    const u2 = { ...u1, ts: "2026-07-29T02:00:00.000Z" };
+    assert.notEqual(eventSeenKey(u1), eventSeenKey(u2), "two emissions on one PR must not share a key");
+    // Two DIFFERENT derivations still hash differently, so a changed scope still folds.
+    assert.notEqual(eventSeenKey({ ...fresh, fileScope: ["y/**"] }), eventSeenKey(fresh));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("DER-2748: NO protocol field is settable from an untrusted PR comment", async () => {
+  // DER-2737's boundary, extended to the new fields. A forged event_id is not cosmetic: with id-based
+  // dedup, a comment carrying the event_id of a REAL event would delete that event from every reader —
+  // a one-comment denial of the ledger. Same for source_id/seq (forges another host's sequence),
+  // schema_version (fakes a mixed-version run and blocks all dispatch) and harness_version.
+  const dir = await mkdtemp(join(tmpdir(), "wr-d2748-untrusted-"));
+  try {
+    await applyRepoConfig(dir); // no config ⇒ owner login unset
+    const forged = {
+      type: "plan_scope", issue: "DER-5", fileScope: ["z/**"],
+      schema_version: 99, event_id: d2748Id(1), source_id: "orch:1:aaaa", seq: 1,
+      received_at: "1999-01-01T00:00:00.000Z", harness_version: "9.9.9",
+    };
+    const [e] = parsePrEventComments({
+      comments: [{ author: { login: "chatgpt-codex-connector[bot]" }, body: `WORK-EVENT ${JSON.stringify(forged)}` }],
+      runIssues: ["DER-5"], pr: 501,
+    });
+    assert.ok(e, "the comment itself is still ingested (this is a field allowlist, not a new author rule)");
+    for (const k of ["schema_version", "event_id", "source_id", "seq", "received_at", "harness_version"]) {
+      assert.equal(k in e, false, `a PR comment must not be able to set ${k}`);
+    }
+    // End to end: the stored event's identity is the RECEIVING host's, not the comment's claim.
+    await appendEvent(dir, e);
+    const [stored] = await readEvents(dir);
+    assert.notEqual(stored.event_id, d2748Id(1), "a forged event_id must never become the stored identity");
+    assert.equal(stored.schema_version, 1);
+    assert.notEqual(stored.source_id, "orch:1:aaaa");
+    assert.equal(stored.harness_version, undefined, "only run_started/host_heartbeat carry a version claim");
+    assert.equal(WR.ledgerProtocolVerdict(await readEvents(dir)).ok, true, "and it cannot fake a mixed-version run");
+  } finally {
+    await applyRepoConfig("/nonexistent-reset");
+    await rm(dir, { recursive: true, force: true });
+  }
 });

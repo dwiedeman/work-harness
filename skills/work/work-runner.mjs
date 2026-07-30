@@ -7,10 +7,10 @@
 // truth for merge-readiness. Node built-ins only (mirrors your repo's own workflow scripts). See
 // the design notes in the repository README.
 import { spawn } from "node:child_process";
-import { createHash } from "node:crypto";
-import { existsSync } from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
 import { appendFile, mkdir, open, readdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
+import { homedir, hostname } from "node:os";
 import { join, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -67,6 +67,10 @@ export function parseArgs(argv) {
     else if (a === "--pull-hosts") o.pullHosts = argv[++i];
     else if (a === "--reconcile-merged") o.reconcileMerged = true;
     else if (a === "--reconcile-pr-events") o.reconcilePrEvents = true;
+    // DER-2748: proceed DELIBERATELY on a ledger whose hosts report different harness versions (a
+    // mid-run upgrade of one host). Never overrides a FOREIGN schema_version — there is no degraded
+    // mode for lines this build cannot parse.
+    else if (a === "--allow-version-skew") o.allowVersionSkew = true;
     else if (a === "--all") o.all = true;
     // Context rotation (2026-07-25). These need explicit entries: the `--xxx <value>` catch-all below
     // would eat the NEXT argument as a boolean flag's value.
@@ -2442,11 +2446,239 @@ export function computeEligible({ issues = [], inflight = [], cap = 2 } = {}) {
 // Ledger — append-only events + state fold
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Wire protocol (DER-2748) — identity, ordering and version on every event
+// ---------------------------------------------------------------------------
+// Until 0.2.0 `appendEvent` stamped exactly ONE field (`ts`), and every integrity property the harness
+// needed was faked downstream: dedup by ad-hoc content hashing (`contentHash`), the watch cursor by line
+// COUNT, and version skew between hosts not detected at all. The primitives below are the substrate:
+//
+//   schema_version  the ledger wire version this line was written under. ABSENT = the legacy pre-0.2.0
+//                   shape, which is KNOWN and tolerated forever (real ledgers exist, and two of the
+//                   harness's own producers — the SessionEnd telemetry hook and the context-report hook —
+//                   still append raw legacy lines). A value this build does not know is FOREIGN and
+//                   blocks dispatch, because folding it "best effort" silently mis-reads another host.
+//   event_id        uuid v7, minted ONCE at the origin. Time-ordered on purpose: a later cursor can sort
+//                   and range on it (DER-2741) instead of guessing a line count.
+//   source_id       host:pid:nonce — the WRITER, not the host. The nonce matters: pids recycle and two
+//                   machines share pid numbers, so pid alone cannot make (source_id, seq) an identity.
+//   seq             monotonic per source, handed out in-process. Because a source is a PROCESS, seq needs
+//                   no lock file and concurrent appenders from different processes cannot collide.
+//   received_at     when THIS ledger accepted the line, always the local clock — the field that finally
+//                   separates event time from arrival time for backfilled/relayed events.
+//   harness_version stamped on `run_started` and `host_heartbeat` only (see VERSION_BEARING_EVENT_TYPES).
+//
+// A relay (pull-host / a cloud fold) PRESERVES event_id/source_id/seq/schema_version and re-stamps only
+// received_at. Re-minting identity at a relay is what made an exactly-once merge impossible.
+export const LEDGER_SCHEMA_VERSION = 1;
+
+// The fields `appendEvent` stamps. Enumerated ONCE because three other things must agree with this list:
+//   - `contentHash` (the DER-2519 dedup key) must EXCLUDE every one of them, or a stored event and its
+//     fresh re-derivation can never produce the same seen-key and the 129-duplicate bug returns;
+//   - `sanitizeCommentEvent` must never accept one from a PR comment (see PROTOCOL_EVENT_FIELDS);
+//   - a relay must preserve the identity subset rather than re-mint it.
+export const PROTOCOL_EVENT_FIELDS = ["schema_version", "event_id", "source_id", "seq", "received_at", "harness_version"];
+export const STAMPED_EVENT_FIELDS = ["ts", ...PROTOCOL_EVENT_FIELDS];
+const STAMPED_FIELD_SET = new Set(STAMPED_EVENT_FIELDS);
+
+// Only these types carry a harness-version claim. Keeping it off every event keeps the line small; the
+// two that carry it are the two that exist to answer "what code is this host running against our
+// ledger?" — a run's opening statement, and a per-host heartbeat for a host that never runs `init-run`.
+export const VERSION_BEARING_EVENT_TYPES = new Set(["run_started", "host_heartbeat"]);
+
+// uuid v7: 48-bit big-endian unix-ms prefix + 74 random bits, so ids from any source sort by creation
+// time as plain strings. Node has no built-in v7 (randomUUID is v4, which sorts randomly).
+export function uuidv7(ms = Date.now(), rand = randomBytes(10)) {
+  const b = Buffer.alloc(16);
+  b.writeUIntBE(Math.max(0, Math.min(ms, 0xffffffffffff)), 0, 6);
+  Buffer.from(rand).copy(b, 6, 0, 10);
+  b[6] = (b[6] & 0x0f) | 0x70; // version 7
+  b[8] = (b[8] & 0x3f) | 0x80; // variant 10xx
+  const h = b.toString("hex");
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
+}
+
+let SOURCE_ID = null;
+let SOURCE_SEQ = 0;
+
+// One process = one source. `WORK_SOURCE_ID` exists so a wrapper can name a writer explicitly (and so
+// this is testable); everything else is derived, never configured, because a source_id an operator can
+// mistype is a source_id two writers can share.
+export function getSourceId() {
+  if (SOURCE_ID) return SOURCE_ID;
+  const env = process.env.WORK_SOURCE_ID;
+  if (typeof env === "string" && env.trim()) {
+    SOURCE_ID = env.trim().slice(0, 120);
+    return SOURCE_ID;
+  }
+  const host = String(hostname() || "host").split(".")[0] || "host";
+  SOURCE_ID = `${host}:${process.pid}:${randomBytes(3).toString("hex")}`;
+  return SOURCE_ID;
+}
+
+let HARNESS_VERSION_CACHE = null;
+
+// VERSION at the repo root is the single source of truth (repo-contract.test.mjs pins it against the
+// changelog) — read it, never hardcode it. Fails CLOSED to the literal string "unknown", which counts
+// as a DISTINCT version for skew purposes: an "unknown" host alongside a "0.2.0" host is exactly the
+// situation this is meant to refuse.
+//
+// KNOWN GAP: `install.sh` copies `skills/` and `hooks/` but NOT `VERSION`, so a host running from
+// `~/.claude/skills/work/` finds no VERSION file and reports "unknown". Two such hosts therefore look
+// same-version to each other. Closing it is a one-line `cp "$SRC/VERSION" "$DEST/VERSION"` in the
+// installer plus the `../../VERSION` candidate below; until then, `WORK_HARNESS_VERSION` is the override.
+export function getHarnessVersion() {
+  const env = process.env.WORK_HARNESS_VERSION;
+  if (typeof env === "string" && env.trim()) return env.trim();
+  if (HARNESS_VERSION_CACHE) return HARNESS_VERSION_CACHE;
+  for (const rel of ["../../VERSION", "../VERSION", "../../../VERSION"]) {
+    try {
+      const v = readFileSync(new URL(rel, import.meta.url), "utf8").trim();
+      if (/^\d+\.\d+\.\d+/.test(v)) {
+        HARNESS_VERSION_CACHE = v;
+        return v;
+      }
+    } catch { /* try the next candidate layout */ }
+  }
+  return "unknown";
+}
+
+// Pure-ish (reads the process's source id + clock): the exact line `appendEvent` writes. Exported so the
+// stamp can be asserted without touching a filesystem.
+export function stampEvent(event, { now = new Date() } = {}) {
+  const e = { ...event };
+  if (!e.ts) e.ts = now.toISOString();
+  // ORIGIN vs RELAY. An event that already carries an event_id was minted somewhere else (a mini's local
+  // ledger, a successor's replay) — its identity, sequence and schema are FACTS about that writer and
+  // must survive the relay, or the same event arriving twice can never be recognized as one event.
+  const relayed = typeof e.event_id === "string" && e.event_id.length > 0;
+  if (!relayed) {
+    e.event_id = uuidv7(now.getTime());
+    e.source_id = getSourceId();
+    SOURCE_SEQ += 1; // assigned synchronously, BEFORE any await — two racing appends must not share a seq
+    e.seq = SOURCE_SEQ;
+    e.schema_version = LEDGER_SCHEMA_VERSION;
+    // A version claim is only ever THIS process's own reading of VERSION. Stamped unconditionally for
+    // these types (never read from the payload) so an `append`-ed heartbeat cannot vouch for a version
+    // it isn't running.
+    if (VERSION_BEARING_EVENT_TYPES.has(e.type)) e.harness_version = getHarnessVersion();
+  }
+  // Always ours: this is the receiving ledger's arrival time. A re-pull of the same remote line therefore
+  // differs from its predecessor in received_at only — and dedups on event_id.
+  e.received_at = now.toISOString();
+  return e;
+}
+
 export async function appendEvent(runDir, event) {
   await mkdir(runDir, { recursive: true });
-  const e = { ...event };
-  if (!e.ts) e.ts = new Date().toISOString();
+  const e = stampEvent(event);
   await appendFile(join(runDir, "events.jsonl"), `${JSON.stringify(e)}\n`, "utf8");
+  return e;
+}
+
+// Exactly-once read (DER-2748). Drops a line only on EXACT IDENTITY collision: an `event_id` already
+// seen, or a `(source_id, seq)` pair already seen. Legacy lines carry neither and are NEVER dropped.
+//
+// Deliberately NOT the issue's literal "a lower seq than already seen is ignored". `readEvents` sorts by
+// effective ts (DER-2520), so a source whose clock steps BACKWARD yields seq 1,3,2 in fold order — the
+// literal rule would then delete seq 2, a real event, permanently. Clock skew is a diagnostic
+// (`ledgerProtocolVerdict().out_of_order`), never a licence to discard. `(source_id, seq)` still catches
+// a replay whose event_id was regenerated, which is the case a pure id check would miss.
+export function dedupeLedgerEvents(events = []) {
+  const seenIds = new Set();
+  const seenSourceSeq = new Set();
+  const out = [];
+  for (const e of events) {
+    const id = e && typeof e.event_id === "string" && e.event_id ? e.event_id : null;
+    const src = e && typeof e.source_id === "string" && e.source_id ? e.source_id : null;
+    const pair = src && Number.isFinite(e.seq) ? `${src}#${e.seq}` : null;
+    if ((id && seenIds.has(id)) || (pair && seenSourceSeq.has(pair))) continue;
+    if (id) seenIds.add(id);
+    if (pair) seenSourceSeq.add(pair);
+    out.push(e);
+  }
+  return out;
+}
+
+// Protocol health of a ledger, as data. Pure. Two independent verdicts:
+//   FOREIGN schema_version ⇒ not ok. We cannot claim to fold a wire version we don't implement, and a
+//     silent best-effort fold is the failure mode this whole unit exists to remove. Unparseable counts as
+//     foreign (fail closed) rather than "probably fine".
+//   MIXED harness_version ⇒ not ok. More than one distinct version across `run_started`/`host_heartbeat`
+//     means two hosts are running different harness code against ONE ledger. "unknown" is a distinct
+//     value on purpose.
+// `legacy_events` and `out_of_order` are reported but never fatal.
+export function ledgerProtocolVerdict(events = []) {
+  const schemaVersions = new Set();
+  const foreign = new Set();
+  let legacy = 0;
+  const versionSources = new Map(); // harness_version -> Set of "source_id/host" labels
+  const maxSeq = new Map();
+  const outOfOrder = [];
+  for (const e of events) {
+    if (!e || typeof e !== "object") continue;
+    if (e.schema_version === undefined || e.schema_version === null) legacy += 1;
+    else if (Number.isInteger(e.schema_version) && e.schema_version >= 1 && e.schema_version <= LEDGER_SCHEMA_VERSION) schemaVersions.add(e.schema_version);
+    else foreign.add(typeof e.schema_version === "number" ? e.schema_version : String(e.schema_version));
+    if (VERSION_BEARING_EVENT_TYPES.has(e.type)) {
+      const v = typeof e.harness_version === "string" && e.harness_version ? e.harness_version : "unknown";
+      if (!versionSources.has(v)) versionSources.set(v, new Set());
+      versionSources.get(v).add(e.host ? `${e.host} (${e.source_id ?? "?"})` : (e.source_id ?? "?"));
+    }
+    if (typeof e.source_id === "string" && e.source_id && Number.isFinite(e.seq)) {
+      const seen = maxSeq.get(e.source_id);
+      if (seen !== undefined && e.seq < seen) outOfOrder.push({ source_id: e.source_id, seq: e.seq, after: seen });
+      else maxSeq.set(e.source_id, e.seq);
+    }
+  }
+  const harnessVersions = [...versionSources.keys()].sort();
+  const reasons = [];
+  if (foreign.size) {
+    reasons.push(
+      `foreign schema_version in the ledger: ${[...foreign].join(", ")} (this harness implements ${LEDGER_SCHEMA_VERSION}). ` +
+      `Refusing rather than folding a wire version it cannot interpret — upgrade this host, or run against a ledger written by a build you have.`,
+    );
+  }
+  if (harnessVersions.length > 1) {
+    reasons.push(
+      `mixed harness version on ONE ledger: ${harnessVersions.map((v) => `${v} [${[...versionSources.get(v)].join(", ")}]`).join(" vs ")}. ` +
+      `Different harness code folding one ledger is how two hosts silently disagree about a run's state. ` +
+      `Re-install the lagging host (install.sh) so every host reports the same VERSION, or pass --allow-version-skew to proceed DELIBERATELY.`,
+    );
+  }
+  return {
+    ok: reasons.length === 0,
+    schema_version: LEDGER_SCHEMA_VERSION,
+    schema_versions: [...schemaVersions].sort((a, b) => a - b),
+    foreign_schema_versions: [...foreign].sort(),
+    legacy_events: legacy,
+    harness_versions: harnessVersions,
+    harness_version_sources: Object.fromEntries([...versionSources].map(([v, s]) => [v, [...s].sort()])),
+    out_of_order: outOfOrder,
+    reasons,
+  };
+}
+
+// Subcommands that COMMIT MORE WORK to a ledger. A version-skewed ledger must stop here rather than at
+// the post-mortem: everything downstream of a dispatch (the fold the new session reads, the events it
+// appends) assumes one wire protocol. NOT exempt for --dry-run — unlike `assertExistingRunDir` (where a
+// preview genuinely cannot fork a ledger), a dry-run prints a boot command the operator then pastes, so
+// a preview that hides the skew hides it at exactly the moment it would be acted on.
+const VERSION_GATED_SUBCOMMANDS = new Set(["spawn-lead", "spawn-shepherd", "spawn-orch", "rotate-lead", "rotate-shepherd"]);
+
+export function assertLedgerProtocolCompatible(verdict, subcommand, { allowSkew = false } = {}) {
+  if (!verdict || verdict.ok) return;
+  // `--allow-version-skew` is a DELIBERATE degrade for harness-version skew (mid-run upgrade of one
+  // host, and the operator has decided the difference is immaterial). A FOREIGN schema_version is never
+  // overridable: there is no degraded mode for "lines this build cannot parse".
+  const foreign = verdict.foreign_schema_versions?.length ? verdict.reasons.filter((r) => r.startsWith("foreign schema_version")) : [];
+  const blocking = allowSkew ? foreign : verdict.reasons;
+  if (!blocking.length) return;
+  throw new Error(
+    `refusing to run "${subcommand}" against this ledger:\n` +
+      blocking.map((r) => `  - ${r}`).join("\n") +
+      `\n  (this is DER-2748 — see \`state\`'s "protocol" block for the full picture)`,
+  );
 }
 
 // Timestamp-ordered fold (DER-2520). The ledger file is append-only, but appends are NOT in event-time
@@ -2477,14 +2709,23 @@ export async function readEvents(runDir) {
     throw err;
   }
   // Sorted at the single choke point every consumer reads through, so the fold, the derived-event
-  // suppression set, and "latest kickback" queries all see event-time order (DER-2520). Length is
-  // unchanged, so `watch --since <count>` cursors keep working.
-  return sortEventsByTs(
+  // suppression set, and "latest kickback" queries all see event-time order (DER-2520).
+  //
+  // Then deduped by IDENTITY (DER-2748), at the same choke point and for the same reason: a duplicate
+  // delivery is not news, and doing it here means every consumer — the fold, `derivedEventSeen`,
+  // `kickbackDossier`, `watch` — sees each event once without each re-deriving the rule. Sort BEFORE
+  // dedup so the surviving copy is the earliest by event time. Legacy lines carry no identity and are
+  // never dropped, so this cannot shrink a pre-0.2.0 ledger.
+  //
+  // Cursor contract (DER-2520/DER-2741): appends only ever ADD lines and dedup is deterministic on
+  // content, so the returned length is monotonic NON-DECREASING — `watch --since <count>` still works,
+  // and a pure re-pull correctly fails to advance it.
+  return dedupeLedgerEvents(sortEventsByTs(
     body
       .split("\n")
       .filter((line) => line.trim())
       .map((line) => JSON.parse(line)),
-  );
+  ));
 }
 
 // Parse raw ledger lines pulled from a remote host's local events.jsonl (the mini), tagging each with
@@ -2925,6 +3166,10 @@ export function materializeState(rawEvents, meta = {}) {
     // invisible to the worktree-keyed pull probe — finally show up in context accounting, and it
     // keeps reporting for rotated-out originals until their workspace closes. `window:null` means
     // the window is honestly unknown (never guessed); `used` is still real.
+    // Wire-protocol health (DER-2748). Always present, so a successor reading only `state.json` learns
+    // that this ledger holds a foreign schema or two harness versions WITHOUT having to hit the dispatch
+    // refusal to find out. `ok:false` is what the dispatch gate blocks on.
+    protocol: ledgerProtocolVerdict(rawEvents ?? events),
     session_context: (() => {
       const m = {};
       for (const e of events) {
@@ -3490,8 +3735,14 @@ const REOPENABLE_DERIVED = new Set(["lead_online", "handed_off"]);
 // for a lead that had been dead for 90 minutes. Key on (type, issue, content-hash), where the hash
 // excludes the volatile fields append stamps (`ts`) so a stored copy and a fresh derivation collide.
 function contentHash(e) {
+  // Excludes EVERY field `appendEvent` stamps (STAMPED_EVENT_FIELDS), not just `ts`. This is the seam
+  // DER-2748 could have broken silently: the key is computed on a FRESH derivation (unstamped) and
+  // compared against keys built from STORED events (stamped), so if event_id/seq/received_at reached the
+  // hash the two could never match, the suppression set would stop suppressing, and DER-2519's measured
+  // failure would return — 129 byte-identical plan_scope events, 11.6% of a 1,114-event ledger,
+  // manufacturing a liveness signal for a lead that had been dead 90 minutes.
   const entries = Object.entries(e ?? {})
-    .filter(([k]) => k !== "ts")
+    .filter(([k]) => !STAMPED_FIELD_SET.has(k))
     .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
   const s = JSON.stringify(entries);
   let h = 5381;
@@ -3754,6 +4005,11 @@ export async function runSubcommand(argv) {
   const runDir = o.runId ? join(runsRoot, o.runId) : null;
   // DER-2570 — a named run must already exist; only init-run may create one. See assertExistingRunDir.
   assertExistingRunDir(runDir, runsRoot, o.subcommand, { dryRun: o.dryRun });
+  // DER-2748 — before committing MORE work to this ledger, check that we can read it: no foreign wire
+  // version, and not two harness versions folding one run. Reads the ledger once; dispatch is rare.
+  if (runDir && VERSION_GATED_SUBCOMMANDS.has(o.subcommand)) {
+    assertLedgerProtocolCompatible(ledgerProtocolVerdict(await readEvents(runDir)), o.subcommand, { allowSkew: !!o.allowVersionSkew });
+  }
 
   switch (o.subcommand) {
     case "init-run": {
@@ -4215,6 +4471,31 @@ export async function runSubcommand(argv) {
       const event = JSON.parse(o.rest[0] ?? o.event ?? "{}");
       await appendEvent(runDir, event);
       return { stdout: "ok" };
+    }
+    // DER-2748 — a host says, in the ledger, which harness code it is running. `run_started` covers the
+    // host that opened the run; every OTHER host (a mini reached over ssh, a successor orchestrator) only
+    // ever appends lifecycle events and would otherwise never declare a version, which is precisely the
+    // blind spot that let two hosts fold one ledger with different code. Run this once per host per run
+    // (e.g. right after `create-worktree --host mini`), and again after upgrading a host mid-run.
+    // The version stamped is the APPENDING process's own reading of VERSION — never a payload claim.
+    //
+    // RUN IT ON THE HOST. `--host` is a LABEL; the attestation is about whichever machine executes this
+    // line. `ssh mini 'node ~/.claude/skills/work/work-runner.mjs heartbeat --run <r> --host mini …'` —
+    // the mini writes it to its own ledger and `pull-host` relays it with its identity intact. Running
+    // `heartbeat --host mini` locally records the LOCAL version under the mini's label; that is a
+    // mislabel, not a forgery, and it stays visible in `state.protocol.harness_version_sources`, where
+    // the `source_id` names the machine that actually appended it.
+    case "heartbeat": {
+      const ev = await appendEvent(runDir, {
+        actor: o.actor ?? "orch", type: "host_heartbeat",
+        host: o.host ?? "local",
+        ...(o.note ? { note: o.note } : {}),
+      });
+      const verdict = ledgerProtocolVerdict(await readEvents(runDir));
+      return {
+        stdout: `${ev.host} ${ev.harness_version}${verdict.ok ? "" : `\n${verdict.reasons.map((r) => `WARNING: ${r}`).join("\n")}`}`,
+        host: ev.host, harnessVersion: ev.harness_version, schemaVersion: ev.schema_version, protocol: verdict,
+      };
     }
     case "state": {
       const events = await readEvents(runDir);
@@ -5004,6 +5285,10 @@ export async function runSubcommand(argv) {
               leads_dead: (st.leads_dead ?? []).map((r) => r.issue),
               context_unreadable: (st.lead_context_unreadable ?? []).map((r) => r.issue),
               budget_tripped: (st.budget_trips ?? []).filter((t) => t.level === "tripped").map((t) => t.issue),
+              // DER-2748: a version-skewed ledger surfaces on EVERY wake, not only when the orchestrator
+              // happens to run `state`. It already blocks dispatch; this is how the operator learns why
+              // before they hit the refusal. `state.protocol.reasons` names the hosts.
+              protocol_skew: !(st.protocol?.ok ?? true),
             },
           });
         };
@@ -5066,6 +5351,10 @@ already busts it (over plan), which is the cheapest moment to split. Runs with n
   spawn-shepherd --run <r> [--project p] [--dry-run]
   spawn-orch --run <r> [--project p] [--model m] [--dry-run]   boot a SUCCESSOR orchestrator (/work resume <r>) — routine rotation
   append --run <r> '<event-json>'             atomic append to events.jsonl
+  heartbeat --run <r> [--host <name>]         record THIS host's harness version in the ledger (DER-2748) —
+                                              RUN IT ON THE HOST (over ssh for a mini); --host is a label.
+                                              Once per host per run; mixed versions then REFUSE dispatch
+                                              (override deliberately with --allow-version-skew)
   state --run <r>                             materialize + print state.json
   usage --run <r> | usage --all               fold token_usage telemetry → usage.json/usage.md (per-run) or the cross-run fleet view
   lead-context --run <r> [--emit] [--json]    read every in-flight lead's context utilization (local + mini; cloud is not pollable)

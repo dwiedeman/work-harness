@@ -62,7 +62,38 @@ export function readEvents(runDir) {
     if (!d || typeof d !== "object" || !d.type) continue;
     events.push(d);
   }
-  return events;
+  return dedupeLedgerEvents(events);
+}
+
+// Exactly-once read (DER-2748). MUST stay behaviourally identical to work-runner.mjs's
+// `dedupeLedgerEvents`: two instruments that disagree about the same ledger is the DER-2581 defect class,
+// and this one disagreeing was measured — one duplicated `token_usage` line reported 165 tokens here
+// against the runner's correct 110, because a relayed replay was folded twice.
+//
+// Deliberately DUPLICATED rather than imported: this module's contract (see the header) is that it is
+// standalone and imports nothing from work-runner.mjs, so it can be dropped into a fresh checkout alone.
+// The duplication is made safe by an agreement test in work-metrics.test.mjs that runs both
+// implementations over one table of ledgers and asserts identical output — drift fails CI.
+//
+// Drops a line only on EXACT IDENTITY collision: an `event_id` already seen, or a `(source_id, seq)`
+// pair already seen. Legacy lines (pre-0.2.0) carry neither and are NEVER dropped — that is the live
+// shape for the two SessionEnd hooks, not merely an archived one. A lower-but-unseen `seq` is a late
+// arrival, not a duplicate: `readEvents` order can put a backwards-clock source at 1,3,2, and discarding
+// seq 2 there would delete a real event permanently.
+export function dedupeLedgerEvents(events = []) {
+  const seenIds = new Set();
+  const seenSourceSeq = new Set();
+  const out = [];
+  for (const e of events) {
+    const id = e && typeof e.event_id === "string" && e.event_id ? e.event_id : null;
+    const src = e && typeof e.source_id === "string" && e.source_id ? e.source_id : null;
+    const pair = src && Number.isFinite(e.seq) ? `${src}#${e.seq}` : null;
+    if ((id && seenIds.has(id)) || (pair && seenSourceSeq.has(pair))) continue;
+    if (id) seenIds.add(id);
+    if (pair) seenSourceSeq.add(pair);
+    out.push(e);
+  }
+  return out;
 }
 
 export function loadUsageJson(runDir) {

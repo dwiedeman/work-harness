@@ -432,3 +432,75 @@ test("findRunDirs: skips files and non-run dirs, includes a symlinked-in run dir
     rmSync(realRun, { recursive: true, force: true });
   }
 });
+
+// ---- DER-2748: this reader must agree with the runner's about one ledger --------------------------
+// Measured before the fix: a single duplicated `token_usage` line reported 165 tokens here against the
+// runner's correct 110, because a relayed replay was folded twice. Two instruments disagreeing about one
+// ledger is the DER-2581 defect class, so the dedup rule is duplicated (this module is standalone by
+// contract) and pinned by the agreement test below.
+import { readEvents as wmReadEvents, dedupeLedgerEvents as wmDedupe } from "./work-metrics.mjs";
+import { dedupeLedgerEvents as runnerDedupe } from "./work-runner.mjs";
+
+const stamped = (over = {}) => ({
+  actor: "lead:DER-1", type: "token_usage", role: "lead",
+  by_model: { "claude-opus-5": { input: 10, output: 10 } }, total_tokens: 55,
+  event_id: "0193aaa-1", source_id: "hostA:11:n1", seq: 1, schema_version: 1,
+  ts: "2026-07-29T01:00:00.000Z", ...over,
+});
+
+function ledgerDir(events) {
+  const dir = mkdtempSync(join(tmpdir(), "wm-dedupe-"));
+  writeFileSync(join(dir, "events.jsonl"), `${events.map((e) => JSON.stringify(e)).join("\n")}\n`, "utf8");
+  return dir;
+}
+
+test("DER-2748: a duplicated ledger line is folded ONCE, matching the runner's total", () => {
+  const dup = stamped();
+  const distinct = stamped({ event_id: "0193aaa-2", seq: 2 });
+  const dir = ledgerDir([dup, dup, distinct]);
+  try {
+    const events = wmReadEvents(dir);
+    const total = events.filter((e) => e.type === "token_usage").reduce((a, e) => a + e.total_tokens, 0);
+    assert.equal(events.length, 2, "the replayed line must not appear twice");
+    assert.equal(total, 110, "a replay must not inflate reported spend (was 165 — the measured bug)");
+    // CONTROL: the two DISTINCT events are both kept — dedup must not eat real events.
+    assert.deepEqual(events.map((e) => e.seq), [1, 2]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("DER-2748 CONTROL: a LEGACY ledger (no event_id, no source_id) loses nothing", () => {
+  // The two SessionEnd hooks still append unstamped lines, so this is the LIVE shape, not just history.
+  // A dedup rule that keyed on absent fields would silently collapse them into one.
+  const legacy = { actor: "lead:DER-9", type: "token_usage", role: "lead", by_model: { m: { input: 1 } }, total_tokens: 7 };
+  const dir = ledgerDir([legacy, legacy, legacy]);
+  try {
+    assert.equal(wmReadEvents(dir).length, 3, "legacy lines carry no identity and must never be dropped");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("DER-2748: work-metrics' dedup rule AGREES with work-runner's, ledger for ledger", () => {
+  // This test is what makes duplicating the rule safe instead of reckless. If either copy drifts, it fails.
+  const a = stamped();
+  const b = stamped({ event_id: "0193aaa-2", seq: 2 });
+  const idOnly = stamped({ event_id: "0193aaa-3", source_id: undefined, seq: undefined });
+  const pairOnly = stamped({ event_id: undefined, source_id: "hostB:22:n2", seq: 5 });
+  const legacy = { type: "reaped", issue: "DER-3" };
+  const ledgers = [
+    [a, a, b],                               // id replay
+    [pairOnly, { ...pairOnly, event_id: "regenerated" }], // same (source,seq), new id
+    [idOnly, idOnly, b],                     // id-only identity
+    [legacy, legacy],                        // no identity at all
+    [a, b, pairOnly, idOnly, legacy],        // mixed
+    [],                                      // empty
+  ];
+  for (const [i, ledger] of ledgers.entries()) {
+    assert.deepEqual(
+      wmDedupe(ledger), runnerDedupe(ledger),
+      `ledger ${i}: work-metrics and work-runner must fold identically`,
+    );
+  }
+});

@@ -8,6 +8,16 @@ echo "Installing from $SRC → $DEST"
 mkdir -p "$DEST/skills" "$DEST/hooks"
 cp -R "$SRC/skills/." "$DEST/skills/"
 cp -R "$SRC/hooks/."  "$DEST/hooks/"
+# VERSION is part of the shipped payload, not just repo metadata: the runner reads the harness version
+# from `<skillsDir>/../../VERSION`, which resolves to `$DEST/VERSION` once installed (DER-2748). Without
+# it the installed harness reports `harness_version: "unknown"` — and the failure is subtle in the worst
+# way, because TWO installed hosts then look same-version to each other, which is precisely the skew the
+# version check exists to catch. The suite also passes in a checkout and fails only from ~/.claude.
+if [ ! -f "$SRC/VERSION" ]; then
+  echo "INSTALL FAILED: $SRC/VERSION is missing — refusing to install a harness that cannot report its own version." >&2
+  exit 1
+fi
+cp "$SRC/VERSION" "$DEST/VERSION"
 
 echo
 echo "Installed:"
