@@ -41,9 +41,14 @@ const LIVE = process.env.WORK_E2E_LIVE === "1";
 // The CLI as a real subprocess. TIMEOUT is reported separately from FAILURE on purpose (DER-2829): a
 // killed process and a refusing process are different facts, and collapsing them is how a false RED
 // teaches an operator to stop trusting the gate.
-function cli(args, { timeoutMs = 30000, cwd = REPO } = {}) {
+function cli(args, { timeoutMs = 30000, cwd = REPO, env = null } = {}) {
   return new Promise((resolve) => {
-    execFile(process.execPath, [RUNNER, ...args], { timeout: timeoutMs, cwd, encoding: "utf8" }, (err, stdout, stderr) => {
+    // `env` plays a host on a DIFFERENT BUILD (WORK_HARNESS_VERSION) without a second checkout — the
+    // subprocess analogue of the unit suite's withHarnessVersion. Merged onto the parent env, never
+    // replacing it: a bare env loses PATH and the child fails for a reason that has nothing to do with
+    // the case under test.
+    const opts = { timeout: timeoutMs, cwd, encoding: "utf8", ...(env ? { env: { ...process.env, ...env } } : {}) };
+    execFile(process.execPath, [RUNNER, ...args], opts, (err, stdout, stderr) => {
       const timedOut = !!(err && (err.killed || err.signal === "SIGTERM"));
       resolve({
         code: timedOut ? null : (err?.code ?? 0), // null === UNKNOWN, never conflated with a refusal
@@ -181,6 +186,150 @@ test("FAULT complete-run with a non-terminal unit: refused; and the SAME run com
   await R.append({ actor: "orch", type: "pr_merged", issue: "DER-1", pr: 1 });
   await R.append({ actor: "orch", type: "reaped", issue: "DER-1" });
   succeeded(await R.run(["complete-run", "--run", R.runId]));
+
+  // DER-2838 — and the marker it wrote carries the receipt the fold requires. Asserted on the LINE ON
+  // DISK rather than on the command's own report: "complete-run said it completed" is the claim under
+  // test, not the evidence for it.
+  const marker = (await R.events()).map((l) => JSON.parse(l)).find((e) => e.type === "run_completed");
+  assert.ok(marker, "complete-run must have appended a run_completed");
+  assert.equal(marker.completion_receipt?.receipt_version, 1, `the marker must carry a versioned receipt: ${JSON.stringify(marker)}`);
+  assert.deepEqual(marker.completion_receipt.units, ["DER-1"], "…naming the units the gate vouched for");
+});
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// DER-2838 — A RUN'S TERMINAL STATE CANNOT BE CLAIMED BY WRITING TO THE FILE
+//
+// The fold used to accept the FIRST `run_completed` unconditionally, and the generic `append` relay
+// reserved only `gate_adjudication`. So a hand-written line ended the run and every DER-2781 check was
+// moot. This is the case the unit suite structurally cannot make on its own: the receipt has to be
+// rejected by the REAL reader, reading a REAL ledger, from a line written the way an attacker writes one.
+//
+// THE TRAP THIS CASE IS BUILT TO AVOID: a hand-written line normally folds as `unknown` because it skips
+// `stampEvent` (see appendRaw above), so a forgery test can go green for a reason that has nothing to do
+// with the receipt. Every forged line below is therefore stamped with the SAME field set a real
+// `appendEvent` writes — copied off a real event in the same ledger, and asserted to be complete — and
+// cases (b) and (c) differ from each other in EXACTLY ONE FIELD: `completion_receipt`. That pair is the
+// proof that the receipt, and nothing else, is what refuses.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+// The stamp `appendEvent` puts on every origin line. Named here so the forgeries can be held to it.
+const STAMP_FIELDS = ["ts", "event_id", "source_id", "seq", "schema_version", "received_at"];
+
+// A `run_completed` line written the way an attacker writes one: straight into events.jsonl, but
+// indistinguishable from a stamped line. `donor` is a real event from the same ledger, so the forgery
+// inherits that ledger's real `source_id`/`schema_version` instead of a guess.
+function forgedCompletion(donor, { runId, units, receipt = null, seq = 9001, ts = "2126-07-30T23:59:00.000Z" }) {
+  for (const k of STAMP_FIELDS) {
+    assert.notEqual(donor[k], undefined, `the donor event is missing ${k} — the forgery would then be under-stamped and could be refused for the wrong reason`);
+  }
+  return `${JSON.stringify({
+    ts, received_at: ts,
+    event_id: `0197e000-0000-7000-8000-00000000f${String(seq).slice(-3)}`,
+    source_id: donor.source_id, seq, schema_version: donor.schema_version,
+    actor: "orch", type: "run_completed", run_id: runId, units, unit_count: units.length,
+    ...(receipt ? { completion_receipt: receipt } : {}),
+  })}\n`;
+}
+
+const validReceipt = (runId, units) => ({
+  receipt_version: 1, run_id: runId, units: [...units].sort(), unit_count: units.length,
+  checks_passed: ["kickbacks_pending", "ledger_health", "ledger_held_fragments", "ledger_quarantine", "protocol", "units_terminal", "units_tracked"],
+  harness_version: "0.2.0", allow_version_skew: false, minted_by: "e2e:0:00",
+});
+
+test("FAULT forged run_completed: a hand-appended terminal marker does NOT end the run (DER-2838 #5)", async (t) => {
+  const R = await newRun(t);
+  await seedUnit(R); // DER-1 is at pr_open — ACTIVE
+  const donor = (await R.events()).map((l) => JSON.parse(l)).find((e) => e.type === "pr_opened");
+
+  // (a) THE ATTACK: an ACTIVE run, marked complete by a line nobody gated. On the parent commit this
+  //     reads `completed` and all seven DER-2781 checks are bypassed.
+  await R.appendRaw(forgedCompletion(donor, { runId: R.runId, units: ["DER-1"], seq: 9001 }));
+  const active = await R.state();
+  assert.equal(active.status, "running", "a forged marker must not end a run with a live unit");
+  assert.ok((active.run_completion_rejected ?? []).length >= 1, "…and the rejection must be VISIBLE, not silent");
+
+  // (a2) THE SAME ATTACK WITH A WELL-FORMED RECEIPT. Case (a) alone is refused for MISSING a receipt, so
+  //      on its own it says nothing about the cross-check — measured: with the ledger cross-check
+  //      neutered, (a) stayed green. This is the case that fails there. A forger who writes a perfect
+  //      receipt still cannot complete a run holding a `pr_open` unit, because the fold derives
+  //      terminality from the ledger and no receipt field moves it.
+  await R.appendRaw(forgedCompletion(donor, { runId: R.runId, units: ["DER-1"], seq: 9004, ts: "2126-07-30T23:59:30.000Z", receipt: validReceipt(R.runId, ["DER-1"]) }));
+  const receiptedForgery = await R.state();
+  assert.equal(receiptedForgery.status, "running", "a well-formed receipt must not complete a run with a live unit");
+  assert.match(String(receiptedForgery.run_completion_rejected?.at(-1)?.reason ?? ""), /NOT terminal/,
+    "…and the rejection must name the ledger fact that refused it, not the receipt's shape");
+
+  // (b) THE SAME FORGERY over an ALL-TERMINAL run: still refused. Terminality alone is not the receipt.
+  const R2 = await newRun(t);
+  await seedUnit(R2);
+  await R2.append({ actor: "orch", type: "pr_merged", issue: "DER-1", pr: 1 });
+  await R2.append({ actor: "orch", type: "reaped", issue: "DER-1" });
+  const donor2 = (await R2.events()).map((l) => JSON.parse(l)).find((e) => e.type === "reaped");
+  await R2.appendRaw(forgedCompletion(donor2, { runId: R2.runId, units: ["DER-1"], seq: 9002 }));
+  const unreceipted = await R2.state();
+  assert.equal(unreceipted.status, "running", "an unreceipted marker is not a completion even when the units really are terminal");
+  assert.match(String(unreceipted.run_completion_rejected?.[0]?.reason ?? ""), /receipt/i,
+    "the reason must be the RECEIPT — if it names the stamp or the version, this case proves nothing about DER-2838");
+
+  // (c) CONTROL, and the discriminator: the SAME line as (b), same run, same raw write, same stamp —
+  //     plus a valid receipt. It completes. So (b) was refused by the receipt check and by nothing else.
+  const R3 = await newRun(t);
+  await seedUnit(R3);
+  await R3.append({ actor: "orch", type: "pr_merged", issue: "DER-1", pr: 1 });
+  await R3.append({ actor: "orch", type: "reaped", issue: "DER-1" });
+  const donor3 = (await R3.events()).map((l) => JSON.parse(l)).find((e) => e.type === "reaped");
+  await R3.appendRaw(forgedCompletion(donor3, { runId: R3.runId, units: ["DER-1"], seq: 9003, receipt: validReceipt(R3.runId, ["DER-1"]) }));
+  const receipted = await R3.state();
+  assert.equal(receipted.status, "completed",
+    "a receipted marker over an all-terminal run MUST complete it — otherwise the fix broke completion instead of gating it");
+  assert.deepEqual(receipted.run_completion_rejected, []);
+});
+
+test("FAULT `append` refuses a run_completed — the write-time reservation (DER-2838 #5)", async (t) => {
+  const R = await newRun(t);
+  await seedUnit(R);
+  await R.append({ actor: "orch", type: "pr_merged", issue: "DER-1", pr: 1 });
+  await R.append({ actor: "orch", type: "reaped", issue: "DER-1" });
+  const before = (await R.events()).length;
+
+  const r = await R.run(["append", "--run", R.runId, JSON.stringify({ actor: "orch", type: "run_completed", run_id: R.runId, units: ["DER-1"], unit_count: 1 })]);
+  refused(r);
+  assert.match(r.out, /run_completed/, "the refusal must name the reserved type");
+  assert.match(r.out, /complete-run/, "…and point at the subcommand that owns it");
+  assert.equal((await R.events()).length, before, "a refused append must write NOTHING");
+
+  // CONTROL — `append` still relays everything else. Without it, this case is satisfied by an `append`
+  // that refuses its whole input.
+  succeeded(await R.run(["append", "--run", R.runId, JSON.stringify({ actor: "orch", type: "note", note: "ok" })]));
+  assert.equal((await R.events()).length, before + 1);
+
+  // …and the reserved path still works: the real subcommand completes the same run.
+  succeeded(await R.run(["complete-run", "--run", R.runId]));
+});
+
+test("FAULT complete-run from a DIFFERENT harness build is refused (DER-2838 #8)", async (t) => {
+  // DER-2779 gave dispatch the missing half — the ACTING process's own version is one of the versions
+  // compared. `complete-run` never got it, so a caller on another build passed the protocol check and
+  // then auto-attested its version during the append, leaving the completed run mixed.
+  const R = await newRun(t);
+  await seedUnit(R);
+  await R.append({ actor: "orch", type: "pr_merged", issue: "DER-1", pr: 1 });
+  await R.append({ actor: "orch", type: "reaped", issue: "DER-1" });
+
+  const skewed = await R.run(["complete-run", "--run", R.runId], { env: { WORK_HARNESS_VERSION: "9.9.9" } });
+  refused(skewed);
+  assert.match(skewed.out, /mixed harness version/i, "the refusal must name the protocol finding");
+  assert.match(skewed.out, /9\.9\.9/, "…and the version THIS process is running");
+  assert.equal((await R.state()).status, "running", "nothing was appended and the run is still open");
+
+  // CONTROL 1 — the documented escape reaches this refusal too, or a mid-run-upgraded host could never
+  // close the run it is holding.
+  succeeded(await R.run(["complete-run", "--run", R.runId, "--dry-run", "--allow-version-skew"], { env: { WORK_HARNESS_VERSION: "9.9.9" } }));
+  // CONTROL 2 — a same-version caller still completes. Proves the gate discriminates on the version
+  // rather than refusing every completion.
+  succeeded(await R.run(["complete-run", "--run", R.runId]));
+  assert.equal((await R.state()).status, "completed");
 });
 
 test("FAULT version skew: a second harness_version in one ledger blocks dispatch; --allow-version-skew is the documented escape (DER-2748, DER-2779)", async (t) => {

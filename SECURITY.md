@@ -50,7 +50,24 @@ operator may record a `gate_adjudication`" is a documented convention enforced b
 that every waiver is printed loudly — not by authentication. An agent with filesystem access can name an
 operator.
 
-The same applies to other privileged events, including run completion.
+The same applies to other privileged events, including run completion — with one distinction worth
+stating precisely, because it is easy to read as more than it is.
+
+`run_completed` — the event that declares a run finished, and so retires all seven of its completion
+checks — is **reserved and receipted** (DER-2838). `append` refuses the type outright, and the fold
+ignores any marker that does not carry a **completion receipt**: the record `complete-run` writes naming
+the units it vouched for, the checks it evaluated, and the build it ran. On read, the fold re-derives the
+ledger-checkable half of that claim — is this run tracking anything, is every tracked unit terminal, are
+those exactly the units the receipt names — and ignores the marker when the ledger disagrees.
+
+**That is integrity, not authentication.** `minted_by` is an unauthenticated string with exactly the
+standing of `adjudicated_by`; there is no key, so any digest the harness could compute an appender could
+compute too, which is why the receipt carries none. What it buys is bounded and real: a hand-written
+marker **cannot** make an **active or empty** run read as completed, because the only way to satisfy the
+cross-check is to make the units terminal — which is the work itself. What it does **not** buy: on a run
+that would pass the gate anyway, a hand-written valid receipt still completes it, and the answer is then
+the one the gate would have given. Ignored markers are listed in `state.run_completion_rejected` and
+named by `complete-run`'s own output, so a rejected claim is visible rather than merely inert.
 
 **This is a deliberate, recorded decision, not an oversight.** Adding authenticated privileged-event
 ingress is real work and is not currently planned. Refusing relayed events instead would fork the ledger
@@ -126,10 +143,12 @@ Closed, in the order they were addressed:
    *Evidence queries execute WITHOUT a shell* above.
 2. ~~Make review-gate evidence internally consistent, so malformed evidence cannot authorize a merge.~~
    Closed by DER-2837 — see *Review-gate evidence must agree with itself* above.
+3. ~~Reserve and receipt the run-completion event so a terminal state cannot be claimed by generic
+   append.~~ Closed by DER-2838 — see the run-completion paragraphs under *Privileged event
+   authority is documented, not authenticated* above for what the receipt does and does not prove.
 
 Current known gaps:
 
-3. Reserve and receipt the run-completion event so a terminal state cannot be claimed by generic append.
 4. Preserve remote-read failure state so an unreadable host cannot read as a clean, empty pull.
 5. Require exact repository identity — not owner equality — before deriving cloud lifecycle events.
 
