@@ -6061,11 +6061,22 @@ export function getRepoOwnerLogin() {
   return owner || null;
 }
 
-// gh spells these `author.login` and `headRepositoryOwner.login` on `pr list --json` (verified against
-// gh 2.x). Both are REQUIRED: the author check answers "is this one of ours", the head-repository check
-// answers "is the branch on OUR repo" — a fork PR from a compromised-but-listed login still fails the
-// second. Anything missing (an older payload, a deleted fork, a hand-built test object) carries no
-// identity and is not authenticated. Pure; the module-config fallbacks mirror `toAuthorSet`.
+// gh spells these `author.login`, `headRepositoryOwner.login` and `isCrossRepository` on `pr list --json`
+// (verified against gh 2.76.2). All THREE are required, and each answers a different question:
+//
+//   author               — "is this one of ours"
+//   headRepositoryOwner  — "is the head repo owned by the org we are polling"
+//   isCrossRepository    — "is the head IN that repository, or merely under that owner"
+//
+// DER-2840: the third is not implied by the second. GitHub lets one owner hold both a repository and a
+// fork of it, so `headRepositoryOwner.login === owner` is satisfied by a repository that is NOT the
+// target repository — owner equality is a strictly weaker proposition than repository identity, and a
+// same-org fork therefore passed the DER-2778 gate and could drive cloud lifecycle derivation. DER-2778
+// closed the untrusted-AUTHOR half correctly; this closes the head-REPOSITORY half.
+//
+// Anything missing (an older payload, a deleted fork, a hand-built test object) carries no identity and
+// is not authenticated — so an ABSENT or non-boolean `isCrossRepository` is "I do not know", never
+// "same repo". Pure; the module-config fallbacks mirror `toAuthorSet`.
 export function prIdentityTrusted(pr, { trustedPrAuthors, repoOwner } = {}) {
   const trusted = trustedPrAuthors instanceof Set ? trustedPrAuthors
     : Array.isArray(trustedPrAuthors) ? new Set(trustedPrAuthors)
@@ -6075,7 +6086,10 @@ export function prIdentityTrusted(pr, { trustedPrAuthors, repoOwner } = {}) {
   const head = pr?.headRepositoryOwner?.login;
   if (typeof author !== "string" || !author || !trusted.has(author)) return false;
   if (typeof owner !== "string" || !owner) return false;
-  return typeof head === "string" && head === owner;
+  if (typeof head !== "string" || head !== owner) return false;
+  // Strict `=== false`: a missing field is undefined and a stubbed one may be the STRING "false". Both
+  // must deny. `!pr?.isCrossRepository` would accept both and reinstate exactly this defect.
+  return pr?.isCrossRepository === false;
 }
 
 // gh spells the author two ways: `pr view --json comments` gives `author.login`; the REST
@@ -6416,7 +6430,11 @@ async function reconcilePrEventsInto(runDir, runId, repoRoot) {
   // DER-2778: `author,headRepositoryOwner` ride along on the SAME call — measured free (the GraphQL
   // cost stays 1 point at the 100×100 ceiling), and without them `deriveCloudPrEvents` had nothing but a
   // branch/title substring to decide that a PR belongs to this run. A second call is not the answer here.
-  const listRes = await runCommand({ command: "gh", args: ["pr", "list", "--state", "open", "--json", "number,isDraft,body,headRefName,title,headRefOid,comments,author,headRepositoryOwner", "--limit", "100"], cwd: repoRoot });
+  //
+  // DER-2840 adds `isCrossRepository` to the same call, and re-measured rather than inheriting the
+  // claim: against this repo, with a zero-noise control (two `gh api rate_limit` reads and no call
+  // between them ⇒ delta 0), the field set costs 1 GraphQL point both WITHOUT and WITH the new field.
+  const listRes = await runCommand({ command: "gh", args: ["pr", "list", "--state", "open", "--json", "number,isDraft,body,headRefName,title,headRefOid,comments,author,headRepositoryOwner,isCrossRepository", "--limit", "100"], cwd: repoRoot });
   if (listRes.exitCode !== 0) return { folded: 0 };
   let prRows;
   try { prRows = JSON.parse(listRes.stdout || "[]"); } catch { return { folded: 0 }; }
@@ -6475,7 +6493,14 @@ async function reconcilePrEventsInto(runDir, runId, repoRoot) {
     // PR therefore injects that PR's number into the run's state, which is the retargeting attack this
     // issue closes, reached through a different door: the Codex review bot is a TRUSTED comment author
     // and comments on whatever PR it is asked to review, including a fork's.
-    if (!prIdentityTrusted({ author: data.author, headRepositoryOwner: data.headRepositoryOwner })) continue;
+    if (!prIdentityTrusted({
+      author: data.author, headRepositoryOwner: data.headRepositoryOwner,
+      // DER-2840: this projection is field-by-field, so a new identity field that is not named HERE is
+      // dropped before the predicate ever sees it — and a dropped `isCrossRepository` reads as "I do not
+      // know" and denies every PR, disabling the cloud lane rather than reopening the hole. Silent
+      // either way; named here so it cannot go missing.
+      isCrossRepository: data.isCrossRepository,
+    })) continue;
     // Belt-and-braces fix_pushed (item 1): SHA-keyed, so it bypasses the `${type}:${pr}` seen set (which
     // would block a 2nd fix on a different SHA). deriveKickbackFixEvents does the SHA-based idempotency.
     // MUST append BEFORE the derived handed_off for the same scan (2026-07-16 flap guard): the fold only
@@ -6492,12 +6517,14 @@ async function reconcilePrEventsInto(runDir, runId, repoRoot) {
     const derived = await annotateShaAncestry(
       deriveCloudPrEvents({
         // The projection stays explicit (not `...data`) so every field the derivation may read is a
-        // deliberate one. `author`/`headRepositoryOwner` are what `deriveCloudPrEvents` authenticates on
-        // (DER-2778); dropping them here would silently restore deny-everything, not the old trust-all.
+        // deliberate one. `author`/`headRepositoryOwner`/`isCrossRepository` are what
+        // `deriveCloudPrEvents` authenticates on (DER-2778, DER-2840); dropping any of them here would
+        // silently restore deny-everything, not the old trust-all.
         pr: {
           number: pr, isDraft: data.isDraft, body: data.body, headRefName: data.headRefName,
           title: data.title, headRefOid: data.headRefOid,
           author: data.author, headRepositoryOwner: data.headRepositoryOwner,
+          isCrossRepository: data.isCrossRepository,
         },
         runIssues: scope, bundles, status: issueStatus, kickbackSha: kickbackShaByPr.get(pr),
       }),

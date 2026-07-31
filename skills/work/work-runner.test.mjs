@@ -1424,7 +1424,12 @@ test("renderCloudBrief: draft-PR-first lifecycle (open draft, work, mark ready)"
 // the process last loaded. The identity-gate regressions themselves live in the DER-2778 block below.
 const D2778_OWNER = "repo-owner";
 const D2778_IDENT = { trustedPrAuthors: [D2778_OWNER], repoOwner: D2778_OWNER };
-const trustedPr = (pr) => ({ author: { login: D2778_OWNER }, headRepositoryOwner: { login: D2778_OWNER }, ...pr });
+// DER-2840: a trusted PR now carries all THREE identity fields. `isCrossRepository: false` is not
+// decoration — owner equality alone is satisfied by a same-owner FORK, so a fixture that omits it is not
+// a canonical-repo PR and (correctly) authenticates as nothing.
+const trustedPr = (pr) => ({
+  author: { login: D2778_OWNER }, headRepositoryOwner: { login: D2778_OWNER }, isCrossRepository: false, ...pr,
+});
 
 test("deriveCloudPrEvents: draft PR → lead_online (handle from footer, draft:true), no handed_off", () => {
   const evs = deriveCloudPrEvents({
@@ -8012,6 +8017,115 @@ test("DER-2778 CONTROL: a trusted same-repo PR still derives lead_online + hande
   assert.equal(evs[1].sha, "realhead");
 });
 
+// ============================================================================
+// DER-2840 (#7, P1) — owner equality is not repository identity
+// ============================================================================
+// DER-2778 closed the UNTRUSTED-AUTHOR half: it authenticates the PR author and the head-repo OWNER
+// before deriving cloud lifecycle events. That is the right fix for a fork owned by an outsider, and it
+// does not distinguish a SAME-OWNER fork from the canonical repo — GitHub lets one org own both the repo
+// and a fork of it, so `headRepositoryOwner.login === targetOwner` is satisfied by a repository that is
+// not the target repository. The gap is only visible if you ask what `headRepositoryOwner` actually
+// PROVES, which is why DER-2778's own comment ("a fork PR from a compromised-but-listed login still
+// fails the second") reads as complete: it is true of the forks DER-2778 had in mind.
+//
+// The fix is one extra field on the SAME `gh pr list --json` call. Measured against this repo with a
+// zero-noise control (two `gh api rate_limit` reads with no call between them ⇒ delta 0): the field set
+// costs 1 GraphQL point at the 100×100 ceiling both WITHOUT and WITH `isCrossRepository`. Free, as
+// DER-2778 found for `author,headRepositoryOwner`.
+const d2840SameOwnerFork = (over = {}) => ({
+  number: 4343, isDraft: false, headRefName: "der-9-x", title: "feat: DER-9",
+  body: "claude.ai/code/session_01FORK", headRefOid: "forkhead", comments: [],
+  // Everything DER-2778 checks PASSES here: a trusted author, and a head repo owned by the target owner.
+  author: { login: D2778_OWNER }, headRepositoryOwner: { login: D2778_OWNER },
+  isCrossRepository: true, // …but the head is a DIFFERENT repository under that same owner.
+  ...over,
+});
+
+test("DER-2840: a SAME-OWNER fork passes every DER-2778 check and must still be refused", () => {
+  const derive = (pr) => deriveCloudPrEvents({ pr, runIssues: ["DER-9"], ...D2778_IDENT });
+
+  // THE ASSERTION THAT FAILS ON THE PARENT. On the parent this row derives lead_online + handed_off:
+  // author trusted ✓, head-repo owner matches ✓ — and nothing ever asked whether it was the same REPO.
+  assert.deepEqual(derive(d2840SameOwnerFork()), [],
+    "a fork under the target owner is not the target repository, whatever its owner login says");
+
+  // Fail CLOSED on a missing field, matching the posture the identity gate already states for `author`
+  // and `headRepositoryOwner`: an older payload or a hand-built object carries no identity. Without
+  // this, a stub or an un-upgraded `gh` silently restores the old behaviour.
+  assert.deepEqual(derive(d2840SameOwnerFork({ isCrossRepository: undefined })), [],
+    "an ABSENT cross-repository answer is 'I do not know', which must not read as 'same repo'");
+  assert.deepEqual(derive(d2840SameOwnerFork({ isCrossRepository: "false" })), [],
+    "a non-boolean must not be coerced — the string \"false\" is truthy-adjacent and is not an answer");
+
+  // The DER-2778 cases must still refuse, for their ORIGINAL reasons. A fix that accidentally made the
+  // cross-repository flag the only live check would leave an untrusted author authenticated on a
+  // same-repo branch.
+  assert.deepEqual(derive(d2778Fork({ isCrossRepository: false })), [],
+    "an untrusted author must still be refused even when the head IS this repository");
+  assert.deepEqual(derive(d2778Fork({ headRepositoryOwner: { login: D2778_OWNER }, isCrossRepository: false })), [],
+    "…and an untrusted author on a same-repo, same-owner branch is still refused");
+});
+
+test("DER-2840 CONTROL: a genuine same-repository PR still derives lead_online + handed_off", () => {
+  // The inverse failure: requiring a field the fixtures do not carry would refuse every PR and silently
+  // disable the cloud lane while every assertion above stayed green.
+  const evs = deriveCloudPrEvents({
+    pr: trustedPr({ number: 700, isDraft: false, headRefName: "der-9-x", title: "feat: DER-9", body: "claude.ai/code/session_01OK", headRefOid: "realhead" }),
+    runIssues: ["DER-9"], ...D2778_IDENT,
+  });
+  assert.deepEqual(evs.map((e) => e.type), ["lead_online", "handed_off"],
+    "the canonical-repo path must survive the tightening");
+});
+
+test("DER-2840: the same-owner fork cannot repoint a tracked unit — end to end through `gh pr list`", async () => {
+  // The pure predicate is not the production path. This drives the real `reconcile-pr-events` fold, so a
+  // fix that hardened `prIdentityTrusted` without the caller requesting the field would fail HERE.
+  const { runsRoot, runDir } = await d2750Run();
+  const repoRoot = await d2778RepoRoot();
+  try {
+    await withFakeGh([d2840SameOwnerFork()], async ({ calls }) => {
+      await runSubcommand(["reconcile-pr-events", "--run", "r1", "--runs-root", runsRoot, "--repo-root", repoRoot]);
+      // The field must be REQUESTED. Without this the case above could pass for the wrong reason —
+      // `isCrossRepository` would arrive undefined on EVERY row and the fail-closed branch would refuse
+      // the fork and the canonical PR alike, which is a broken lane wearing a passing test.
+      const lists = (await calls()).filter((l) => l.startsWith("pr list"));
+      assert.equal(lists.length, 1);
+      assert.match(lists[0], /isCrossRepository/,
+        "the list must request isCrossRepository, or the gate is deciding on a field it never asked for");
+    });
+    const evs = await readEvents(runDir);
+    assert.equal(evs.some((e) => e.pr === 4343), false, "no event may carry the same-owner fork's PR number");
+    assert.equal(evs.some((e) => e.type === "lead_online" || e.type === "handed_off"), false,
+      "and no cloud lifecycle event may be derived at all");
+    assert.equal(materializeState(evs, { run_id: "r1" }).issues["DER-9"].pr, null,
+      "the unit's PR pointer must be untouched (still the initial null)");
+  } finally {
+    await rm(runsRoot, { recursive: true, force: true });
+    await rm(repoRoot, { recursive: true, force: true });
+    await applyRepoConfig("/nonexistent-reset");
+  }
+});
+
+test("DER-2840 CONTROL: a genuine same-repository PR still folds end to end through `gh pr list`", async () => {
+  const { runsRoot, runDir } = await d2750Run();
+  const repoRoot = await d2778RepoRoot();
+  try {
+    await withFakeGh([trustedPr({
+      number: 707, isDraft: false, headRefName: "der-9-x", title: "feat: DER-9",
+      body: "claude.ai/code/session_01OK", headRefOid: "realhead", comments: [],
+    })], async () => {
+      await runSubcommand(["reconcile-pr-events", "--run", "r1", "--runs-root", runsRoot, "--repo-root", repoRoot]);
+    });
+    const evs = await readEvents(runDir);
+    assert.equal(evs.some((e) => e.type === "lead_online" && e.pr === 707), true,
+      "the canonical-repo PR must still be discovered — this is what proves the gate is not a blanket refusal");
+  } finally {
+    await rm(runsRoot, { recursive: true, force: true });
+    await rm(repoRoot, { recursive: true, force: true });
+    await applyRepoConfig("/nonexistent-reset");
+  }
+});
+
 test("DER-2778: the trusted-PR-author set is CONFIG-driven, defaults to deny, and EXCLUDES the review bot", async () => {
   const dir = await mkdtemp(join(tmpdir(), "wr-d2778-cfg-"));
   try {
@@ -8019,8 +8133,12 @@ test("DER-2778: the trusted-PR-author set is CONFIG-driven, defaults to deny, an
     await applyRepoConfig(join(dir, "no-config-here"));
     assert.equal(WR.getTrustedPrAuthors().size, 0, "an unconfigured repo trusts no PR author at all");
     assert.equal(WR.getRepoOwnerLogin(), null, "and cannot say who owns the repo, so no head is same-repo");
+    // The identity here is OTHERWISE COMPLETE — including `isCrossRepository: false` (DER-2840) — so the
+    // only thing left to deny it is the missing config. Without that field the row would be denied for
+    // TWO reasons, and this assertion would stay green even if the unconfigured-repo branch it names were
+    // deleted: a check that still runs but no longer discriminates the property in its own message.
     assert.equal(
-      WR.prIdentityTrusted({ author: { login: D2778_OWNER }, headRepositoryOwner: { login: D2778_OWNER } }),
+      WR.prIdentityTrusted(trustedPr({})),
       false,
       "with no configured repo the default must be deny, not allow-all",
     );
@@ -8040,7 +8158,12 @@ test("DER-2778: the trusted-PR-author set is CONFIG-driven, defaults to deny, an
     assert.equal(WR.getTrustedCommentAuthors().has(bot), true, "the review bot's comments stay trusted (DER-2737)");
     assert.equal(WR.getTrustedPrAuthors().has(bot), false, "but the review bot is NOT a trusted PR author");
     assert.deepEqual(
-      deriveCloudPrEvents({ pr: d2778Fork({ author: { login: bot }, headRepositoryOwner: { login: D2778_OWNER } }), runIssues: ["DER-9"] }),
+      // `isCrossRepository: false` is REQUIRED here, exactly as above: `d2778Fork` omits the field, so
+      // without it DER-2840's fail-closed branch denies this row before the trusted-author property in
+      // this assertion's own message is ever exercised — the assertion would pass for the wrong reason
+      // and stay green even if the review bot were added to `trustedPrAuthors`. Verified by control:
+      // with the bot trusted, this returns [] without the field and the two lifecycle events with it.
+      deriveCloudPrEvents({ pr: d2778Fork({ author: { login: bot }, headRepositoryOwner: { login: D2778_OWNER }, isCrossRepository: false }), runIssues: ["DER-9"] }),
       [],
       "a PR opened by the review bot must not derive lifecycle events for a run unit",
     );

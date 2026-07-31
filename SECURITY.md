@@ -147,10 +147,18 @@ Closed, in the order they were addressed:
    append.~~ Closed by DER-2838 — see the run-completion paragraphs under *Privileged event
    authority is documented, not authenticated* above for what the receipt does and does not prove.
 
-Current known gaps:
+4. ~~Preserve remote-read failure state so an unreadable host cannot read as a clean, empty pull.~~
+   Closed by DER-2839 — the remote tail no longer ends in `2>/dev/null || true`, so a missing or
+   unreadable host ledger is distinguishable from a healthy host with nothing new, and no longer
+   deletes the held-fragment record.
+5. ~~Require exact repository identity — not owner equality — before deriving cloud lifecycle
+   events.~~ Closed by DER-2840 — `isCrossRepository === false` is now required alongside the owner
+   check, because one owner may hold both a repository and a fork of it.
 
-4. Preserve remote-read failure state so an unreadable host cannot read as a clean, empty pull.
-5. Require exact repository identity — not owner equality — before deriving cloud lifecycle events.
+Roadmap items 1–5 are closed. That is a statement about those five findings only. It is **not** a claim
+that the harness has no open weaknesses: authenticated privileged-event ingress is out of scope below,
+the read-any-path exposure described under *Evidence queries execute WITHOUT a shell* remains the stated
+residual risk, and unknown gaps are why *Reporting a vulnerability* exists.
 
 Authenticated privileged-event ingress is **explicitly out of scope** for now; see the trust-boundary
 section above for what that implies.

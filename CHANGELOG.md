@@ -22,13 +22,37 @@ The 2026-07-30 cold-eyes remediation wave: nine fixes against the 21 findings of
 places this file and its neighbors described those gaps as still open after they were closed.
 
 **A SECOND cold-eyes review, of `fbb8631`, ran the same day and its fixes land in this same section** —
-DER-2836 (P0), DER-2837, DER-2838, DER-2839 so far. They are listed below alongside the first wave's,
+DER-2836 (P0), DER-2837, DER-2838, DER-2839, DER-2841/DER-2810/DER-2808, and DER-2840 so far. They are
+listed below alongside the first wave's,
 which is why the entry count under `### Security` exceeds the nine named above. Recording it because the
 paragraph above was written when this section held one wave, and a reader counting entries against it
 would otherwise conclude the file had drifted.
 
 ### Security
 
+- **DER-2840 (P1) — a same-owner FORK is not the same REPOSITORY, and owner equality let one through the
+  identity gate.** DER-2778 (below) required a PR's `headRepositoryOwner.login` to equal the target repo's
+  owner segment, and its changelog entry and the shipped `SKILL.md` both stated that a fork never satisfies
+  it. GitHub lets **one owner hold both a repository and a fork of it**, so owner equality is strictly
+  weaker than repository identity: a same-org fork passed the gate and could drive cloud lifecycle
+  derivation against a tracked unit — the half of DER-2778 that closing the untrusted-AUTHOR side did not
+  reach. `prIdentityTrusted` now additionally requires `isCrossRepository === false`, spelled strictly:
+  a missing field is `undefined` and a stubbed one may be the string `"false"`, and **both must deny**
+  (`!pr?.isCrossRepository` would have accepted both and reinstated the defect). Both call sites that
+  project the identity field-by-field were updated — that projection is the silent-loss shape, where an
+  identity field not named is dropped before the predicate sees it, and a dropped `isCrossRepository`
+  denies *every* PR, disabling the cloud lane rather than reopening the hole. The `pr list` call now
+  requests the field, asserted by a test, so the gate cannot decide on a field it never asked for.
+  GraphQL cost was re-measured rather than inherited: against a zero-noise control (two `gh api
+  rate_limit` reads with no call between them ⇒ delta 0), the field set costs 1 point at the 100×100
+  ceiling both without and with `isCrossRepository` — free. Evidence: the fork case is RED on
+  `origin/main` at the predicate, at the production fold, and end to end through a real
+  `reconcile-pr-events` subprocess; a mutation audit neutering the new return to `true` turns **all three**
+  of those cases red — two in `work-runner.test.mjs` (457 tests, 2 fail) and one in `e2e.test.mjs` (47
+  tests, 1 fail) — and leaves every control green, so the gate is load-bearing. *(An earlier draft of this
+  entry said "exactly the two defect cases", which is wrong and contradicted the three levels enumerated
+  in the same sentence. The count is stated here as measured, with its denominators, because a maintainer
+  re-running the audit gets three and would otherwise have to work out what broke.)*
 - **DER-2839 (P1) — a remote read that FAILED was reported as a remote that was EMPTY, and that erased a
   completion-blocking damage signal.** The remote ledger tail ran as
   `tail -n +N <path> 2>/dev/null || true`. That suffix answers every question with success: a MISSING
@@ -302,8 +326,14 @@ would otherwise conclude the file had drifted.
   could repoint the tracked PR's pointer, and its ancestry check failed **open** on an unfetchable fork
   SHA — reading it as "proven new work" and dropping a real pending kickback out of `kickbacks_pending`. A
   PR now counts as this run's own only when its author is the repo owner or a configured
-  `trustedPrAuthors` login **and** its head repository owner matches the target repo (a fork never does);
-  an unresolvable SHA now fails closed rather than open. `trustedPrAuthors` is deliberately a separate
+  `trustedPrAuthors` login **and** its head repository owner matches the target repo; an unresolvable SHA
+  now fails closed rather than open. *(This entry as written asserted parenthetically that the owner check
+  alone already excluded every fork. That is false when one owner holds both a repository and a fork of
+  it, which is the defect DER-2840 closes (its entry is at the top of this section — `[Unreleased]` is
+  newest-first). The false wording is described rather than quoted, because `repo-contract.test.mjs` now
+  sieves shipped prose for it literally and cannot tell a quotation from a live claim. Corrected here
+  rather than left standing, because it is the sentence a
+  reader would use to conclude the hole was already shut.)* `trustedPrAuthors` is deliberately a separate
   allowlist from `trustedCommentAuthors` (DER-2737) — the review bot's *comments* are trusted input, but a
   PR it opens is not one of your leads. (PR #23)
 
@@ -446,7 +476,9 @@ Each fix below landed with a regression test that was **observed failing on the 
   `issues[]`, and both `reap` interpolations are `shellQuote`d. **This closed the comment vector only** —
   a *retargeted* unit stayed reachable through PR-*list* state (`gh pr list` + branch/title matching, no
   comment involved at all), which a fork PR could exploit to silently drop a pending kickback; that half
-  was closed by DER-2778 (`[Unreleased]`, above).
+  was closed by DER-2778 (`[Unreleased]`, above) — and only fully by DER-2840, which closed the same-owner
+  fork that DER-2778's owner-equality check still admitted. Named here because this entry points a reader
+  at DER-2778 as the closer, and on its own would hand them the retracted conclusion.
 - **#19 — evidence queries are validated read-only before a shell runs them.** `prep-runner`'s
   `query-check` passed `evidenceQueries[].query` to `spawnSync(…, {shell: true})` behind only a *shape*
   check, and a plan is often assembled from issue text and lead output — so plan content could execute
