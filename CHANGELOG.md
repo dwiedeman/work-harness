@@ -179,6 +179,14 @@ would otherwise conclude the file had drifted.
     consumer of `stages[0]` inherits. Now refused with the operator named. The contract comment above
     `queryCountsNumerically` documented this case as a deliberate residual and is amended in the same
     diff — it would otherwise describe behavior its own file no longer has.
+  **Follow-up in the same wave:** `skills/prep-for-work/SKILL.md` — the SHIPPED guidance an author reads —
+  still carried both retracted claims after the code changed under it: it recommended "end it in
+  `| wc -l`" (removed from the refusal message because it counts FILES, and over one file answers 1 for
+  any pattern) and stated that "a single `path:count` row is still counted" (the carve-out that was
+  reverted for failing open). Both were written when those behaviours were true and neither was updated
+  when they stopped being. Caught by grepping for copy that depended on the old behaviour AFTER the
+  reversal merged, which is the only step that finds this class — the diff that made the prose false does
+  not touch the file the prose is in.
   **Left open deliberately, and PINNED live: DER-2900.** `grep -c PATTERN file | wc -l` is stamped
   `ok 1 ≥ 1` for ANY pattern — `grep -c` prints one line whatever the count, `wc -l` counts that one
   line, and numeric mode reads the 1. `| head -1` and `| sort` do the same. All exit 0, so DER-2783's
