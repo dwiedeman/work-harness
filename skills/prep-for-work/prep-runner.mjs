@@ -1405,8 +1405,14 @@ export function parseEvidenceQuery(query) {
   // `queryCountsNumerically` already has to carry a paragraph explaining the case rather than relying on
   // it being impossible. Refused with the operator named, consistent with the validator's stated posture
   // that an unparsed shape is refused rather than assumed safe.
+  // A leading NEWLINE is not this defect — it is ordinary leading whitespace, and a templated or indented
+  // multi-line query in a JSON plan legitimately starts with one. Refusing it was a regression this
+  // check introduced (`\ngit log --oneline | wc -l` worked before). Only a real control OPERATOR with
+  // nothing in front of it is the malformed shape DER-2808 is about, so leading newlines are dropped
+  // first and the check applies to what remains.
+  while (segments.length > 1 && !segments[0].tokens.length && segments[1].separator === "\n") segments.shift();
   if (!segments[0].tokens.length && segments.length > 1) {
-    return refuse(`begins with the separator \`${segments[1].separator === "\n" ? "newline" : segments[1].separator}\` — there is no command in front of it for it to join to, so the leading segment is empty. Remove it, or name the command that should produce the input.`);
+    return refuse(`begins with the separator \`${segments[1].separator}\` — there is no command in front of it for it to join to, so the leading segment is empty. Remove it, or name the command that should produce the input.`);
   }
 
   const out = [];

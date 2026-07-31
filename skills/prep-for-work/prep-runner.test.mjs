@@ -1302,6 +1302,11 @@ test("evidence queries: a query beginning with a bare separator is refused, nami
   }
   // …and the parse reports no stages at all, so a consumer cannot read a phantom first command.
   assert.deepEqual(parseEvidenceQuery("| wc -l").stages, []);
+  // A leading NEWLINE is ordinary whitespace, not this defect: an indented or templated multi-line query
+  // in a JSON plan legitimately starts with one, and it worked before this check existed. Refusing it was
+  // a regression this check introduced.
+  assert.deepEqual(evidenceQueryShellProblems("\ngit log --oneline | wc -l"), []);
+  assert.deepEqual(evidenceQueryShellProblems("\n  git log --oneline |\n  wc -l"), []);
   // CONTROL: the same commands without the leading separator are untouched.
   assert.deepEqual(evidenceQueryShellProblems("wc -l < f.txt"), []);
   assert.equal(parseEvidenceQuery("git log --oneline | grep -c 'fix('").stages.length, 2);
