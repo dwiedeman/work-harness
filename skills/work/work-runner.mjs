@@ -8,7 +8,7 @@
 // the design notes in the repository README.
 import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { appendFile, lstat, mkdir, mkdtemp, open, readdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { homedir, hostname, tmpdir } from "node:os";
 import { basename, dirname, join, resolve as resolvePath } from "node:path";
@@ -934,8 +934,69 @@ export function reviewShellCommand({ model = "opus", promptFile = "<prompt.md>",
 // Stderr is kept separate: mixing diagnostics into the JSONL destroys its typed evidence contract.
 // Verified live on codex-cli 0.144.4 before this edit: `--json` composes with `--output-schema` and
 // `--output-last-message` (exit 0, turn.completed=true, command_execution=2, out.json well-formed).
-export function codexReviewCommand({ promptFile = "<prompt.md>", outFile = "<review.json>", logFile = "<review.jsonl>", errorFile = "<review.stderr.log>", schemaFile = "~/.claude/skills/work/codex-review-schema.json" } = {}) {
-  return `codex exec --json --sandbox read-only --output-schema ${schemaFile} --output-last-message ${outFile} - < ${promptFile} > ${logFile} 2> ${errorFile}`;
+// ── 2.1 — never invoke a bare `codex` ────────────────────────────────────────────────────────────
+// On 2026-07-31 both an orchestrator and a shepherd independently lost ~40 minutes to a WRONG ROOT
+// CAUSE because `which -a codex` resolved to a cmux CLI shim ahead of the real binary. That shim
+// generation invoked `timeout`, which does not exist on macOS, so it printed `command not found` and
+// then hung at 0.0% CPU with ~37 bytes of output — BYTE-IDENTICAL to the quota-wall signature the skill
+// teaches an operator to trust. Two agents hit it separately, so it is environmental, not a one-off.
+//
+// Re-measured on this host 2026-07-31 before implementing, per the plan's own re-verification rule, and
+// the finding did NOT hold as written: `codex` here IS the real `@openai/codex` CLI, `~/bin/codex` does
+// not exist at all, and the shims present never call `timeout` (they exec a cmux wrapper, or strip their
+// own directory out of PATH and exec the real binary). The plan prescribed hardcoding `~/bin/codex`;
+// doing that literally would have broken every codex call on this machine.
+//
+// So the durable rule is kept and the brittle path is not: resolve explicitly, refuse to accept a shim
+// directory as the answer, and let an operator override. The audit the plan also asked for came back
+// clean — there is no bare `timeout` anywhere in skills/**, hooks/** or install.sh.
+// Conventional shell encoding of "killed by signal N" (2.2). Kept as a named constant so the exit code
+// a killed `watch` reports is a stated contract rather than a magic number a caller has to guess.
+export const SIGNAL_EXIT_BASE = 128;
+
+export const CODEX_SHIM_MARKERS = ["cmux-cli-shims"];
+
+// Pure resolver so both outcomes are unit-testable without a filesystem. `exists` is injected; the
+// async wrapper below supplies the real check.
+//
+// Returning `null` for "not found" is deliberate and load-bearing: an absent codex is UNKNOWN, never a
+// verdict. Every caller must treat null as "could not measure", because the entire point of 2.1 is that
+// a probe which cannot run must not be rendered as a probe that ran and failed.
+export function resolveCodexBinFrom({ pathEnv = "", override = null, home = "", exists = () => false } = {}) {
+  const skipped = [];
+  if (override) {
+    return exists(override)
+      ? { bin: override, source: "WORK_CODEX_BIN", skipped }
+      : { bin: null, source: "WORK_CODEX_BIN", skipped, why: `WORK_CODEX_BIN=${override} does not exist` };
+  }
+  for (const dir of String(pathEnv).split(":").filter(Boolean)) {
+    const candidate = `${dir.replace(/\/$/, "")}/codex`;
+    if (!exists(candidate)) continue;
+    // A shim is not "a codex that might work" — it is the thing whose failure mode is indistinguishable
+    // from a quota wall. Skip it and keep walking; record it so the operator learns WHY.
+    if (CODEX_SHIM_MARKERS.some((m) => candidate.includes(m))) { skipped.push(candidate); continue; }
+    return { bin: candidate, source: "PATH", skipped };
+  }
+  const fallback = `${home.replace(/\/$/, "")}/bin/codex`;
+  if (home && exists(fallback)) return { bin: fallback, source: "~/bin", skipped };
+  return {
+    bin: null, source: null, skipped,
+    why: skipped.length
+      ? `the only codex on PATH is a shim (${skipped.join(", ")}) and no real binary was found — a shim's hang is byte-identical to a quota wall, so this is UNKNOWN, not "codex is down"`
+      : "no codex found on PATH or at ~/bin/codex",
+  };
+}
+
+export function resolveCodexBin({ pathEnv = process.env.PATH ?? "", override = process.env.WORK_CODEX_BIN ?? null, home = homedir() } = {}) {
+  return resolveCodexBinFrom({ pathEnv, override, home, exists: (p) => existsSync(p) });
+}
+
+export function codexReviewCommand({ promptFile = "<prompt.md>", outFile = "<review.json>", logFile = "<review.jsonl>", errorFile = "<review.stderr.log>", schemaFile = "~/.claude/skills/work/codex-review-schema.json", bin = null } = {}) {
+  // Resolved, never bare. Falling back to the literal `codex` when nothing resolves keeps the command
+  // renderable for briefs and tests; the PROBE is what refuses to turn an unresolvable binary into a
+  // verdict, and it runs before any gate depends on this.
+  const codex = bin ?? resolveCodexBin().bin ?? "codex";
+  return `${codex} exec --json --sandbox read-only --output-schema ${schemaFile} --output-last-message ${outFile} - < ${promptFile} > ${logFile} 2> ${errorFile}`;
 }
 
 // Token total for the gate run. Two log shapes, because the flag above changed which one we get:
@@ -8314,9 +8375,16 @@ export async function runSubcommand(argv) {
       // transcript persistence off, a disk nearly full (a co-factor in the cmux freeze). Each check
       // here is an instrument that CAN return the failing answer; `--skip-probes` skips the slow
       // account/gate probes (1-token completions), everything else always runs.
+      // `ok` is TRI-STATE: true (green), false (red), or the string "unknown" (⚠, could not measure).
+      // The third state is the 2.1 fix. An empty probe result is not evidence of a dead dependency — it
+      // is evidence of no evidence, and rendering it red trains the operator to wave past the one signal
+      // this preflight exists to make trustworthy. Same reasoning as the REMOTE_PATH_PRELUDE false-RED:
+      // a wrong verdict is worse than an absent one. UNKNOWN does not fail the gate; it prints loudly
+      // and carries a re-run instruction so a human decides.
       const checks = [];
       const add = (name, ok, detail) => { checks.push({ name, ok, detail }); };
       const skillsDir = fileURLToPath(new URL(".", import.meta.url));
+      const repoRootForPreflight = o.repoRoot ?? process.cwd();
 
       // 1. Unit suite — 30s bound, the cheapest full-logic check.
       {
@@ -8394,6 +8462,46 @@ export async function runSubcommand(argv) {
       // the script they call is absent, stale, or fabricates zeros — see checkTokenReporter, which SMOKE
       // RUNS it rather than asserting a file exists.
       for (const leg of await checkTokenReporter({ skillsDir, cwd: process.cwd() })) add(leg.name, leg.ok, leg.detail);
+      // 6d. 2.2 — `watch` ALWAYS prints. These are the exact controls shepherd #5 used to prove the
+      // backgrounded-watch pattern was killing the watcher, promoted from a hand-run diagnosis into a
+      // standing check. The inference that mattered was "watch always prints, therefore silence ⇒
+      // killed, never woke" — and that inference is only sound if something keeps verifying the premise.
+      // The third leg is the one that would have caught the original defect: kill a real watch and
+      // require a terminal record on its stdout.
+      {
+        const dir = await mkdtemp(join(tmpdir(), "preflight-watch-"));
+        try {
+          const runDir2 = join(dir, "runs", "SMOKE");
+          await mkdir(runDir2, { recursive: true });
+          await writeFile(join(runDir2, "events.jsonl"),
+            `${JSON.stringify({ ts: "2026-01-01T00:00:00.000Z", actor: "orch", type: "run_started", run_id: "SMOKE", event_id: "0".repeat(39) + "1", source_id: "preflight:0:0", seq: 1, schema_version: 1 })}\n`, "utf8");
+          const base = ["watch", "--run", "SMOKE", "--runs-root", join(dir, "runs"), "--repo-root", dir, "--nudge-since", "0"];
+          const parse = (s) => { try { return JSON.parse(String(s ?? "").trim().split("\n").pop()); } catch { return null; } };
+
+          const ev = parse((await runSubcommand([...base, "--since", "0", "--timeout", "30"])).stdout);
+          add("watch-prints:event", ev?.wake === "event", ev?.wake === "event" ? "--since 0 → event record immediately" : `--since 0 returned ${JSON.stringify(ev)} — expected wake:"event"`);
+
+          const t0 = Date.now();
+          const to = parse((await runSubcommand([...base, "--since", "99", "--timeout", "1"])).stdout);
+          add("watch-prints:timeout", to?.wake === "timeout", to?.wake === "timeout" ? `--timeout 1 → timeout record at ${Math.round((Date.now() - t0) / 100) / 10}s` : `--timeout 1 returned ${JSON.stringify(to)} — expected wake:"timeout"`);
+
+          // The kill leg. A watch that dies silently is indistinguishable from a quiet wake, which is
+          // precisely how two watchers were lost without anyone being able to tell.
+          const killed = await new Promise((res) => {
+            const ch = spawn(process.execPath, [join(skillsDir, "work-runner.mjs"), ...base, "--since", "99", "--timeout", "120"], { cwd: dir, stdio: ["ignore", "pipe", "ignore"] });
+            let buf = "";
+            ch.stdout.on("data", (d) => { buf += d; });
+            const t = setTimeout(() => ch.kill("SIGTERM"), 1500);
+            ch.on("exit", () => { clearTimeout(t); res(parse(buf)); });
+            ch.on("error", () => { clearTimeout(t); res(null); });
+          });
+          add("watch-prints:killed", killed?.wake === "killed", killed?.wake === "killed"
+            ? "SIGTERM → terminal record (silence is structurally impossible)"
+            : `a SIGTERMed watch printed ${JSON.stringify(killed)} — a killed watcher that prints NOTHING reads exactly like a quiet wake`);
+        } finally {
+          await rm(dir, { recursive: true, force: true });
+        }
+      }
       // 6c. HARNESS DRIFT (P0.3) — is the installed tree what install.sh actually wrote? Every check
       // above this line tests the ENVIRONMENT; this one tests the harness's own bytes, which until now
       // nothing did. `VERSION` equality is a claim two divergent installs make identically (measured:
@@ -8402,7 +8510,30 @@ export async function runSubcommand(argv) {
       {
         const dest = process.env.CLAUDE_HOME || join(homedir(), ".claude");
         const drift = await measureHarnessDrift(dest);
-        add("harness-drift", drift.ok, drift.ok ? drift.reason : `${drift.reason}`);
+        add("harness-drift", drift.ok, drift.reason);
+
+        // The other half, and the one that actually bit: the 2026-07-31 drift was stale-but-UNTAMPERED.
+        // Every installed file matched what install.sh wrote, so per-file hashes alone report CLEAN —
+        // correctly — while the install lags the source of truth by ~12 commits. Only `source_commit`
+        // can see that, and only when a source checkout is in reach. When it is not, this is UNKNOWN:
+        // "I cannot see the source" must never be printed as "the install is current".
+        if (drift.source_commit) {
+          const head = await runCommand({ command: "git", args: ["rev-parse", "HEAD"], cwd: repoRootForPreflight, timeoutMs: 10000 }).catch(() => ({ exitCode: 1, stdout: "" }));
+          const isHarnessCheckout = existsSync(join(repoRootForPreflight, "install.sh")) && existsSync(join(repoRootForPreflight, "skills", "work", "work-runner.mjs"));
+          const sha = String(head.stdout ?? "").trim();
+          if (head.exitCode !== 0 || !sha || !isHarnessCheckout) {
+            add("harness-install-current", "unknown", `installed from ${drift.source_commit.slice(0, 12)}; no work-harness checkout at ${repoRootForPreflight} to compare against. ` +
+              "Run preflight from the checkout, or `cd ~/Projects/work-harness && git fetch && git log --oneline HEAD..origin/main` to see how far behind this install is.");
+          } else if (sha === drift.source_commit) {
+            add("harness-install-current", true, `install matches this checkout's HEAD (${sha.slice(0, 12)})`);
+          } else {
+            const behind = await runCommand({ command: "git", args: ["rev-list", "--count", `${drift.source_commit}..HEAD`], cwd: repoRootForPreflight, timeoutMs: 10000 }).catch(() => ({ exitCode: 1, stdout: "" }));
+            const n = String(behind.stdout ?? "").trim();
+            add("harness-install-current", false, `STALE INSTALL — installed from ${drift.source_commit.slice(0, 12)}, checkout HEAD is ${sha.slice(0, 12)}` +
+              `${/^\d+$/.test(n) && n !== "0" ? ` (${n} commit(s) ahead)` : ""}. Nothing is tampered, so the digest check reads CLEAN — ` +
+              "this is the exact shape that drove a 20h run on stale code while both hosts reported the same VERSION. Re-run ./install.sh.");
+          }
+        }
       }
       // 7. Skills skew vs remote hosts — a lead on the mini following a stale brief loses gates silently,
       // and a remote skills dir without session-token-report.mjs makes every mini lead gap its spend, so
@@ -8479,17 +8610,54 @@ export async function runSubcommand(argv) {
         }
         {
           // The codex gate probe — positive evidence, since `codex login status` lies (2026-07-25).
-          const res = await runCommand({ command: "sh", args: ["-c", `codex exec --json 'Reply with exactly: OK' 2>&1 | tail -5`], timeoutMs: 120000 }).catch(() => ({ exitCode: 1, stdout: "" }));
-          const out = String(res.stdout ?? "");
-          add("codex-probe", out.includes("turn.completed") || /\bOK\b/.test(out), out.includes("401") ? "401 — credential expired (login status LIES; re-login)" : (out.includes("turn.completed") ? "turn.completed seen" : out.trim().slice(-120)));
+          //
+          // 2.1: resolve the binary explicitly and NEVER shell a bare `codex`. A cmux shim ahead of the
+          // real binary on PATH cost two agents ~40 minutes and a wrong root cause, because its hang is
+          // byte-identical to a quota wall. If nothing resolves, this is UNKNOWN — the probe could not
+          // run, which is not the same claim as "codex is down".
+          const resolved = resolveCodexBin();
+          if (!resolved.bin) {
+            add("codex-probe", "unknown", `${resolved.why}. Probe by hand with stdin closed and READ THE ERROR TEXT: ` +
+              `\`<path-to>/codex exec --sandbox read-only "reply OK" < /dev/null\`. A real quota wall SAYS so ` +
+              `("You've hit your usage limit"); CPU% is NOT a discriminator.`);
+          } else {
+            const res = await runCommand({ command: resolved.bin, args: ["exec", "--json", "Reply with exactly: OK"], timeoutMs: 120000 })
+              .catch((err) => ({ exitCode: 1, stdout: "", stderr: err instanceof Error ? err.message : String(err) }));
+            const out = `${String(res.stdout ?? "")}${String(res.stderr ?? "")}`;
+            const shimNote = resolved.skipped.length ? ` [skipped shim: ${resolved.skipped.join(", ")}]` : "";
+            const where = ` (${resolved.bin} via ${resolved.source})${shimNote}`;
+            if (out.includes("turn.completed") || /\bOK\b/.test(out)) {
+              add("codex-probe", true, `turn.completed seen${where}`);
+            } else if (out.includes("401")) {
+              add("codex-probe", false, `401 — credential expired (login status LIES; re-login)${where}`);
+            } else if (/usage limit|rate limit|quota/i.test(out)) {
+              // A wall that SAYS it is a wall is a real verdict — that is the whole discriminator.
+              add("codex-probe", false, `usage wall: ${out.trim().slice(-160)}${where}`);
+            } else if (!out.trim()) {
+              // The failure this item exists for. ~0 bytes is no evidence, so it must not become a verdict.
+              add("codex-probe", "unknown", `NO OUTPUT${where} — treat as UNKNOWN, not a dead gate. ` +
+                `Re-run by hand with stdin closed: \`${resolved.bin} exec --sandbox read-only "reply OK" < /dev/null\` ` +
+                `and read the error text. A real wall prints a message and a date; a real hang BURNS CPU. ` +
+                `~0% CPU with ~0 bytes is a wall or a broken wrapper, never work in progress.`);
+            } else {
+              add("codex-probe", false, `${out.trim().slice(-160)}${where}`);
+            }
+          }
         }
       }
-      const failed = checks.filter((c) => !c.ok);
-      const lines = checks.map((c) => `  ${c.ok ? "✅" : "🔴"} ${c.name} — ${c.detail}`);
+      // Tri-state, strictly: only an explicit `false` fails the gate. `"unknown"` is neither — it is a
+      // probe that could not measure, and it is surfaced in the marker line so it can never be read as a
+      // silent pass either. A GREEN with unmeasured probes says so.
+      const failed = checks.filter((c) => c.ok === false);
+      const unknown = checks.filter((c) => c.ok === "unknown");
+      const lines = checks.map((c) => `  ${c.ok === true ? "✅" : c.ok === "unknown" ? "⚠️ " : "🔴"} ${c.name} — ${c.detail}`);
       // The printed marker is the gate (background-verify rule: `&&…||` chains exit 0 — gate on the
       // marker, never the exit code).
-      lines.push(failed.length ? `PREFLIGHT RED — ${failed.length} failing: ${failed.map((c) => c.name).join(", ")}` : "PREFLIGHT GREEN");
-      return { checks, ok: failed.length === 0, stdout: lines.join("\n") };
+      const unknownSuffix = unknown.length ? ` — ${unknown.length} UNMEASURED: ${unknown.map((c) => c.name).join(", ")}` : "";
+      lines.push(failed.length
+        ? `PREFLIGHT RED — ${failed.length} failing: ${failed.map((c) => c.name).join(", ")}${unknownSuffix}`
+        : `PREFLIGHT GREEN${unknownSuffix}`);
+      return { checks, ok: failed.length === 0, unknown: unknown.map((c) => c.name), stdout: lines.join("\n") };
     }
     case "sweep-workspaces": {
       // Close every leaked CMUX workspace this run's ledger knows about (DER-2517 + 2026-07-26
@@ -8614,6 +8782,36 @@ export async function runSubcommand(argv) {
       // idle. The existing idle-watch perf test did not catch it because it runs without `--pull-hosts`,
       // so the side-effect block never executes there.
       let dispatchHosts = null;
+      // ── 2.2 — silence must be structurally impossible ─────────────────────────────────────────────
+      // Shepherd #5 lost its watcher TWICE to the pattern `work/SKILL.md` §4 itself recommended
+      // (background `watch` + `caffeinate -w <pid>`): the watcher exited after ~100s printing NOTHING,
+      // which is indistinguishable from a quiet wake. A silently-blind shepherd is exactly the failure
+      // that leaves a ready PR sitting unshepherded, and the orchestrator who used the same pattern all
+      // shift could not rule out missed wakes either — there was no evidence in either direction.
+      //
+      // It was proven with two foreground controls: `--since 0` returned an event record immediately and
+      // `--timeout 15` returned a timeout record at exactly 15s. `watch` ALWAYS prints. Therefore silence
+      // implies killed, never woke. This trap makes that inference unnecessary by putting the terminal
+      // record on stdout before dying, so "no output" stops being an ambiguous state the reader has to
+      // interpret. Writing synchronously matters: a queued async write does not survive process.exit.
+      const terminalOnSignal = (signal) => {
+        try {
+          writeFileSync(1, `${JSON.stringify({
+            wake: "killed", signal, run: o.runId ?? null,
+            elapsed_s: Math.round((Date.now() - started) / 1000),
+            note: "watch was TERMINATED, it did not time out and it did not wake. Any event after the " +
+              "cursor below is UNSEEN. Re-run watch with --since <cursor>. If this arrives ~100s into a " +
+              "backgrounded watch, the harness that backgrounded it killed it — run watch in the FOREGROUND.",
+            cursor: cursorId ?? null,
+          })}\n`);
+        } catch { /* a dying process that cannot write is beyond rescue; never mask the signal */ }
+        process.exit(SIGNAL_EXIT_BASE + (signal === "SIGINT" ? 2 : 15));
+      };
+      const sigHandlers = [["SIGTERM", () => terminalOnSignal("SIGTERM")], ["SIGINT", () => terminalOnSignal("SIGINT")], ["SIGHUP", () => terminalOnSignal("SIGHUP")]];
+      for (const [sig, fn] of sigHandlers) process.on(sig, fn);
+      // Removed on every exit path, or `runSubcommand`'s in-process callers (the suite, chained
+      // subcommands) accumulate one listener set per call and Node warns at 11.
+      try {
       for (;;) {
         if ((pullHostNames.length || reconcileMerged || reconcilePrEvents) && Date.now() - lastSideEffect >= PULL_INTERVAL_MS) {
           for (const h of pullHostNames) {
@@ -8746,6 +8944,9 @@ export async function runSubcommand(argv) {
         }
         if (Date.now() - started >= timeoutMs) return { stdout: await wakePayload("timeout") };
         await sleep(pollMs);
+      }
+      } finally {
+        for (const [sig, fn] of sigHandlers) process.off(sig, fn);
       }
     }
     default:

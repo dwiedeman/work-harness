@@ -44,8 +44,38 @@ it reported the two divergent hosts as **agreeing**. Version equality was a clai
   Control-tested against real history: it produces the failing answer on `f4ef1b3..658d97e`, a merged PR
   that changed shipped code under an unchanged version.
 
+### Fixed
+
+- **`watch` can no longer die in silence (2.2).** A SIGTERM/SIGINT/SIGHUP now writes a terminal
+  `{"wake":"killed", signal, cursor, elapsed_s}` record synchronously before exiting `128+N`. The
+  pattern `work/SKILL.md` §4 itself recommended — background `watch` + `caffeinate -w <pid>` — **killed
+  shepherd #5's watcher twice**, exiting after ~100s printing nothing, which is indistinguishable from a
+  quiet wake. That guidance is **removed**, in both `work/SKILL.md` and `work-shepherd/SKILL.md`, in
+  favour of foreground bounded `watch`. `preflight` now runs the three controls that proved it:
+  `watch-prints:event` (`--since 0`), `watch-prints:timeout` (`--timeout 1`), and `watch-prints:killed`
+  (a real SIGTERM against a real child process).
+- **Never invoke a bare `codex` (2.1).** `resolveCodexBin()` honours `WORK_CODEX_BIN`, walks `PATH`
+  skipping any `cmux-cli-shims` directory, and falls back to `~/bin/codex` only if it exists. A cmux shim
+  resolving ahead of the real binary cost two agents ~40 minutes and a wrong root cause, because its hang
+  is byte-identical to a quota wall.
+- **`preflight` checks are tri-state.** `ok` is now `true` / `false` / `"unknown"`. An empty codex probe
+  is `⚠️ UNKNOWN` with a re-run instruction — evidence of no evidence, never a verdict — and the marker
+  line reports `PREFLIGHT GREEN — n UNMEASURED: …` so it cannot read as a silent pass either. A wall that
+  *says* it is a wall still reds; the discriminator (**a real hang burns CPU; ~0% CPU with ~0 bytes is a
+  wall, not work**) ships in the probe's own text.
+- **`preflight` check `harness-install-current`.** Compares the manifest's `source_commit` against the
+  surrounding checkout's HEAD. This is the half that actually bit: the 2026-07-31 drift was
+  stale-but-**untampered**, so per-file digests report CLEAN — correctly — while the install lags by ~12
+  commits. Reports `unknown` when no checkout is in reach, never "current".
+
 ### Notes
 
+- The plan prescribed hardcoding `~/bin/codex` for 2.1. Re-verification found that path **does not exist
+  on this host**, where `codex` on `PATH` is the real `@openai/codex` CLI and the cmux shims present never
+  invoke `timeout` at all. Implementing it literally would have broken every codex call here. The durable
+  rule (resolve explicitly, never trust a shim, never render silence as a verdict) is kept; the brittle
+  path is not. The plan's companion audit — *no bare `timeout` anywhere* — came back **clean**, and now
+  ships as a standing test rather than a one-time grep.
 - `aggregateDigest()` in `work-runner.mjs` and `CONTENT_DIGEST` in `install.sh` are two implementations
   of one wire definition (`path:sha256` lines, sorted, newline-joined, no trailing newline). The suite
   pins their agreement by recomputing one from a real manifest's own `files` map — if they drift apart,

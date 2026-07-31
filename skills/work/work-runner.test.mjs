@@ -1,7 +1,7 @@
 // Unit tests for scripts/work-runner.mjs — run with: node --test scripts/work-runner.test.mjs
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm, readFile, symlink, writeFile, chmod } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, readdir, readFile, symlink, writeFile, chmod } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -27,6 +27,7 @@ import {
   aggregateTokenUsage, renderUsageMd, eventSeenKey,
   clampWatchTimeout, WATCH_TIMEOUT_MAX_S,
   harnessDriftVerdict, aggregateDigest, measureHarnessDrift, HARNESS_MANIFEST_FILE,
+  resolveCodexBinFrom,
   assignedBudgetFor, renderAssignedBudget,
   ROTATION_CAP, resolveContextWindow, rotationBands, classifyContext,
   transcriptSlug, transcriptDirFor, leadBriefFromHead, pickLeadTranscript,
@@ -9427,6 +9428,142 @@ test("measureHarnessDrift WALKS the tree, so a file absent from the manifest is 
     await mkdir(join(dir, "skills", "work", "tmp", "work", "run1"), { recursive: true });
     await writeFile(join(dir, "skills", "work", "tmp", "work", "run1", "events.jsonl"), "{}\n");
     assert.equal((await measureHarnessDrift(dir)).status, "clean", "runtime state under tmp/ must never read as drift");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// 2.1 — never invoke a bare `codex`; an unmeasurable probe is UNKNOWN, never a verdict.
+//
+// Two agents independently lost ~40 minutes to a cmux CLI shim resolving ahead of the real binary: it
+// hung at 0.0% CPU with ~37 bytes of output, byte-identical to the quota-wall signature the skill teaches
+// an operator to trust. The plan prescribed hardcoding `~/bin/codex`; re-verification found that path
+// does not exist on this host and `codex` here IS the real CLI, so the rule is kept and the path is not.
+
+test("resolveCodexBin: an explicit override wins, and a MISSING override is null, never a silent fallback", () => {
+  const exists = (p) => p === "/opt/real/codex" || p === "/usr/bin/codex";
+  assert.equal(resolveCodexBinFrom({ override: "/opt/real/codex", pathEnv: "/usr/bin", exists }).bin, "/opt/real/codex");
+  const missing = resolveCodexBinFrom({ override: "/nope/codex", pathEnv: "/usr/bin", exists });
+  assert.equal(missing.bin, null, "a broken override must not silently fall through to PATH — that hides the operator's own mistake");
+  assert.match(missing.why, /WORK_CODEX_BIN/);
+});
+
+test("resolveCodexBin SKIPS a cmux shim directory and keeps walking to the real binary", () => {
+  const shim = "/var/folders/k7/T/cmux-cli-shims/ABC/codex";
+  const real = "/Users/x/.local/node/bin/codex";
+  const r = resolveCodexBinFrom({ pathEnv: "/var/folders/k7/T/cmux-cli-shims/ABC:/Users/x/.local/node/bin", exists: (p) => p === shim || p === real });
+  assert.equal(r.bin, real, "the shim is FIRST on PATH — resolving it is the whole defect");
+  assert.deepEqual(r.skipped, [shim], "and the operator must be told which shim was skipped, or the fix looks like magic");
+});
+
+test("resolveCodexBin: a shim with NO real binary behind it is UNKNOWN, not 'codex is down'", () => {
+  const shim = "/var/folders/k7/T/cmux-cli-shims/ABC/codex";
+  const r = resolveCodexBinFrom({ pathEnv: "/var/folders/k7/T/cmux-cli-shims/ABC", home: "/Users/x", exists: (p) => p === shim });
+  assert.equal(r.bin, null);
+  assert.match(r.why, /shim/i);
+  assert.match(r.why, /UNKNOWN/, "the distinction between 'no evidence' and 'a failing verdict' is the entire item");
+});
+
+test("resolveCodexBin falls back to ~/bin/codex only when it actually exists", () => {
+  assert.equal(resolveCodexBinFrom({ pathEnv: "/usr/bin", home: "/Users/x", exists: (p) => p === "/Users/x/bin/codex" }).bin, "/Users/x/bin/codex");
+  // This host: no ~/bin/codex at all. Hardcoding it, as the plan literally prescribed, would have broken
+  // every codex call here — which is why re-verification runs BEFORE implementation.
+  const none = resolveCodexBinFrom({ pathEnv: "/usr/bin", home: "/Users/x", exists: () => false });
+  assert.equal(none.bin, null);
+  assert.match(none.why, /no codex found/i);
+});
+
+test("codexReviewCommand never emits a bare `codex`", () => {
+  const cmd = codexReviewCommand({ bin: "/opt/real/codex", promptFile: "/tmp/p.md", outFile: "/tmp/o.json", logFile: "/tmp/l.jsonl", errorFile: "/tmp/e.log", schemaFile: "/tmp/s.json" });
+  assert.match(cmd, /^\/opt\/real\/codex exec /);
+  assert.doesNotMatch(cmd, /(^|\s)codex exec/, "a bare `codex` is whatever PATH hands us — including a shim");
+});
+
+test("2.1: no shipped file invokes a bare `timeout` (macOS has no such binary)", async () => {
+  // The plan asked for this audit and it came back CLEAN — recorded as a standing guard rather than a
+  // one-time grep, since the shim's failure mode (`command not found: timeout`, then a 0%-CPU hang)
+  // is the one an operator is trained to misread as a quota wall.
+  const root = new URL("../../", import.meta.url).pathname;
+  const files = [];
+  const walk = async (rel) => {
+    for (const ent of await readdir(join(root, rel), { withFileTypes: true })) {
+      if (ent.name === "tmp" || ent.name === "node_modules") continue;
+      const child = join(rel, ent.name);
+      if (ent.isDirectory()) await walk(child);
+      else if (/\.(sh|mjs)$/.test(ent.name)) files.push(child);
+    }
+  };
+  await walk("skills"); await walk("hooks");
+  // This suite runs from BOTH a checkout and from ~/.claude (install.sh verifies the installed copy),
+  // and `install.sh` exists only in the former. Include it when present rather than assuming a layout —
+  // the previous line assumed it and turned every install into a red suite.
+  if (existsSync(join(root, "install.sh"))) files.push("install.sh");
+  // A grep that scanned nothing would pass loudest at the moment it stopped working (DER-2743).
+  assert.ok(files.length >= 5, `expected to scan the shipped tree, got ${files.length} file(s) under ${root}`);
+  const offenders = [];
+  for (const f of files) {
+    const body = await readFile(join(root, f), "utf8");
+    body.split("\n").forEach((line, i) => {
+      // A shell invocation of coreutils `timeout`, not the harness's own `--timeout <n>` flag.
+      if (/(^|[;&|`(]|\s)timeout\s+-?-?[0-9kKsSmMhH]/.test(line) && !/--timeout/.test(line)) offenders.push(`${f}:${i + 1}: ${line.trim().slice(0, 100)}`);
+    });
+  }
+  assert.deepEqual(offenders, [], `bare \`timeout\` is not available on macOS:\n${offenders.join("\n")}`);
+});
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// 2.2 — `watch` always prints, so silence is structurally impossible.
+
+test("2.2: a SIGTERMed watch prints a terminal record instead of dying silently", async () => {
+  // THE control. The prescribed background-watch pattern killed shepherd #5's watcher twice; it exited
+  // after ~100s printing NOTHING, indistinguishable from a quiet wake. This runs the real signal path in
+  // a real child process, because an in-process test cannot exercise process.exit + a synchronous write.
+  const dir = await mkdtemp(join(tmpdir(), "wr-watch-killed-"));
+  try {
+    const runDir = join(dir, "runs", "R1");
+    await mkdir(runDir, { recursive: true });
+    await writeFile(join(runDir, "events.jsonl"),
+      `${JSON.stringify({ ts: "2026-01-01T00:00:00.000Z", actor: "orch", type: "run_started", run_id: "R1", event_id: "0".repeat(39) + "1", source_id: "t:0:0", seq: 1, schema_version: 1 })}\n`, "utf8");
+    const runner = new URL("./work-runner.mjs", import.meta.url).pathname;
+
+    const { out, code } = await new Promise((res) => {
+      const ch = spawn(process.execPath, [runner, "watch", "--run", "R1", "--runs-root", join(dir, "runs"),
+        "--repo-root", dir, "--since", "99", "--nudge-since", "0", "--timeout", "120"], { cwd: dir, stdio: ["ignore", "pipe", "ignore"] });
+      let buf = "";
+      ch.stdout.on("data", (d) => { buf += d; });
+      const t = setTimeout(() => ch.kill("SIGTERM"), 1200);
+      ch.on("exit", (code) => { clearTimeout(t); res({ out: buf, code }); });
+    });
+
+    assert.notEqual(out.trim(), "", "a watcher that dies in silence is indistinguishable from one that is quietly waiting — that is the defect");
+    const rec = JSON.parse(out.trim().split("\n").pop());
+    assert.equal(rec.wake, "killed");
+    assert.equal(rec.signal, "SIGTERM");
+    assert.equal(rec.run, "R1");
+    assert.ok(rec.cursor, "the record must carry a resumable cursor, or the successor cannot know what it missed");
+    assert.match(rec.note, /UNSEEN/, "it must say that events past the cursor were NOT observed");
+    assert.equal(code, 128 + 15, "and it must still report death-by-signal to its parent");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("2.2: the watch signal trap does not leak listeners across in-process calls", async () => {
+  // `runSubcommand` is called in-process by the suite and by chained subcommands. Without removal on the
+  // normal exit path, every call would add another listener set and Node warns at 11 — a fix that
+  // introduces a slow leak into the one loop that runs unattended for hours is not a fix.
+  const dir = await mkdtemp(join(tmpdir(), "wr-watch-leak-"));
+  try {
+    const runDir = join(dir, "runs", "R1");
+    await mkdir(runDir, { recursive: true });
+    await writeFile(join(runDir, "events.jsonl"),
+      `${JSON.stringify({ ts: "2026-01-01T00:00:00.000Z", actor: "orch", type: "run_started", run_id: "R1", event_id: "0".repeat(39) + "1", source_id: "t:0:0", seq: 1, schema_version: 1 })}\n`, "utf8");
+    const before = process.listenerCount("SIGTERM");
+    for (let i = 0; i < 3; i++) {
+      await runSubcommand(["watch", "--run", "R1", "--runs-root", join(dir, "runs"), "--repo-root", dir, "--since", "0", "--nudge-since", "0", "--timeout", "5"]);
+    }
+    assert.equal(process.listenerCount("SIGTERM"), before, "handlers must be removed on the normal exit path too");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
