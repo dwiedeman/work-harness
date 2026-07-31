@@ -28,6 +28,7 @@ import {
   clampWatchTimeout, WATCH_TIMEOUT_MAX_S,
   harnessDriftVerdict, aggregateDigest, measureHarnessDrift, HARNESS_MANIFEST_FILE,
   resolveCodexBinFrom,
+  parseLensVerdicts, reviewSwapEvent, gateShaRefusal, codexWaiverFrom, gateBlockerCountVerdict,
   assignedBudgetFor, renderAssignedBudget,
   ROTATION_CAP, resolveContextWindow, rotationBands, classifyContext,
   transcriptSlug, transcriptDirFor, leadBriefFromHead, pickLeadTranscript,
@@ -3773,13 +3774,13 @@ test("DER-2603: state.gate_missing puts an un-gated PR on the board, and watch r
   const base = [D2603_STAMPED, { type: "lead_spawned", issue: "DER-1" }, { type: "pr_opened", issue: "DER-1", pr: 11 }];
   const s = materializeState(base, { run_id: "R" });
   assert.deepEqual((s.gate_missing ?? []).map((g) => g.issue), ["DER-1"], "a handed-off PR with no gate evidence belongs on the board, not only at enqueue time");
-  assert.equal(s.issues["DER-1"].gate_seen, false);
+  assert.equal(s.issues["DER-1"].gate?.seen ?? false, false);
   assert.match(s.gate_missing[0].note, /review_findings/);
   // CONTROL 1 — the gate event clears it. A banner that is always non-empty is a banner nobody reads.
   const gated = materializeState([...base, { type: "review_findings", issue: "DER-1", sha: "abc", blockers: 0, round: 1 }], { run_id: "R" });
   assert.deepEqual(gated.gate_missing, []);
-  assert.equal(gated.issues["DER-1"].gate_seen, true);
-  assert.equal(gated.issues["DER-1"].gate_sha, "abc");
+  assert.equal(gated.issues["DER-1"].gate.seen, true);
+  assert.equal(gated.issues["DER-1"].gate.sha, "abc");
   // CONTROL 2 — a lead still building (no PR handed off) is NOT listed: the gate is a PRE-PR check, and
   // flagging every in-flight lead would make the banner permanently red.
   assert.deepEqual(materializeState([D2603_STAMPED, { type: "lead_spawned", issue: "DER-2" }]).gate_missing, []);
@@ -4021,11 +4022,11 @@ test("DER-2782: an UNREADABLE blockers count reaches the board too (the fold's `
   const base = [D2603_STAMPED, { type: "lead_spawned", issue: "DER-1" }, { type: "pr_opened", issue: "DER-1", pr: 12 }];
   const s = materializeState([...base, d2782Gate({ blockers: "two", findings: [] })], { run_id: "R" });
   assert.deepEqual(s.gate_blocked.map((g) => [g.issue, g.blockers]), [["DER-1", "UNREADABLE"]]);
-  assert.equal(s.issues["DER-1"].gate_blockers_unreadable, true);
+  assert.equal(s.issues["DER-1"].gate.blockers_unreadable, true);
   // CONTROL — a real zero is not unreadable, and does not land on the banner.
   const ok = materializeState([...base, d2782Gate({ blockers: 0, findings: [] })], { run_id: "R" });
   assert.deepEqual(ok.gate_blocked, []);
-  assert.equal(ok.issues["DER-1"].gate_blockers_unreadable, false);
+  assert.equal(ok.issues["DER-1"].gate.blockers_unreadable, false);
 });
 
 test("DER-2782: `append` refuses a malformed gate_adjudication and shouts about a valid one", async () => {
@@ -4230,15 +4231,15 @@ test("DER-2837: an under-counted gate reaches the BOARD — the fold trusted the
   const s = materializeState([...base, d2837Gate({ blockers: 0 })], { run_id: "R" });
   assert.deepEqual(s.gate_blocked.map((g) => [g.issue, g.blockers]), [["DER-1", "INCONSISTENT"]]);
   assert.match(s.gate_blocked[0].note, /INCONSISTENT/, "the banner must say what is wrong, not just that something is");
-  assert.match(s.issues["DER-1"].gate_blockers_inconsistent, /records 0 blocker\(s\) but its findings list holds 2/);
-  assert.equal(s.issues["DER-1"].gate_blockers_unreadable, false, "an inconsistent count is READABLE — conflating the two loses the operator's next action");
+  assert.match(s.issues["DER-1"].gate.blockers_inconsistent, /records 0 blocker\(s\) but its findings list holds 2/);
+  assert.equal(s.issues["DER-1"].gate.blockers_unreadable, false, "an inconsistent count is READABLE — conflating the two loses the operator's next action");
   // CONTROLS — an honest dirty unit still lands with its NUMBER, and an honest clean unit stays off.
   const honest = materializeState([...base, d2837Gate()], { run_id: "R" });
   assert.deepEqual(honest.gate_blocked.map((g) => [g.issue, g.blockers]), [["DER-1", 2]]);
-  assert.equal(honest.issues["DER-1"].gate_blockers_inconsistent, null);
+  assert.equal(honest.issues["DER-1"].gate.blockers_inconsistent, null);
   const clean = materializeState([...base, d2837Gate({ blockers: 0, findings: [D2837_P3] })], { run_id: "R" });
   assert.deepEqual(clean.gate_blocked, []);
-  assert.equal(clean.issues["DER-1"].gate_blockers_inconsistent, null);
+  assert.equal(clean.issues["DER-1"].gate.blockers_inconsistent, null);
 });
 
 test("DER-2837: `append` refuses a review_findings whose count disagrees with its own findings", async () => {
@@ -4267,7 +4268,7 @@ test("DER-2837: `append` refuses a review_findings whose count disagrees with it
     // side is where the enforcement lives. This is the same split DER-2782 documented for waivers.
     await append({ ...d2837Gate({ blockers: 0, issue: "DER-1" }), event_id: "0192f000-0000-7000-8000-000000000002", source_id: "mini", seq: 1, schema_version: 1 });
     const st = materializeState(await readEvents(dir), { run_id: runId });
-    assert.match(st.issues["DER-1"].gate_blockers_inconsistent, /records 0 blocker/, "a relayed but inconsistent gate event must still be refused by the fold");
+    assert.match(st.issues["DER-1"].gate.blockers_inconsistent, /records 0 blocker/, "a relayed but inconsistent gate event must still be refused by the fold");
     assert.deepEqual(st.gate_blocked.map((g) => g.issue), ["DER-1"]);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
@@ -9567,4 +9568,143 @@ test("2.2: the watch signal trap does not leak listeners across in-process calls
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// PHASE 1 — posture C. Codex was down BOTH ways for ~16h of a 20h run and the harness had no path to
+// record the substitute gate, so a shepherd hand-rolled it and its successor inherited it as tribal
+// knowledge. These pin the fail-closed rules that make the substitute a first-class gate rather than a
+// looser one.
+
+test("1.1 review-swap: fewer than 2 lenses is refused — a redundant panel concurs and deletes live code", () => {
+  const r = parseLensVerdicts({ raw: { correctness: { verdict: "clean" } }, lensesRequested: ["correctness"] });
+  assert.equal(r.ok, false);
+  assert.match(r.refusal, /at least 2 DISTINCT lenses/);
+  // On #1183 the repro lens refuted the security lens and was RIGHT. Three redundant reviewers would
+  // have concurred and removed a `size_bytes` branch that catches truncation the checksum cannot.
+  assert.deepEqual(parseLensVerdicts({ raw: {}, lensesRequested: [] }).ok, false, "an unnamed panel cannot be audited for redundancy");
+});
+
+test("1.1 review-swap: a SILENT lens is INCOMPLETE, never clean", () => {
+  const requested = ["correctness", "security", "repro"];
+  // (a) a lens with no entry at all
+  const missing = parseLensVerdicts({ raw: { correctness: { verdict: "clean" }, security: { verdict: "clean" } }, lensesRequested: requested });
+  assert.equal(missing.ok, false);
+  assert.deepEqual(missing.missing, ["repro"]);
+  assert.match(missing.refusal, /silent lens is INCOMPLETE, never clean/);
+  // (b) a lens that answered with an EMPTY verdict — the shape a truncated subagent produces
+  const empty = parseLensVerdicts({ raw: { correctness: { verdict: "clean" }, security: { verdict: "  " }, repro: { verdict: "clean" } }, lensesRequested: requested });
+  assert.equal(empty.ok, false);
+  assert.deepEqual(empty.empty, ["security"]);
+  // Both must name the ULTIMATUM, not a respawn: the reviewers that went silent on 2026-07-31 were
+  // alive (136k/158k tokens) and delivered in full when told "findings or INCOMPLETE".
+  for (const r of [missing, empty]) assert.match(r.refusal, /INCOMPLETE/);
+});
+
+test("1.1 review-swap: a 1-of-3 panel can never RENDER as a full swap", () => {
+  const lenses = parseLensVerdicts({
+    raw: { correctness: { verdict: "clean", findings: [] }, security: { verdict: "findings", findings: [{ title: "x", priority: 1 }] } },
+    lensesRequested: ["correctness", "security"],
+  });
+  assert.equal(lenses.ok, true);
+  const ev = reviewSwapEvent({ issueId: "DER-1", sha: "a".repeat(40), engine: "claude", model: "opus", lenses });
+  assert.deepEqual(ev.lenses_requested, ["correctness", "security"]);
+  assert.deepEqual(ev.lenses_returned, ["correctness", "security"]);
+  assert.equal(ev.substitute, true, "a substitute must be self-identifying — mistaking one for codex already happened on #1183");
+  assert.equal(ev.blockers, 1, "a P1 from any lens is a blocker for the panel as a whole");
+  assert.equal(ev.verdict, "blockers");
+  assert.equal(ev.reviewer, "claude:opus");
+  // The count must be DERIVED from the findings the event carries, or `ready` refuses it as inconsistent.
+  assert.equal(gateBlockerCountVerdict(ev).ok, true, "the event must satisfy the same blocker-count contract codex events do");
+});
+
+test("2.4 a gate sha must be 40 chars where it is required, and format-checked where it is not", () => {
+  // Measured on #1180: 9- and 10-char forms both read `stale-clean`; only 40 reads CURRENT.
+  for (const bad of ["abc123def", "abc123def0", "zz".repeat(20)]) {
+    assert.match(gateShaRefusal(bad, { command: "review-swap" }), /40-char/, `${bad} must be refused`);
+  }
+  assert.equal(gateShaRefusal("a".repeat(40), { command: "review-swap" }), null);
+  assert.equal(gateShaRefusal("A".repeat(40), { command: "review-swap" }), null, "case must not matter");
+  // ABSENT is a different question from TRUNCATED, and only review-swap requires presence: `gate=UNSTAMPED`
+  // is a legacy shape review-usage still produces legitimately on a bare/non-git checkout.
+  assert.equal(gateShaRefusal(null, { command: "review-usage" }), null);
+  assert.match(gateShaRefusal(null, { command: "review-swap", required: true }), /required/);
+});
+
+test("1.3 codexWaiverFrom: expires by construction, and an unparseable --until is EXPIRED not forever", () => {
+  const at = (until) => [{ type: "codex_gate_waived", reason: "wall", until, ts: "2026-07-31T00:00:00Z" }];
+  const now = "2026-08-01T00:00:00Z";
+  assert.equal(codexWaiverFrom(at("2026-08-05T00:00:00Z"), { now }).active, true);
+  assert.equal(codexWaiverFrom(at("2026-07-15T00:00:00Z"), { now }).active, false, "a past --until is expired");
+  assert.equal(codexWaiverFrom(at("2026-07-15T00:00:00Z"), { now }).expired, true);
+  // Fail CLOSED on a typo. The alternative — treating an unreadable expiry as no expiry — is exactly
+  // how a run silently stops reviewing.
+  const typo = codexWaiverFrom(at("next tuesday"), { now });
+  assert.equal(typo.active, false);
+  assert.equal(typo.expired, true);
+  // No waiver at all is distinct from an expired one: they oblige different actions.
+  const none = codexWaiverFrom([], { now });
+  assert.equal(none.active, false);
+  assert.equal(none.expired, false);
+});
+
+test("1.3 THE INVARIANT: a waiver clears the codex hold and NEVER waives evidence", () => {
+  const waiver = { active: true, reason: "codex quota wall", until: "2026-08-05T00:00:00Z" };
+  const base = { draft: false, threads: 0, checks: "pass", shardsPass: 0, shardsTotal: 0 };
+
+  // Without a waiver, a dead codex holds forever on a condition no action can satisfy.
+  assert.equal(readyVerdict({ ...base, onHead: false, gate: { blocks: false } }).ready, false);
+
+  // With a waiver but NO recorded review, it STILL blocks. This is the property that separates
+  // "must be some recorded adversarial review" from "no review".
+  assert.equal(readyVerdict({ ...base, onHead: false, gate: null, codexWaiver: waiver }).ready, false,
+    "a waiver that also waived evidence would be a licence to merge unreviewed code");
+  const missing = readyVerdict({ ...base, onHead: false, codexWaiver: waiver, gate: { blocks: true, label: "gate=MISSING" } });
+  assert.equal(missing.ready, false);
+
+  // With a substitute gate covering the head, it passes — and SAYS how it was gated.
+  const ok = readyVerdict({ ...base, onHead: false, codexWaiver: waiver,
+    gate: { blocks: false, substitute: true, engine: "claude", model: "opus-5", lenses: ["correctness", "security", "repro"], sha: "a".repeat(40) } });
+  assert.equal(ok.ready, true);
+  assert.match(ok.why, /gate=WAIVED/);
+  assert.match(ok.why, /gate=SUBSTITUTE \(claude\/opus-5, 3 lenses/);
+
+  // An EXPIRED waiver restores the hold. Without this the `--until` requirement would be decorative.
+  assert.equal(readyVerdict({ ...base, onHead: false, gate: { blocks: false }, codexWaiver: { active: false, expired: true } }).ready, false);
+});
+
+test("1.4 state.gate carries provenance, so a substitute is never mistaken for codex", async () => {
+  const mk = (extra) => ([
+    { ts: "2026-07-31T00:00:00Z", actor: "orch", type: "run_started", run_id: "R", mode: "issue-list", issues: ["DER-1"], harness_version: "0.3.0" },
+    { ts: "2026-07-31T00:01:00Z", actor: "lead:DER-1", type: "pr_opened", issue: "DER-1", pr: 7 },
+    { ts: "2026-07-31T00:02:00Z", actor: "shepherd", type: "review_findings", issue: "DER-1", sha: "a".repeat(40), blockers: 0, findings: [], round: 1, ...extra },
+  ]);
+  const codex = materializeState(mk({ reviewer: "codex" }), { run_id: "R" }).issues["DER-1"];
+  assert.equal(codex.gate.seen, true);
+  assert.equal(codex.gate.substitute, false, "an absent `substitute` field means codex — every pre-1.1 event has that shape");
+
+  const swapped = materializeState(mk({
+    reviewer: "claude:opus-5", engine: "claude", model: "opus-5", substitute: true,
+    lenses: ["correctness", "security"], lenses_requested: ["correctness", "security", "repro"],
+  }), { run_id: "R" }).issues["DER-1"];
+  assert.equal(swapped.gate.substitute, true);
+  assert.equal(swapped.gate.engine, "claude");
+  assert.deepEqual(swapped.gate.lenses, ["correctness", "security"]);
+  assert.deepEqual(swapped.gate.lenses_requested, ["correctness", "security", "repro"],
+    "requested vs returned must BOTH survive into state, or a 2-of-3 panel reads as complete");
+
+  // An ungated unit is `gate: null`, and the gate_missing banner still finds it.
+  const ungated = materializeState(mk({}).slice(0, 2), { run_id: "R" });
+  assert.equal(ungated.issues["DER-1"].gate, null);
+  assert.equal(ungated.gate_missing.length, 1);
+});
+
+test("1.5 STRUCK: review-fidelity already refuses rather than inventing a 0% — control, not a fix", () => {
+  // The plan claimed `review-fidelity --pr` "returns nothing and reads as preempt_rate: 0%". It does not,
+  // and re-verification struck the item before any code was written. This control exists so the property
+  // the plan wanted cannot silently regress into the behaviour the plan feared.
+  const scored = scoreReviewFidelity({ local: [{ title: "x" }], cloud: [] });
+  assert.equal(scored.preempt_rate, null, "0/0 is not a 0% hit rate — a fake zero would drag every run average down");
+  const real = scoreReviewFidelity({ local: [], cloud: [{ title: "y" }] });
+  assert.equal(real.preempt_rate, 0, "a REAL zero — the bot posted one finding and the gate pre-empted none — must still be 0");
 });

@@ -42,6 +42,68 @@ For each open PR:
    `node ~/.claude/skills/work/work-runner.mjs append --run <run-id> --runs-root <repo>/tmp/work '{"actor":"shepherd","type":"pr_merged","issue":"<DER-id>","pr":<n>}'`.
    Then score the local gate against what the bot actually posted — `node ~/.claude/skills/work/work-runner.mjs review-fidelity --run <run-id> --runs-root <repo>/tmp/work --issue <DER-id> --pr <n>` — one call per merged PR. This is the only honest measure of whether the pre-PR gate is pre-empting cloud findings (2026-07-26 retrospective: preempt_rate 0% on the issues whose gate output was malformed, while working gates caught 6 findings — the number has to come from the run).
 
+## Posture C — codex is down BOTH ways (the substitute gate)
+
+There are **three** review postures, not two. Know which one you are in before you gate anything:
+
+| Posture | Codex bot on the PR | Local `codex exec` | Gate |
+|---|---|---|---|
+| **A. Normal** | yes | yes | codex pre-PR gate + bot post-PR |
+| **B. Cloud down, local alive** | no | yes | local `codex exec` only |
+| **C. Both down** | no | no | **local adversarial Claude panel, recorded with `review-swap`** |
+
+Posture C is a real operating mode, not an emergency: it ran for ~16h on 2026-07-31 when the bot died 3h47m into a 20h run and `codex exec` hit a quota wall until Aug 4. It used to have zero harness support, so shepherd #4 hand-rolled it and shepherd #5 inherited it as tribal knowledge. This is the procedure, from what actually worked on #1183.
+
+**1. Confirm codex is genuinely down — with the probe, not with `codex login status`.**
+`login status` reports healthy while every call 401s. Probe the resolved binary with **stdin closed** and READ THE ERROR TEXT:
+
+```bash
+"$(node ~/.claude/skills/work/work-runner.mjs preflight --skip-probes >/dev/null 2>&1; echo)" # (or just:)
+codex exec --sandbox read-only "reply OK" < /dev/null
+```
+
+⚠️ **CPU% is NOT a discriminator, and this cost two agents ~40 minutes.** A cmux CLI shim can sit ahead of the real binary on `PATH` and hang at **0.0% CPU with ~37 bytes of output — byte-identical to a quota wall.** The real discriminator: **a genuine hang BURNS CPU; ~0% CPU with ~0 bytes is a wall or a broken wrapper, never work in progress.** A real wall *says so* and names a date (`You've hit your usage limit … Aug 4th, 2026 11:22 PM`). If you get **no output at all, that is UNKNOWN, not "codex is down"** — `preflight`'s `codex-probe` now reports it as `⚠️` for exactly this reason. Re-probe explicitly before concluding anything.
+
+**2. Ask the orchestrator to record a waiver** (or record it yourself if you own the run):
+
+```bash
+node ~/.claude/skills/work/work-runner.mjs waive-codex-gate --run "$RUN" \
+  --reason "codex quota wall, probe output: <paste it>" --until 2026-08-05T00:00:00Z
+```
+
+Without this, `ready` prints `hold (codex not on head)` **forever** — a condition no action can satisfy while codex is dead. `--until` is required so the waiver expires by construction. **The waiver does not waive evidence:** `ready` still refuses any PR with no `review_findings` covering its head.
+
+**3. Dispatch THREE reviewers with DISTINCT refute lenses** — *correctness*, *security/trust-boundary*, *does-it-actually-reproduce*.
+
+**Distinct, not redundant, and this is the whole design.** On #1183 the **repro lens REFUTED the security lens** — security had called a `size_bytes` branch redundant with the checksum; repro proved it caught truncation the checksum could not — and repro was right. **Three redundant reviewers would have concurred and deleted live code.**
+
+**4. Prompt each to REFUTE, defaulting to `refuted=true` under uncertainty.** Majority-refute kills a finding.
+
+**5. Scope each reviewer to the diff over `origin/main`, not the repo.** Cheaper, and it actually finishes.
+
+**6. Demand a verdict-first contract** (see the subagent contract in `work/SKILL.md`): `refuted: true|false` + a one-line reason FIRST, detail after, and every dispatch ends in `COMPLETE` / `INCOMPLETE` / `REFUSED` — never silence. Two of three reviewers went silent twice on 2026-07-31 and then delivered in full on an explicit **"send findings or send INCOMPLETE"** ultimatum. They were not dead (136k / 158k tokens each). **For a SILENT agent, prefer the ultimatum to a respawn**; reserve respawn for a WEDGED one.
+
+**7. Where a finding claims missing coverage, prefer a mutation proof — and REQUIRE PAIRED CONTROLS.** On #1183 one green mutation meant something *only because four control mutations went red*. A single green mutation with no controls proves the test suite ran, not that it tests anything.
+
+**8. Record it with `review-swap`. Never hand-write a `review_findings` event** — the ledger is append-only with no supersession, so a mis-shaped gate record is permanent:
+
+```bash
+node ~/.claude/skills/work/work-runner.mjs review-swap --run "$RUN" \
+  --issue DER-1234 --pr 1183 --sha "$(gh pr view 1183 --json headRefOid -q .headRefOid)" \
+  --engine claude --model claude-opus-5 \
+  --lens correctness --lens security --lens repro \
+  --substitute-reason "codex quota wall until Aug 4" \
+  --verdicts /tmp/panel.json
+```
+
+`--verdicts` is a JSON object keyed by lens: `{"correctness":{"verdict":"clean","findings":[]}, "security":{…}, "repro":{…}}`.
+
+**It fails closed exactly like the codex gate does**, and for the same reason — a gate that dies exits 0, and recording that would manufacture 0-finding "proof" of a clean PR. It refuses: fewer than 2 lenses, any lens missing or with an empty verdict, or a `--sha` that is not 40 chars. **A silent lens is `INCOMPLETE`, never `clean`.** It records `lenses_requested` *and* `lenses_returned`, so a 1-of-3 panel is visible as 1-of-3 and can never render as a full swap.
+
+`ready` then prints `gate=SUBSTITUTE (claude/claude-opus-5, 3 lenses: correctness/security/repro, sha …)` — so nobody downstream mistakes your panel for a codex run. That misattribution is not hypothetical: the #1183 gate was shepherd #4's work and was credited to #5 in a run report and a learnings entry before it was caught.
+
+**9. `review-fidelity` is UNSCOREABLE in posture C, and it already says so.** When the bot never posts it returns `NOT SCOREABLE` and records nothing — it does **not** return `preempt_rate: 0%`. Do not report a 0 here; there is no number to report. Same for the run's kickback rate: see `work-metrics`' gate-coverage split.
+
 ## Cloud leads: draft PRs are NOT yours yet (DER-1838)
 
 **`lead_online` is poller-SYNTHESIZED, never proof of a live session (2026-07-24 incident):** the orchestrator's `--reconcile-pr-events` derives `lead_online` from PR draft state (`host:"cloud"`, `handle:null`) — a #1002 shepherd inferred a round-7 fixer existed from one and was wrong. Evidence a fixer exists = an orch-emitted `lead_spawned` PLUS actual branch movement; absent both, treat the kickback as un-actioned and escalate per the watchdog above.

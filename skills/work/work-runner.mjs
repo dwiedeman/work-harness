@@ -34,6 +34,17 @@ export function parseArgs(argv) {
     else if (a === "--repo-root") o.repoRoot = argv[++i];
     // The sha/tree a review covered (review-usage). Defaults to the worktree HEAD when omitted.
     else if (a === "--sha") o.sha = argv[++i];
+    // `review-swap --lens X --lens Y --lens Z` (1.1) — REPEATABLE, and it must accumulate rather than
+    // last-wins: the whole point of the panel is that the lenses are distinct, so a parser that kept only
+    // the final one would silently record a 3-lens gate as a 1-lens gate. That is the exact 1-of-3-reads-
+    // as-a-full-swap failure the command refuses at every other layer.
+    else if (a === "--lens") (o.lens ??= []).push(argv[++i]);
+    else if (a === "--verdicts") o.verdicts = argv[++i];
+    else if (a === "--engine") o.engine = argv[++i];
+    else if (a === "--substitute-reason") o.substituteReason = argv[++i];
+    // `waive-codex-gate` (1.3). `--until` is required by the command, not merely accepted here.
+    else if (a === "--until") o.until = argv[++i];
+    else if (a === "--reason") o.reason = argv[++i];
     // Re-score an already-scored (pr, round) in review-fidelity instead of returning the prior result.
     // On `reap` it is the DESTRUCTIVE escape hatch (a synonym of --abandon) — see reapRefusal.
     else if (a === "--force") o.force = true;
@@ -1295,7 +1306,34 @@ export function parseChecksOutput({ exitCode, stdout = "", stderr = "" } = {}) {
 // tell" both fail closed, but they oblige the operator to do DIFFERENT things (run the gate vs. make the
 // evidence readable), and a gate that cannot say which one it means is a gate operators learn to wave past.
 // `unknown` carries the reason; see gateEvidenceLookup for the four cases that produce it.
-export function gateEvidenceVerdict({ head, gate, adjudication = null, adjudicationRejected = null, unknown = null } = {}) {
+// 1.4 — the verdict carries PROVENANCE on every branch, not just a pass/block.
+//
+// `gate_seen` was a boolean, so state could not express "gated by a substitute" at all. With posture C
+// now a first-class path, the difference between a codex run and a 3-lens Claude panel is exactly what a
+// reader needs six hours later — and attributing one to the other is not hypothetical: shepherd #5 had
+// to correct the record because the #1183 3-lens gate was shepherd #4's work, and that error had already
+// propagated into a run report and a learnings entry before anyone caught it.
+//
+// Wrapped rather than threaded through each of the nine returns below: every branch gets the same
+// provenance by construction, so a future branch cannot forget to carry it.
+export function gateProvenance(gate) {
+  if (!gate) return { substitute: false, engine: null, model: null, lenses: null, lenses_requested: null, sha: null, reviewer: null };
+  return {
+    substitute: gate.substitute === true,
+    engine: gate.engine ?? null,
+    model: gate.model ?? null,
+    lenses: Array.isArray(gate.lenses) ? gate.lenses : null,
+    lenses_requested: Array.isArray(gate.lenses_requested) ? gate.lenses_requested : null,
+    sha: gate.sha ?? null,
+    reviewer: gate.reviewer ?? null,
+  };
+}
+
+export function gateEvidenceVerdict(args = {}) {
+  return { ...gateEvidenceVerdictCore(args), ...gateProvenance(args.gate) };
+}
+
+function gateEvidenceVerdictCore({ head, gate, adjudication = null, adjudicationRejected = null, unknown = null } = {}) {
   if (unknown) return { state: "unknown", blocks: true, label: `gate=UNKNOWN (${unknown})` };
   if (!gate) {
     return {
@@ -1372,6 +1410,181 @@ export function latestGateEvent(events, issueId) {
     out = e;
   }
   return out;
+}
+
+// ── 2.4 — a gate sha must be 40 chars, enforced at WRITE time ───────────────────────────────────
+// Measured on #1180 across three recordings / 95s: a 9-char and a 10-char sha both read `stale-clean`;
+// only the full 40 reads `CURRENT`. Today that fails SAFE — a short sha under-claims coverage — but a
+// blocker-carrying gate recorded short would block on FALSE STALENESS, and an operator chasing a
+// phantom stale gate is how a real one gets waved through. Enforce at every producer.
+// `required` is FALSE for `review-usage` and true for `review-swap`, deliberately.
+//
+// An ABSENT sha is a pre-existing, separately-tracked shape: it folds to `gate=UNSTAMPED`, which older
+// ledgers rely on and which `review-usage` produces legitimately when `git rev-parse HEAD` cannot run
+// (a bare checkout, a non-git cwd). Making absence fatal here would retroactively refuse those, which is
+// scope this item did not ask for — 2.4 is about a sha that is PRESENT but TRUNCATED, because that is
+// the form that reads `stale-clean` while looking like real coverage. `review-swap` is a new command
+// with no legacy to protect, so it requires the full sha outright.
+export const GATE_SHA_LENGTH = 40;
+export function gateShaRefusal(sha, { command = "review-usage", required = false } = {}) {
+  const s = String(sha ?? "");
+  if (!s) {
+    return required
+      ? `${command}: --sha is required — a gate event with no sha covers no tree, and every reader treats it as UNSTAMPED, which does NOT block.`
+      : null;
+  }
+  if (!/^[0-9a-f]{40}$/i.test(s)) {
+    return `${command}: --sha must be the full 40-char commit sha, got ${JSON.stringify(s)} (${s.length} chars). ` +
+      "An abbreviated sha reads as `stale-clean` at every gate check — measured on #1180 — so a blocker-carrying " +
+      "gate recorded short would block on FALSE staleness. Use `git rev-parse HEAD` or the PR's headRefOid.";
+  }
+  return null;
+}
+
+// ── 1.1 — `review-swap`: the substitute gate as a supported command ─────────────────────────────
+// THREE review postures exist, not two:
+//   A. normal            — codex bot on the PR + local `codex exec`
+//   B. cloud down        — local `codex exec` only
+//   C. BOTH down         — a local adversarial Claude panel        ← the operating mode until Aug 4
+//
+// Posture C had zero harness support. `review-usage` REFUSES a findings-shaped payload without a codex
+// JSONL carrying `turn.completed` — correctly, because a gate that dies exits 0 and recording it would
+// manufacture 0-finding "proof" of a clean PR. But that refusal also meant the substitute gate could not
+// be recorded through ANY supported path, so shepherd #4 hand-rolled it, shepherd #5 inherited it as
+// undocumented tribal knowledge, and the ledger carried no first-class record of how #1183 was gated.
+//
+// So: a separate command with its OWN fail-closed rules, rather than a loosening of codex's.
+//
+// It fails closed in the same shape codex does, for the same reason. A silent lens is INCOMPLETE, never
+// clean — and `lenses_requested` vs `lenses_returned` are both recorded so a 1-of-3 gate is *visible as*
+// 1-of-3 and can never render as a full swap.
+export const REVIEW_SWAP_MIN_LENSES = 2;
+
+// The distinct-lens requirement is not bureaucracy. On #1183 the *repro* lens REFUTED the *security*
+// lens — security had called a `size_bytes` branch redundant with the checksum, and repro proved it was
+// not — and was right. Three redundant reviewers would have concurred and deleted live code.
+export const REVIEW_SWAP_SUGGESTED_LENSES = ["correctness", "security", "repro"];
+
+// Parse + validate the panel's verdicts. Pure, so every refusal is unit-testable.
+// Shape: { "<lens>": { verdict: "clean"|"findings"|"INCOMPLETE"|…, findings: [...], summary } }
+export function parseLensVerdicts({ raw = null, lensesRequested = [] } = {}) {
+  const requested = [...new Set(lensesRequested.filter(Boolean))];
+  const fail = (refusal) => ({ ok: false, refusal, requested, returned: [], missing: [], empty: [], findings: [], verdictPerLens: {} });
+  if (!requested.length) return fail("review-swap: name the lenses with --lens (repeatable). An unnamed panel cannot be audited for redundancy, and redundant reviewers concur — on #1183 the repro lens refuted the security lens and was right.");
+  if (requested.length < REVIEW_SWAP_MIN_LENSES) {
+    return fail(`review-swap: ${requested.length} lens requested; a substitute gate needs at least ${REVIEW_SWAP_MIN_LENSES} DISTINCT lenses (suggested: ${REVIEW_SWAP_SUGGESTED_LENSES.join(", ")}).`);
+  }
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return fail("review-swap: --verdicts must be a JSON object keyed by lens name.");
+
+  const verdictPerLens = {};
+  const returned = [];
+  const missing = [];
+  const empty = [];
+  const findings = [];
+  for (const lens of requested) {
+    const entry = raw[lens];
+    if (entry == null) { missing.push(lens); continue; }
+    // A lens that returned nothing usable is INCOMPLETE, never clean. This is the whole point: a
+    // reviewer that goes silent is indistinguishable from one that found nothing, and two of three
+    // reviewers DID go silent twice on 2026-07-31 before delivering in full on an explicit ultimatum.
+    const verdict = typeof entry === "string" ? entry : entry.verdict;
+    if (verdict == null || String(verdict).trim() === "") { empty.push(lens); continue; }
+    const lensFindings = Array.isArray(entry?.findings) ? entry.findings : [];
+    verdictPerLens[lens] = {
+      verdict: String(verdict).trim(),
+      findings: lensFindings.length,
+      summary: typeof entry?.summary === "string" ? entry.summary : null,
+    };
+    returned.push(lens);
+    for (const f of lensFindings) {
+      findings.push({
+        title: f?.title ?? null, priority: f?.priority ?? null, confidence: f?.confidence ?? null,
+        file: f?.file ?? null, line_start: f?.line_start ?? null, line_end: f?.line_end ?? null,
+        lens,
+      });
+    }
+  }
+  if (missing.length || empty.length) {
+    const parts = [];
+    if (missing.length) parts.push(`no entry for ${missing.join(", ")}`);
+    if (empty.length) parts.push(`no verdict from ${empty.join(", ")}`);
+    return {
+      ok: false, requested, returned, missing, empty, findings: [], verdictPerLens,
+      refusal: `review-swap: REFUSING to record — ${parts.join("; ")}. A silent lens is INCOMPLETE, never clean. ` +
+        `Recording ${returned.length}/${requested.length} as a full swap is exactly the 0-finding-reads-as-CLEAN failure ` +
+        "the codex gate's own refusal exists to prevent. Send the lens its ultimatum (\"findings or INCOMPLETE\") and re-record; " +
+        "a silent subagent is usually alive and truncating, not dead — prefer the ultimatum to a respawn.",
+    };
+  }
+  if (returned.length < REVIEW_SWAP_MIN_LENSES) {
+    return { ok: false, requested, returned, missing, empty, findings: [], verdictPerLens,
+      refusal: `review-swap: only ${returned.length} lens returned; at least ${REVIEW_SWAP_MIN_LENSES} are required.` };
+  }
+  return { ok: true, refusal: null, requested, returned, missing, empty, findings, verdictPerLens };
+}
+
+// The ONE event a substitute gate writes. Same `review_findings` type every reader already understands
+// — so `ready`, the gate-evidence lookup and the blocker-count check all apply unchanged — plus
+// first-class provenance so a substitute can never be mistaken for a codex run.
+export function reviewSwapEvent({ issueId, pr = null, sha, engine = "claude", model = null, lenses = null, substituteReason = null, round = 1, actor = "shepherd" } = {}) {
+  if (!lenses?.ok) throw new Error("reviewSwapEvent: refusing to build an event from an invalid lens panel");
+  const blockers = gateBlockerFindings({ findings: lenses.findings }).length;
+  const ev = {
+    actor, type: "review_findings", role: "reviewer",
+    reviewer: `${engine}${model ? `:${model}` : ""}`,
+    engine, model,
+    substitute: true,
+    substitute_reason: substituteReason ?? null,
+    lenses: lenses.returned,
+    lenses_requested: lenses.requested,
+    lenses_returned: lenses.returned,
+    verdict_per_lens: lenses.verdictPerLens,
+    // A panel is "clean" only if every lens came back with no blocker. Derived, never asserted.
+    verdict: blockers > 0 ? "blockers" : "clean",
+    confidence: null,
+    findings_total: lenses.findings.length,
+    blockers,
+    findings: lenses.findings,
+    tokens_total: null,
+    sha,
+    pr: pr == null ? null : Number(pr),
+    round,
+    ts: new Date().toISOString(),
+  };
+  if (issueId) ev.issue = issueId;
+  return ev;
+}
+
+// ── 1.3 — a run-level codex waiver that lives in STATE, not in prose ────────────────────────────
+// `ready` prints `hold (codex not on head)` forever when codex is dead. On 2026-07-31 the waiver
+// existed ONLY as ledger prose, so every single `ready` call required a human to remember it, and the
+// successor orchestrator had to be *told*. That is not a waiver, it is a rumour.
+//
+// The two properties that make this safe:
+//   * `--until` is REQUIRED, so it expires by construction. An indefinite waiver is how a run silently
+//     stops reviewing.
+//   * IT DOES NOT WAIVE EVIDENCE. With a waiver active, `ready` still blocks unless a `review_findings`
+//     event — codex OR substitute — covers the head. It converts "must be codex" into "must be SOME
+//     recorded adversarial review", never into "no review".
+export function codexWaiverFrom(events = [], { now = null } = {}) {
+  let latest = null;
+  for (const e of events ?? []) if (e?.type === "codex_gate_waived") latest = e;
+  if (!latest) return { active: false, reason: null, until: null, expired: false, waived_at: null };
+  const nowMs = now == null ? Date.now() : (now instanceof Date ? now.getTime() : Date.parse(now));
+  const untilMs = Date.parse(latest.until ?? "");
+  // An unparseable `--until` is treated as EXPIRED, not as forever. Fail closed: the failure mode of the
+  // other choice is a waiver that never ends because its expiry was a typo.
+  const expired = !Number.isFinite(untilMs) || untilMs <= nowMs;
+  return {
+    active: !expired,
+    expired,
+    reason: latest.reason ?? null,
+    until: latest.until ?? null,
+    waived_at: latest.ts ?? null,
+    why: expired
+      ? `codex waiver EXPIRED at ${latest.until ?? "an unparseable timestamp"} — re-issue it with waive-codex-gate --until <iso8601> or restore the codex gate`
+      : `codex gate WAIVED until ${latest.until} — ${latest.reason ?? "no reason recorded"}`,
+  };
 }
 
 // ── Gate adjudication (DER-2782) ────────────────────────────────────────────────────────────────
@@ -1620,10 +1833,15 @@ function checksHold(checks, allowMergeWithoutChecks) {
   }
   return `checks=${checks}`;
 }
-export function readyVerdict({ draft, threads, onHead, checks, shardsPass, shardsTotal, gate, allowMergeWithoutChecks = false } = {}) {
+export function readyVerdict({ draft, threads, onHead, checks, shardsPass, shardsTotal, gate, allowMergeWithoutChecks = false, codexWaiver = null } = {}) {
   if (draft !== false) return { ready: false, why: "draft" };
   if (threads !== 0) return { ready: false, why: threads == null || Number.isNaN(threads) ? "threads UNKNOWN (throttled — never treat as 0)" : `${threads} unresolved thread(s)` };
-  if (!onHead) return { ready: false, why: "codex not on head" };
+  // 1.3 — a waiver clears THIS hold and nothing else. When codex is dead the bot will never post on any
+  // head, so this hold can never clear on its own and the run stalls on a condition no action satisfies.
+  // The waiver converts "must be codex" into "must be some recorded adversarial review": the `gate`
+  // check below is untouched and still refuses without a review_findings event covering the head, so a
+  // waived run reviews exactly as hard — it just stops requiring that the reviewer be codex.
+  if (!onHead && !codexWaiver?.active) return { ready: false, why: "codex not on head" };
   const checksWaived = checks === "absent" && allowMergeWithoutChecks === true;
   if (checks !== "pass" && !checksWaived) return { ready: false, why: checksHold(checks, allowMergeWithoutChecks) };
   if (shardsTotal > 0 && shardsPass !== shardsTotal) return { ready: false, why: `db shards ${shardsPass}/${shardsTotal}` };
@@ -1633,7 +1851,22 @@ export function readyVerdict({ draft, threads, onHead, checks, shardsPass, shard
   // throttled thread count as 0. `ready` computes this from the ledger via gateEvidenceLookup.
   if (!gate) return { ready: false, why: "gate UNKNOWN (no pre-PR review evidence was read for this PR — `ready` derives it from the run ledger; pass --run <id>)" };
   if (gate.blocks) return { ready: false, why: gate.label };
-  return { ready: true, why: checksWaived ? "all gates pass (checks ABSENT — WAIVED by repo.allowMergeWithoutChecks)" : "all gates pass" };
+  // The gate PASSED. Say how it was gated, rather than printing an undifferentiated "all gates pass" —
+  // a substitute panel and a codex run are not the same evidence, and a reader six hours later (or a
+  // successor orchestrator) must be able to tell which one authorized the merge without re-reading the
+  // ledger by hand. This is the line that used to be an unclearable `hold (codex not on head)`.
+  const notes = [];
+  if (checksWaived) notes.push("checks ABSENT — WAIVED by repo.allowMergeWithoutChecks");
+  if (!onHead && codexWaiver?.active) {
+    notes.push(`gate=WAIVED (${codexWaiver.reason ?? "no reason recorded"}, expires ${codexWaiver.until})`);
+  }
+  if (gate.substitute) {
+    const lensCount = Array.isArray(gate.lenses) ? gate.lenses.length : null;
+    notes.push(`gate=SUBSTITUTE (${gate.engine ?? "?"}${gate.model ? `/${gate.model}` : ""}` +
+      `${lensCount ? `, ${lensCount} lens${lensCount === 1 ? "" : "es"}: ${gate.lenses.join("/")}` : ""}` +
+      `${gate.sha ? `, sha ${String(gate.sha).slice(0, 9)}` : ""})`);
+  }
+  return { ready: true, why: notes.length ? `all gates pass (${notes.join("; ")})` : "all gates pass" };
 }
 
 // ── Merge mode: queue vs direct (DER-2753) ──────────────────────────────────────────────────────
@@ -4469,7 +4702,7 @@ export function materializeState(rawEvents, meta = {}) {
       // `spawn_failed*` (DER-2739) and `transcripts_forced` (DER-2744) are both TRI-STATE-ish on purpose:
       // `transcripts_forced: null` means UNKNOWN — a spawn event that carried no attestation — and unknown
       // is never the same as ok. See the transcripts_unverified banner.
-      issues[id] = { status: "queued", pr: null, worktree: null, branch: null, workspace_ref: null, kickback_count: 0, kickback_unactioned: false, kickback_sha: null, fileScope: [], host: null, bundle: null, tokens: 0, plan_scope_seen: false, gate_seen: false, gate_sha: null, gate_blockers: null, gate_round: null, gate_engine: null, budget: "ok", leadType: null, rotations: 0, rotate_pending: false, rotate_pct: null, rotate_disposition: null, spawn_failed: false, spawn_failed_count: 0, spawn_failed_note: null, spawn_failed_exit_code: null, transcripts_forced: null, reap_cleanup_ok: null, reap_failed: false, reap_leaks: [], reap_failed_note: null, gate_adjudicated: null, gate_adjudication_rejected: null, _reports: {}, _kb_uncounted: false, _gate_event: null, _gate_adjs: [] };
+      issues[id] = { status: "queued", pr: null, worktree: null, branch: null, workspace_ref: null, kickback_count: 0, kickback_unactioned: false, kickback_sha: null, fileScope: [], host: null, bundle: null, tokens: 0, plan_scope_seen: false, gate: null, budget: "ok", leadType: null, rotations: 0, rotate_pending: false, rotate_pct: null, rotate_disposition: null, spawn_failed: false, spawn_failed_count: 0, spawn_failed_note: null, spawn_failed_exit_code: null, transcripts_forced: null, reap_cleanup_ok: null, reap_failed: false, reap_leaks: [], reap_failed_note: null, gate_adjudicated: null, gate_adjudication_rejected: null, _reports: {}, _kb_uncounted: false, _gate_event: null, _gate_adjs: [] };
     }
     return issues[id];
   };
@@ -4674,22 +4907,40 @@ export function materializeState(rawEvents, meta = {}) {
         // DER-2603 — the pre-PR review gate, folded so a MISSING one is visible on the board and not only
         // at enqueue time. Deliberately records what the evidence COVERS (`sha`) rather than just that it
         // exists: an event from round 1 says nothing about the round-3 head (see gateEvidenceVerdict).
-        it.gate_seen = true;
-        it.gate_sha = e.sha ?? null;
         {
+          // 1.4 — ONE structured `gate` object, replacing the flat `gate_seen` boolean and its four
+          // siblings. A boolean cannot express "gated by a substitute", and with posture C now a
+          // first-class path that distinction is exactly what a later reader needs: attributing a
+          // 3-lens Claude panel to codex is not hypothetical, it happened on #1183 and propagated into
+          // a run report and a learnings entry before shepherd #5 caught it.
+          //
           // DER-2782 — `|| 0` turns an UNREADABLE count into a clean one, which is the same fail-open
           // gateEvidenceVerdict now refuses. Kept as its own flag rather than by letting NaN into
-          // `gate_blockers`, which every existing consumer of that field reads as a number.
+          // `blockers`, which every existing consumer of that field reads as a number.
           // DER-2837 — and the fold trusted the NUMBER exactly as `ready` did, so an under-counted unit
           // was missing from `gate_blocked` too: the board, which exists so the round is caught BEFORE
           // enqueue, agreed with the lie. Same contract, one function, both readers.
           const count = gateBlockerCountVerdict(e);
-          it.gate_blockers = count.recorded ?? 0;
-          it.gate_blockers_unreadable = count.kind === "unreadable";
-          it.gate_blockers_inconsistent = count.ok || count.kind === "unreadable" ? null : count.reason;
+          const prior = it.gate ?? {};
+          it.gate = {
+            seen: true,
+            sha: e.sha ?? null,
+            blockers: count.recorded ?? 0,
+            blockers_unreadable: count.kind === "unreadable",
+            blockers_inconsistent: count.ok || count.kind === "unreadable" ? null : count.reason,
+            round: Number.isFinite(Number(e.round)) ? Number(e.round) : prior.round ?? null,
+            // Provenance. `substitute` is strictly `true` only when the producer said so — an absent
+            // field means codex, which is what every pre-1.1 event is.
+            substitute: e.substitute === true,
+            engine: e.engine ?? prior.engine ?? null,
+            model: e.model ?? prior.model ?? null,
+            reviewer: e.reviewer ?? prior.reviewer ?? null,
+            // requested vs returned, both kept: a 1-of-3 panel must be VISIBLE as 1-of-3 and must never
+            // render as a full swap.
+            lenses: Array.isArray(e.lenses) ? e.lenses : null,
+            lenses_requested: Array.isArray(e.lenses_requested) ? e.lenses_requested : null,
+          };
         }
-        it.gate_round = Number.isFinite(Number(e.round)) ? Number(e.round) : it.gate_round ?? null;
-        it.gate_engine = e.engine ?? e.model ?? it.gate_engine ?? null;
         // DER-2782 — the WHOLE event, because an adjudication is checked against this event's findings
         // list, not against the blocker COUNT. Kept private and dropped in the finalize pass below.
         it._gate_event = e;
@@ -5056,8 +5307,13 @@ export function materializeState(rawEvents, meta = {}) {
     // Scoped to handed-off units on purpose: the gate is a PRE-PR check, so an in-flight lead that has not
     // handed off yet is not late — listing every open draft would make this permanently non-empty, and a
     // banner that is always red is a banner nobody reads (the DER-2744 lesson, applied here).
+    // 1.3 — the codex waiver, as STATE. It previously existed only as ledger prose, so every `ready`
+    // call needed a human to remember it and a successor orchestrator had to be told out of band. An
+    // expired waiver is reported too (`active:false, expired:true`) rather than vanishing: "the waiver
+    // ran out" and "there was never a waiver" oblige an operator to do different things.
+    codex_waiver: codexWaiverFrom(events),
     gate_missing: Object.entries(issues)
-      .filter(([, v]) => !v.gate_seen && v.pr != null && (v.status === "pr_open" || v.status === "kickback"))
+      .filter(([, v]) => !v.gate?.seen && v.pr != null && (v.status === "pr_open" || v.status === "kickback"))
       .map(([k, v]) => ({
         issue: k, pr: v.pr, status: v.status, host: v.host,
         note: "no review_findings event — the pre-PR adversarial review gate never ran for this PR. `ready` will refuse it; gate it now (or record why codex is unavailable, WITH the probe output) rather than at enqueue time.",
@@ -5069,16 +5325,19 @@ export function materializeState(rawEvents, meta = {}) {
     // own round-1 findings is not late, and a banner that is permanently red is a banner nobody reads.
     gate_blocked: Object.entries(issues)
       .filter(([, v]) => v.pr != null && (v.status === "pr_open" || v.status === "kickback")
-        && ((v.gate_blockers ?? 0) > 0 || v.gate_blockers_unreadable || v.gate_blockers_inconsistent) && !v.gate_adjudicated)
+        && ((v.gate?.blockers ?? 0) > 0 || v.gate?.blockers_unreadable || v.gate?.blockers_inconsistent) && !v.gate_adjudicated)
       .map(([k, v]) => ({
         issue: k, pr: v.pr, status: v.status,
-        blockers: v.gate_blockers_unreadable ? "UNREADABLE" : v.gate_blockers_inconsistent ? "INCONSISTENT" : v.gate_blockers,
-        sha: v.gate_sha, round: v.gate_round,
+        blockers: v.gate.blockers_unreadable ? "UNREADABLE" : v.gate.blockers_inconsistent ? "INCONSISTENT" : v.gate.blockers,
+        sha: v.gate.sha, round: v.gate.round,
+        // 1.4 — WHO gated it. A substitute panel and a codex run are different evidence, and a banner
+        // that cannot say which is a banner that invites the #1183 misattribution all over again.
+        engine: v.gate.engine, substitute: v.gate.substitute, lenses: v.gate.lenses,
         rejected_adjudication: v.gate_adjudication_rejected,
         // DER-2837 — an inconsistent event gets its OWN sentence. "Fix your blockers" is the wrong
         // instruction for evidence whose blocker count cannot be believed in the first place.
-        note: v.gate_blockers_inconsistent
-          ? `the pre-PR gate's latest verdict is INCONSISTENT WITH ITSELF — it ${v.gate_blockers_inconsistent}. \`ready\` will refuse this PR. Re-run the gate: an under-counted event would otherwise authorize a merge over an open blocker, and no waiver can cover findings the count denies.`
+        note: v.gate.blockers_inconsistent
+          ? `the pre-PR gate's latest verdict is INCONSISTENT WITH ITSELF — it ${v.gate.blockers_inconsistent}. \`ready\` will refuse this PR. Re-run the gate: an under-counted event would otherwise authorize a merge over an open blocker, and no waiver can cover findings the count denies.`
           : "the pre-PR gate's latest verdict still records OPEN blockers. `ready` will refuse this PR. Fix them and re-run the gate, or — orchestrator/operator ONLY — record a gate_adjudication naming every one.",
       })),
     // Waived-findings banner (DER-2782). The AUDIT half, and the reason this list exists at all: a
@@ -7408,6 +7667,16 @@ export async function runSubcommand(argv) {
         // TREE, which may not equal any pushed commit.
         const shaRes = o.sha ? null : await runCommand({ command: "git", args: ["rev-parse", "HEAD"], cwd: cwdForReview }).catch(() => null);
         const coveredSha = o.sha ?? String(shaRes?.stdout ?? "").trim() ?? null;
+        // 2.4 — enforce the full 40 chars AT WRITE TIME. Measured on #1180 across three recordings/95s:
+        // 9- and 10-char forms both read `stale-clean`, only 40 reads `CURRENT`. It fails safe today, but
+        // a blocker-carrying gate recorded short would block on FALSE staleness — and an operator who has
+        // learned to distrust "stale" holds is one who waves past a real one. `git rev-parse HEAD` already
+        // returns 40, so this only ever fires on a hand-passed `--sha`, which is exactly the case worth
+        // refusing rather than silently truncating the run's evidence.
+        {
+          const bad = gateShaRefusal(coveredSha, { command: "review-usage" });
+          if (bad) throw new Error(bad);
+        }
         const cev = reviewFindingsEvent(review, {
           issueId: o.issueId,
           round: o.round ?? o.kickback ?? 1,
@@ -7430,6 +7699,76 @@ export async function runSubcommand(argv) {
         ? `\n⚠ providers=${ev.providers.join(",")} — this review did NOT ride the Claude subscription. Unset ANTHROPIC_BASE_URL/AUTH_TOKEN/API_KEY on the review call and run it again.\n`
         : "";
       return { stdout: `${payload.result ?? ""}\n${warn}\n— recorded: ${Object.keys(ev.by_model).join(", ")}, ${ev.total_tokens.toLocaleString()} tokens, round ${ev.round} (${ev.billing})`, event: ev };
+    }
+    case "review-swap": {
+      // 1.1 — record a SUBSTITUTE adversarial review (posture C: codex bot down AND `codex exec` down).
+      //
+      // This exists because `review-usage` correctly refuses a findings-shaped payload with no codex
+      // JSONL, and that refusal left the substitute gate with no supported path at all — so shepherd #4
+      // hand-rolled it and shepherd #5 inherited it as undocumented tribal knowledge. Never hand-write a
+      // `review_findings` event: the ledger is append-only with no supersession, so a mis-shaped gate
+      // record is permanent, and this command is the only thing that validates the shape.
+      if (!runDir) throw new Error("review-swap needs --run <id>");
+      if (!o.issueId) throw new Error("review-swap needs --issue <DER-id> — the gate is recorded against a unit");
+      const shaBad = gateShaRefusal(o.sha, { command: "review-swap", required: true });
+      if (shaBad) throw new Error(shaBad);
+      if (!o.verdicts) throw new Error("review-swap needs --verdicts <file.json> — an object keyed by lens name, each carrying {verdict, findings[]}");
+      let rawVerdicts;
+      try { rawVerdicts = JSON.parse(await readFile(resolvePath(o.verdicts), "utf8")); }
+      catch (err) { throw new Error(`review-swap --verdicts ${o.verdicts}: ${err instanceof Error ? err.message : String(err)}`); }
+
+      const lenses = parseLensVerdicts({ raw: rawVerdicts, lensesRequested: o.lens ?? [] });
+      if (!lenses.ok) throw new Error(lenses.refusal);
+
+      const ev = reviewSwapEvent({
+        issueId: o.issueId, pr: o.pr ?? null, sha: o.sha,
+        engine: o.engine ?? "claude", model: o.model ?? null,
+        lenses, substituteReason: o.substituteReason ?? null,
+        round: Number.isFinite(Number(o.round)) ? Number(o.round) : 1,
+        actor: o.actor ?? "shepherd",
+      });
+      await appendEvent(runDir, ev);
+      const lensLine = lenses.returned.map((l) => `${l}=${lenses.verdictPerLens[l].verdict}(${lenses.verdictPerLens[l].findings})`).join(" ");
+      return {
+        event: ev,
+        stdout: [
+          `review-swap recorded for ${o.issueId}${o.pr ? ` (PR #${o.pr})` : ""} — SUBSTITUTE gate, engine=${ev.engine}${ev.model ? `/${ev.model}` : ""}`,
+          `  sha ${o.sha}`,
+          `  lenses ${lenses.returned.length}/${lenses.requested.length}: ${lensLine}`,
+          `  findings ${ev.findings_total} (blockers ${ev.blockers}) → verdict ${ev.verdict}`,
+          ev.blockers > 0
+            ? "  `ready` will REFUSE this PR until the blockers are fixed and the panel re-run, or an orchestrator records a gate_adjudication naming each one."
+            : "  `ready` will report gate=SUBSTITUTE with this provenance — it is NOT indistinguishable from a codex run.",
+        ].join("\n"),
+      };
+    }
+    case "waive-codex-gate": {
+      // 1.3 — a run-level codex waiver that lives in state instead of prose.
+      if (!runDir) throw new Error("waive-codex-gate needs --run <id>");
+      if (!o.reason) throw new Error("waive-codex-gate needs --reason <text> — an unexplained waiver is indistinguishable from a forgotten one");
+      if (!o.until) {
+        throw new Error("waive-codex-gate needs --until <iso8601>. A waiver MUST expire by construction — " +
+          "an indefinite one is how a run silently stops reviewing. Use the wall's own reset time when you have it " +
+          "(e.g. the `You've hit your usage limit … Aug 4th` text), else pick a bounded horizon and re-issue.");
+      }
+      const untilMs = Date.parse(o.until);
+      if (!Number.isFinite(untilMs)) throw new Error(`waive-codex-gate: --until ${JSON.stringify(o.until)} is not a parseable ISO-8601 timestamp`);
+      if (untilMs <= Date.now()) throw new Error(`waive-codex-gate: --until ${o.until} is in the PAST — that waiver is expired the moment it is written`);
+      const ev = {
+        actor: o.actor ?? "orch", type: "codex_gate_waived",
+        reason: o.reason, until: new Date(untilMs).toISOString(), ts: new Date().toISOString(),
+      };
+      await appendEvent(runDir, ev);
+      return {
+        event: ev,
+        stdout: [
+          `codex gate WAIVED until ${ev.until} — ${ev.reason}`,
+          "  `ready` will stop holding on `codex not on head` and print gate=WAIVED instead.",
+          "  THE WAIVER DOES NOT WAIVE EVIDENCE: `ready` still refuses any PR with no review_findings",
+          "  event covering its head. Record substitute reviews with `review-swap` (3 distinct lenses).",
+          "  It expires by construction — after that, `ready` holds again until it is re-issued.",
+        ].join("\n"),
+      };
     }
     case "review-fidelity": {
       // Shepherd-facing, run AFTER the cloud Codex review lands on a PR:
@@ -8282,6 +8621,7 @@ export async function runSubcommand(argv) {
       // events once here regardless of whether PR numbers were supplied on the command line.
       const readyEvents = runDir ? await readEvents(runDir) : [];
       const readyState = runDir ? materializeState(readyEvents, { run_id: o.runId }) : { issues: {} };
+      const readyCodexWaiver = codexWaiverFrom(readyEvents);
       const issueByPr = new Map();
       for (const [id, v] of Object.entries(readyState.issues)) if (v.pr != null) issueByPr.set(v.pr, id);
       if (!prNums.length && runDir) {
@@ -8357,6 +8697,10 @@ export async function runSubcommand(argv) {
         const verdict = readyVerdict({
           draft, threads, onHead, checks: chk.checks, shardsPass: chk.shardsPass, shardsTotal: chk.shardsTotal, gate,
           allowMergeWithoutChecks: mergePolicy.allowMergeWithoutChecks,
+          // 1.3 — read from the ledger, not from an operator's memory. Without this the `codex not on
+          // head` hold can never clear while codex is dead, so `ready` reports a condition no action
+          // satisfies and the run stalls on a lie of omission.
+          codexWaiver: readyCodexWaiver,
         });
         // DER-2774: the printed direct-merge command is bound to the SAME head every gate above was
         // evaluated against, so a push landing between `ready` and the merge is refused by GitHub
@@ -8364,8 +8708,13 @@ export async function runSubcommand(argv) {
         const action = mergeAction({ mode: resolvedMode.mode, strategy: mergePolicy.mergeStrategy, pr: n, verdict, expectedHead: head });
         results.push({ pr: n, head, draft, threads, onHead, reviewSha, commentSha, checks: chk.checks, shards: `${chk.shardsPass}/${chk.shardsTotal}`, behind, push, gate: gate.state, gateLabel: gate.label, ...verdict, note, mergeMode: resolvedMode.mode, mergeModeSource: resolvedMode.source, mergeAction: action });
       }
+      const waiverLine = readyCodexWaiver.active
+        ? `⚠ codex gate WAIVED until ${readyCodexWaiver.until} — ${readyCodexWaiver.reason}. Evidence is NOT waived: a PR with no review_findings covering its head still blocks.`
+        : readyCodexWaiver.expired
+          ? `codex waiver EXPIRED (${readyCodexWaiver.until}) — the \`codex not on head\` hold is live again; re-issue with waive-codex-gate or restore the gate.`
+          : null;
       const header = `merge mode: ${resolvedMode.mode ?? "UNRESOLVED"} (${resolvedMode.source}) — ${resolvedMode.why}${mergePolicy.allowMergeWithoutChecks ? "  [repo.allowMergeWithoutChecks=true: waives checks=ABSENT only (gh answered \"no checks on this branch\"); fail, pending and UNKNOWN all still block]" : ""}`;
-      const text = [header, ...results.map((r) => readyLine(r))].join("\n");
+      const text = [header, ...(waiverLine ? [waiverLine] : []), ...results.map((r) => readyLine(r))].join("\n");
       return { results, mergeMode: resolvedMode.mode, stdout: o.json ? JSON.stringify(results) : text };
     }
     case "preflight": {
@@ -8889,6 +9238,12 @@ export async function runSubcommand(argv) {
               // DER-2603: a handed-off PR with no pre-PR gate event. It re-surfaces every wake because the
               // alternative — the old behaviour — was that it surfaced nowhere and `ready` called it
               // enqueueable. Cleared only by the gate actually running (a `review_findings` event).
+              // 1.3 — every wake carries the waiver, so a successor orchestrator learns it from the
+              // ledger instead of from a predecessor remembering to mention it. An EXPIRED waiver is
+              // surfaced too: "it ran out" and "there never was one" oblige different actions.
+              codex_waiver: st.codex_waiver?.active
+                ? { until: st.codex_waiver.until, reason: st.codex_waiver.reason }
+                : (st.codex_waiver?.expired ? { expired: true, until: st.codex_waiver.until } : null),
               gate_missing: (st.gate_missing ?? []).map((r) => r.issue),
               // DER-2782: the gate RAN and its findings are still open. Same wake-level treatment as
               // gate_missing — `ready` blocks it, so the orchestrator should see it long before enqueue.
@@ -9087,6 +9442,24 @@ Design: the README's context-rotation section.
         [--pull-hosts auto|<csv>]             each ~45s, tail these mini hosts' ledgers into the canonical one
         [--reconcile-merged]                  each ~45s, fold 'gh pr list --state merged' truth in (reap out-of-band merges)
         [--reconcile-pr-events]               each ~45s, fold cloud draft-PR lifecycle in + refresh links.md (cloud runs)
+  review-swap --run <r> --issue <ID> [--pr <n>] --sha <40-char> \
+              [--engine claude] [--model <id>] --lens <name> (x2+) --verdicts <file.json>
+                                              POSTURE C: record a SUBSTITUTE adversarial review when codex is
+                                              down BOTH as a bot and as 'codex exec'. Writes ONE review_findings
+                                              event carrying engine/model/lenses/verdict_per_lens/substitute, so
+                                              'ready' prints gate=SUBSTITUTE instead of mistaking it for codex.
+                                              FAILS CLOSED like codex does: refuses <2 lenses, a missing or empty
+                                              lens verdict, or a --sha that is not 40 chars. Records
+                                              lenses_requested vs lenses_returned, so a 1-of-3 panel is visible
+                                              as 1-of-3 and can never render as a full swap.
+                                              NEVER hand-write a review_findings event: the ledger is append-only.
+  waive-codex-gate --run <r> --reason <text> --until <iso8601>
+                                              stop 'ready' holding forever on 'codex not on head' when codex is
+                                              dead. Appends codex_gate_waived → state.codex_waiver, surfaced on
+                                              every watch wake. --until is REQUIRED (a waiver must expire by
+                                              construction). IT DOES NOT WAIVE EVIDENCE: 'ready' still blocks any
+                                              PR with no review_findings covering its head — it converts
+                                              "must be codex" into "must be SOME recorded adversarial review".
   nudge --run <r>                             wake a blocking watch immediately (freed slot / operator change)
 
 Multi-host: create-worktree/spawn-lead/reap accept --host <local|mini|cloud>; hosts are configured in

@@ -44,6 +44,41 @@ it reported the two divergent hosts as **agreeing**. Version equality was a clai
   Control-tested against real history: it produces the failing answer on `f4ef1b3..658d97e`, a merged PR
   that changed shipped code under an unchanged version.
 
+### Added — posture C, the substitute review gate (Phase 1)
+
+There are **three** review postures, not two: normal, cloud-down, and **both-down**. Posture C ran for
+~16h of the source run — the Codex bot died 3h47m in, and `codex exec` hit a quota wall until Aug 4 —
+with **zero** harness support, so shepherd #4 hand-rolled it and shepherd #5 inherited it as
+undocumented tribal knowledge.
+
+- **`review-swap`** records a substitute adversarial review as ONE `review_findings` event carrying
+  first-class `engine`, `model`, `lenses[]`, `lenses_requested[]`, `verdict_per_lens`, `substitute` and
+  `substitute_reason`. It **fails closed exactly like the codex gate does** — refusing fewer than 2
+  lenses, any missing or empty lens verdict, or a `--sha` that is not 40 chars. **A silent lens is
+  `INCOMPLETE`, never `clean`**, and recording `lenses_requested` alongside `lenses_returned` means a
+  1-of-3 panel is *visible as* 1-of-3 and can never render as a full swap.
+- **`waive-codex-gate --run <r> --reason <text> --until <iso8601>`** ends the `hold (codex not on head)`
+  that can never clear while codex is dead. Appends `codex_gate_waived` → `state.codex_waiver`, surfaced
+  on **every** `watch` wake. `--until` is required, so a waiver expires by construction; an unparseable
+  `--until` reads as **expired**, never as forever. Previously this waiver existed only as ledger prose,
+  so every `ready` call needed a human to remember it and a successor orchestrator had to be *told*.
+- **The waiver does not waive evidence.** With one active, `ready` still refuses any PR with no
+  `review_findings` covering its head. It converts *"must be codex"* into *"must be **some** recorded
+  adversarial review"*, never into *"no review"*. Pinned by a test asserting all three cases.
+- **`state.issues[].gate` is a structured object (1.4)**, replacing the `gate_seen` boolean and its four
+  flat siblings. A boolean cannot express "gated by a substitute", and misattributing one is not
+  hypothetical — the #1183 3-lens gate was shepherd #4's work and was credited to #5 in a run report and
+  a learnings entry before it was caught. `ready` now prints
+  `gate=SUBSTITUTE (claude/opus-5, 3 lenses: correctness/security/repro, sha …)`.
+- **The posture-C procedure is written into `work-shepherd/SKILL.md`** — the codex-down probe (and why
+  CPU% is not a discriminator), three *distinct* refute lenses, refute-by-default, diff-scoping, the
+  verdict-first contract, mutation proofs with paired controls, and `review-swap`. Distinct-not-redundant
+  is the load-bearing part: on #1183 the **repro lens refuted the security lens and was right**; three
+  redundant reviewers would have concurred and deleted live code.
+- **A gate sha must be 40 chars (2.4)**, enforced at write time. Measured on #1180: 9- and 10-char forms
+  both read `stale-clean`, only 40 reads `CURRENT`. Required outright by `review-swap`; format-checked
+  by `review-usage`, which still legitimately produces an unstamped gate on a bare checkout.
+
 ### Fixed
 
 - **`watch` can no longer die in silence (2.2).** A SIGTERM/SIGINT/SIGHUP now writes a terminal
