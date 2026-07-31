@@ -162,6 +162,17 @@ would otherwise conclude the file had drifted.
     consumer of `stages[0]` inherits. Now refused with the operator named. The contract comment above
     `queryCountsNumerically` documented this case as a deliberate residual and is amended in the same
     diff — it would otherwise describe behavior its own file no longer has.
+  **Left open deliberately, and PINNED live: DER-2900.** `grep -c PATTERN file | wc -l` is stamped
+  `ok 1 ≥ 1` for ANY pattern — `grep -c` prints one line whatever the count, `wc -l` counts that one
+  line, and numeric mode reads the 1. `| head -1` and `| sort` do the same. All exit 0, so DER-2783's
+  gate does not fire. The obvious rule — refuse a counting command that is not the last stage — also
+  refuses `rg -c PATTERN . | wc -l`, which legitimately answers "how many files contain PATTERN", and
+  telling those apart needs to know how many files the command searches, which the query text does not
+  say. A heuristic guess there is what DER-2810 was filed for, so this bundle fixed only the provable
+  half — **the refusal message used to RECOMMEND `| wc -l` after a counting command**, and now says to
+  drop the `-c` and count matching lines instead (verified: with 2 matches in `a.txt` and 1 in `b.txt`,
+  `grep -c … | wc -l` answers 2, the FILE count, while `grep … | wc -l` answers 3, the real one). The
+  residual is a live pin in `e2e.test.mjs`, to be INVERTED when DER-2900 lands.
   Also corrected here: `e2e.test.mjs`'s header claimed **four** proven-live defect pins and listed
   DER-2810 among them, but only three pins exist and DER-2810 never had one — the count was one more than
   the file could back, with the sentence "the pins below" doing the vouching. That is this suite's own

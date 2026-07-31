@@ -21,7 +21,8 @@
 //
 // DEFECT PINS — read before "fixing" a failure in this file
 //
-// THREE fold defects are PROVEN LIVE (DER-2323, DER-2602, DER-2824) and each has a pin below. The pins
+// THREE fold defects are PROVEN LIVE (DER-2323, DER-2602, DER-2824) and each has a pin below, as does a
+// fourth PROVEN-LIVE evidence-query defect (DER-2900) pinned with the query cases further down. The pins
 // assert the CURRENT BROKEN behavior on purpose. When the matching issue lands, the pin goes RED and must
 // be INVERTED — that redness is the intended signal, not a regression. Without the pins, an all-green E2E
 // while three defects are live would manufacture exactly the false confidence this repo's rules exist to
@@ -1018,6 +1019,33 @@ test("FAULT a query beginning with a bare separator is refused, naming the opera
   const r = await S.run();
   assert.equal(r.code, 1, `a query with no leading command must be refused:\n${r.out}`);
   assert.match(r.out, /begins with the separator/, `and name the operator:\n${r.out}`);
+});
+
+// PIN (DER-2900) — PROVEN LIVE, NOT FIXED HERE. `grep -c PATTERN file | wc -l` is stamped `ok 1 >= 1` for ANY
+// pattern, matching or not: `grep -c` prints one line ("0"), `wc -l` counts that ONE line, and numeric
+// mode reads the 1. The same shape passes with a trailing `| head -1` or `| sort`, which line-count the
+// single "0" to 1. Zero real matches, stamped as evidence.
+//
+// NOT fixed in this bundle, deliberately. The obvious rule — "refuse a counting command that is not the
+// last stage" — also refuses `rg -c PATTERN . | wc -l`, which legitimately answers "how many files
+// contain PATTERN". Telling those apart needs to know how many files the command searches, which is not
+// statically knowable, and a heuristic guess here is what DER-2810 was filed for in the first place.
+//
+// What this bundle DID fix is the part that was provably wrong: the refusal message used to RECOMMEND
+// `| wc -l` after a counting command. It now says to drop the `-c` and count matching lines instead.
+//
+// When DER-2900 lands this pin goes RED and must be INVERTED, not repaired.
+test("PIN DER-2900: `grep -c … | wc -l` still passes with ZERO matches — INVERT THIS WHEN DER-2900 LANDS", async (t) => {
+  const S = await planWithQuery(t, `grep -c 'ZZZ' a.txt | wc -l`, { files: TWO_EMPTY });
+  const r = await S.run();
+  assert.equal(r.code, 0,
+    "PIN IS RED: this query no longer passes, which means the defect was fixed — invert this pin rather than repairing it");
+  assert.match(r.out, /1 ≥ 1/, "…and the count it reports is the constant 1, not a measurement");
+  // The half that IS fixed: the guidance no longer sends authors here.
+  const refused = await planWithQuery(t, `grep -c 'x' a.txt b.txt c.txt`, { expectAtLeast: 3, files: ONE_MATCH_TWO_ZEROS });
+  const rr = await refused.run();
+  assert.match(rr.out, /DROP the `-c`/, `the remedy must not recommend the shape this pin describes:\n${rr.out}`);
+  assert.doesNotMatch(rr.out, /or end it in `\| wc -l`/, "the old, wrong advice must be gone");
 });
 
 // THE CONTROLS. Without these, every case above is satisfied by a validator that refuses everything —

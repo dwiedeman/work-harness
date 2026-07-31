@@ -1,7 +1,7 @@
 // Unit tests for prep-runner.mjs — run with: node --test prep-runner.test.mjs
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -1205,6 +1205,50 @@ test("CLI query-check: ONE real match plus two zero-count files used to satisfy 
     const res = await runSubcommand(["query-check", planPath, "--repo-root", dir]);
     assert.equal(res.exitCode, 1, `one match must not satisfy a floor of three:\n${res.stdout}`);
     assert.match(res.stdout, /PER-FILE counts across 3 files/, `and the refusal must name the shape:\n${res.stdout}`);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("a refused count records WHY, and validate states that cause — not 'exited nonzero' (DER-2841)", async () => {
+  // `failed` used to mean exactly one thing: a nonzero exit or a kill, and validate's message said so.
+  // DER-2841 widened the flag — a query that exits 0 and prints a per-file breakdown is now refused too —
+  // so a message that still names the old cause tells the author something that did not happen and sends
+  // them to fix the wrong thing. The reason has to survive INTO the plan, because validate runs later,
+  // in a different process, off the plan file alone.
+  const dir = await mkdtemp(join(tmpdir(), "prep-prov-"));
+  try {
+    await writeFile(join(dir, "a.txt"), "x\n", "utf8");
+    await writeFile(join(dir, "b.txt"), "nothing\n", "utf8");
+    const planPath = join(dir, "plan.json");
+    const q = { name: "inflated", query: `grep -c 'x' a.txt b.txt`, window: "one real match", expectAtLeast: 2 };
+    await writeFile(planPath, JSON.stringify(goodPlan([goodIssue({ evidenceQueries: [q] })])), "utf8");
+    await runSubcommand(["query-check", planPath, "--repo-root", dir, "--record"]);
+
+    const observed = JSON.parse(await readFile(planPath, "utf8")).issues[0].evidenceQueries[0].observed;
+    assert.equal(observed.failed, true);
+    assert.ok(typeof observed.failure === "string" && observed.failure.trim(),
+      `the REASON must be stamped, not just the flag — got ${JSON.stringify(observed)}`);
+    assert.match(observed.failure, /PER-FILE counts/);
+
+    const res = await runSubcommand(["validate", planPath]);
+    const out = res.stdout + (res.stderr ?? "");
+    assert.match(out, /PER-FILE counts/, `validate must state the recorded cause:\n${out}`);
+    assert.doesNotMatch(out, /exited nonzero or was killed/,
+      `…and must NOT name a cause that did not happen:\n${out}`);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("CONTROL: a genuinely nonzero-exit query still reads as exactly that (DER-2841)", async () => {
+  // The other side of the same message. Without this, a fix that always printed the stamped reason (or
+  // always printed neither) would look correct on the test above.
+  const dir = await mkdtemp(join(tmpdir(), "prep-prov2-"));
+  try {
+    await writeFile(join(dir, "a.txt"), "nothing\n", "utf8");
+    const planPath = join(dir, "plan.json");
+    const q = { name: "zero", query: `grep -c 'ZZZ' a.txt`, window: "no match", expectAtLeast: 1 };
+    await writeFile(planPath, JSON.stringify(goodPlan([goodIssue({ evidenceQueries: [q] })])), "utf8");
+    await runSubcommand(["query-check", planPath, "--repo-root", dir, "--record"]);
+    const out = (await runSubcommand(["validate", planPath])).stdout;
+    assert.match(out, /exited 1|did not exit 0/, `a real nonzero exit must still say so:\n${out}`);
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 

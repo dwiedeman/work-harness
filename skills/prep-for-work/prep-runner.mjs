@@ -328,7 +328,16 @@ export function validatePlan(plan, opts = {}) {
       // Checked BEFORE the count and independently of it: `query-check` stamps 0 on a failed run, but 0
       // is also a legitimate measurement, so the count alone cannot tell the two apart. Without this
       // branch a hand-edited or re-stamped count would buy a query that never ran a pass here (DER-2783).
-      E(scopeId, `${label}: its last \`query-check\` run FAILED — the query exited nonzero or was killed, so its stamped count is a fail-closed 0, not a measurement. A query that cannot run is not evidence: fix the QUERY, then re-run \`query-check --record\`.`);
+      // The RECORDED reason wins when there is one. `failed` used to mean exactly one thing — a nonzero
+      // exit or a kill — and this message said so. DER-2841 widened it: a query that exits 0 and prints a
+      // per-file breakdown is also refused, and telling that author "the query exited nonzero or was
+      // killed" names a cause that did not happen and sends them to fix the wrong thing. Widening the
+      // flag without widening its explanation is the same class this bundle exists to close, so the
+      // stamped reason is carried here rather than re-derived from a flag that no longer implies it.
+      const why = typeof q.observed.failure === "string" && q.observed.failure.trim()
+        ? q.observed.failure.trim()
+        : "the query exited nonzero or was killed";
+      E(scopeId, `${label}: its last \`query-check\` run FAILED — ${why} So its stamped count is a fail-closed 0, not a measurement. A query that cannot run is not evidence: fix the QUERY, then re-run \`query-check --record\`.`);
     } else if (q.observed.count < q.expectAtLeast) {
       E(scopeId, `${label}: returned ${q.observed.count} < ${q.expectAtLeast} on its known-positive window (${q.window}) — the query is BLIND to the history it cites; fix the QUERY, not the floor`);
     }
@@ -1704,11 +1713,13 @@ export function evaluateQueryOutput(stdout, expectAtLeast, { numeric = false } =
             + `(got ${JSON.stringify(shown)}) — refusing to count them. Counting the ROWS reports the `
             + "number of files SEARCHED, not the number of matches: a file with `0` matches counts as "
             + "one. Summing them would report a total the command never reported, and is only correct if "
-            + "every row parsed. Narrow the query to one file, or end it in `| wc -l` so the answer is "
-            + "one number."
+            + "every row parsed. Narrow the query to ONE file, or DROP the `-c` and count the matching "
+            + "lines instead: `grep PATTERN a.txt b.txt | wc -l`. Do NOT append `| wc -l` while keeping "
+            + "`-c` — that counts the ROWS of a count (i.e. the number of files), and over a single file "
+            + "it answers 1 for every pattern, matching or not."
           : "the pipeline ends in a counting command but its output is not a number "
-            + `(got ${JSON.stringify(shown)}) — refusing to count it. End the query in \`| wc -l\` so `
-            + "the answer is one number, or drop the counting flag if lines are what you meant to count.",
+            + `(got ${JSON.stringify(shown)}) — refusing to count it. Drop the counting flag and count `
+            + "the matching lines instead (`grep PATTERN file | wc -l`), which is what a match count is.",
       };
     }
   }
@@ -2078,7 +2089,14 @@ export async function runSubcommand(argv) {
         // Exit status FIRST — output alone is not a pass. `failed` is stamped alongside the count so
         // `validate` can refuse a blind pass rather than re-deriving one from a 0 it cannot interpret.
         const ev = evaluateQueryRun(run, r.q.expectAtLeast, r.q.query);
-        r.q.observed = { count: ev.count, failed: ev.failed, at: new Date().toISOString() };
+        // `failure` is stamped alongside the flag so the REASON survives into the plan. Without it the
+        // only durable record is a boolean, and `validate` — which runs later, in a different process,
+        // off the plan file alone — has to guess the cause from a flag that now has more than one.
+        r.q.observed = {
+          count: ev.count, failed: ev.failed,
+          ...(ev.failed && ev.failure ? { failure: ev.failure } : {}),
+          at: new Date().toISOString(),
+        };
         if (ev.failed) { failures += 1; lines.push(`🔴 ${label}: ${ev.failure}`); }
         else if (!ev.ok) { failures += 1; lines.push(`🔴 ${label}: returned ${ev.count} < ${r.q.expectAtLeast} on its known-positive window (${r.q.window}) — the query is BLIND to the history it cites; fix the QUERY, not the floor`); }
         else lines.push(`ok   ${label}: ${ev.count} ≥ ${r.q.expectAtLeast} on ${r.q.window}`);
