@@ -17,6 +17,7 @@ updated, so this list cannot silently stop matching the jobs it claims to requir
 | `tests (node 24)` | Current. A runtime deprecation should surface here, not mid-run on an operator's box. |
 | `static checks` | `node --check` every `.mjs`, `bash -n` every `.sh`, ShellCheck (`--severity=error`). A syntax error in a shipped runner is unattended-run downtime. |
 | `public-comment security regression` | DER-2737. Fails when **zero** controls match, so deleting the security tests fails loudly instead of passing on an empty pattern. |
+| `skills/** requires a VERSION bump` | P0.3. Shipped code must not change under a version that already means something else. Measured 2026-07-31: two hosts differed by seven files at an identical `VERSION`, and the skew gate — which compares version *strings* — reported them as **agreeing**. Opt out per-PR with a `no-version-bump:` trailer. Pull-request-only, so it is `required` but never runs on a direct push to `main`. |
 
 ## Apply it (repo owner, needs `admin`)
 
@@ -31,7 +32,8 @@ gh api -X PUT repos/dwiedeman/work-harness/branches/main/protection \
       "tests (node 22)",
       "tests (node 24)",
       "static checks",
-      "public-comment security regression"
+      "public-comment security regression",
+      "skills/** requires a VERSION bump"
     ]
   },
   "enforce_admins": false,

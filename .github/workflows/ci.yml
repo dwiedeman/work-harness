@@ -161,3 +161,65 @@ jobs:
           fi
           echo "DER-2737 controls that ran: $ran"
         shell: bash
+
+  version-bump:
+    # P0.3 — the release half of harness-drift detection.
+    #
+    # Measured 2026-07-31: two hosts both reported VERSION 0.2.0 while seven shipped files differed,
+    # work-runner.mjs alone by 37,762 bytes. The cause was not a bad install — it was ~12 commits that
+    # changed skills/** without ever bumping VERSION. The dispatch-time skew gate compares version
+    # STRINGS, so it did not merely miss the drift, it actively reported the two divergent hosts as
+    # agreeing. INSTALL-MANIFEST.json makes the drift *detectable*; this job makes it *rare*, by
+    # refusing to let shipped code change under a version that already means something else.
+    #
+    # The opt-out is deliberate and must stay cheap: plenty of skills/** edits are comments or docs. It
+    # is a `no-version-bump:` trailer, so opting out is a recorded, greppable decision in the history
+    # rather than a silent omission.
+    name: skills/** requires a VERSION bump
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: VERSION bumped, or opted out on the record
+        run: |
+          set -euo pipefail
+          base="origin/${{ github.base_ref }}"
+
+          # No `|| true` on any of these. `set -e` must be allowed to kill the job on a git failure:
+          # a diff that errors and is swallowed reads as "no skills/** changes" and the gate passes
+          # loudest at the exact moment it stopped working. checkout uses fetch-depth: 0, so the base
+          # ref is already present and a failure here means something is genuinely wrong.
+          changed="$(git diff --name-only "$base"...HEAD -- 'skills/**')"
+          if [ -z "$changed" ]; then
+            echo "No skills/** changes in this PR — version bump not required."
+            exit 0
+          fi
+          echo "Shipped files changed in this PR:"
+          printf '%s\n' "$changed" | sed 's/^/  /'
+
+          # An opt-out must be stated in THIS PR's commits, not inherited from history.
+          if git log "$base"..HEAD --format='%B' | grep -qiE '^no-version-bump:'; then
+            echo "Opted out via a 'no-version-bump:' trailer:"
+            git log "$base"..HEAD --format='%B' | grep -iE '^no-version-bump:' | sed 's/^/  /'
+            exit 0
+          fi
+
+          before="$(git show "$base:VERSION" 2>/dev/null | tr -d '[:space:]' || echo '')"
+          after="$(tr -d '[:space:]' < VERSION)"
+          # Guard the gate itself: an unreadable base VERSION must FAIL, not silently pass by comparing
+          # "" against a real value. A check that green-lights on its own broken input is the DER-2743
+          # defect wearing a different hat.
+          if [ -z "$before" ]; then
+            echo "FAIL: could not read VERSION at $base — refusing to judge a bump I cannot measure." >&2
+            exit 1
+          fi
+          if [ "$before" = "$after" ]; then
+            echo "FAIL: this PR changes skills/** but leaves VERSION at $after." >&2
+            echo "Two hosts on different code then report the SAME version, and the skew gate reports them as agreeing." >&2
+            echo "Either bump VERSION (and add its CHANGELOG section), or add a 'no-version-bump: <why>' trailer to a commit." >&2
+            exit 1
+          fi
+          echo "VERSION bumped $before -> $after"
+        shell: bash

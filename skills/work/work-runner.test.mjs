@@ -26,6 +26,7 @@ import {
   estimateCostFromPrices, getBudget, getModelPrices,
   aggregateTokenUsage, renderUsageMd, eventSeenKey,
   clampWatchTimeout, WATCH_TIMEOUT_MAX_S,
+  harnessDriftVerdict, aggregateDigest, measureHarnessDrift, HARNESS_MANIFEST_FILE,
   assignedBudgetFor, renderAssignedBudget,
   ROTATION_CAP, resolveContextWindow, rotationBands, classifyContext,
   transcriptSlug, transcriptDirFor, leadBriefFromHead, pickLeadTranscript,
@@ -5288,16 +5289,24 @@ test("DER-2748: mixed harness versions BLOCK a dispatch; a same-version run is N
     assert.equal(wake.pending.protocol_skew, true);
 
     // DOES NOT BLOCK a same-version run. Without this control the gate could be a constant `throw`.
-    await ledger("0.2.0", "0.2.0");
-    const ok = await dispatch();
-    assert.match(ok.stdout, /work resume|cmux/, "a same-version run must dispatch exactly as before");
-    const st2 = (await runSubcommand(["state", "--run", "R1", "--runs-root", runsRoot, "--repo-root", dir])).state;
-    assert.equal(st2.protocol.ok, true);
+    //
+    // The version is PINNED here rather than left to whatever the repo's VERSION file happens to say.
+    // DER-2779 folds THIS PROCESS's version in as one more source, so a literal "0.2.0" ledger only
+    // matched while the repo itself sat at 0.2.0 — the 0.3.0 bump turned this control red, reporting a
+    // harness defect where there was only a stale literal. A control whose meaning depends on an
+    // unrelated file is not a control.
+    await withHarnessVersion("0.2.0", async () => {
+      await ledger("0.2.0", "0.2.0");
+      const ok = await dispatch();
+      assert.match(ok.stdout, /work resume|cmux/, "a same-version run must dispatch exactly as before");
+      const st2 = (await runSubcommand(["state", "--run", "R1", "--runs-root", runsRoot, "--repo-root", dir])).state;
+      assert.equal(st2.protocol.ok, true);
 
-    // Overridable ONLY explicitly (fail closed by default, degrade on request).
-    await ledger("0.2.0", "0.1.0");
-    const forced = await dispatch(["--allow-version-skew"]);
-    assert.match(forced.stdout, /work resume|cmux/);
+      // Overridable ONLY explicitly (fail closed by default, degrade on request).
+      await ledger("0.2.0", "0.1.0");
+      const forced = await dispatch(["--allow-version-skew"]);
+      assert.match(forced.stdout, /work resume|cmux/);
+    });
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -9302,6 +9311,122 @@ test("DER-2779: the attestation is written ONCE — under in-process concurrency
     await appendFromUnknown(2);
     assert.equal((await heartbeats()).filter((e) => e.harness_version === "unknown").length, 1,
       "and its own prior attestation counts — otherwise `unknown` grows one line per invocation forever");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// P0.3 — HARNESS DRIFT. Version equality is a claim; these pin the measurement.
+//
+// The defect: on 2026-07-31 two hosts both reported VERSION 0.2.0 while seven shipped files differed
+// (work-runner.mjs by 37,762 bytes), because the version was never bumped across ~12 commits and
+// ~/.claude/skills is not a git repo. The skew gate compares version STRINGS, so it reported the two
+// divergent hosts as agreeing — reassurance, not detection.
+//
+// The plan's acceptance criterion is explicitly two-directional: "modify one byte of an installed file
+// -> preflight prints HARNESS DRIFT naming it. Control: an unmodified install prints green. Both
+// directions must be exercised — a drift check that cannot report 'clean' is as useless as one that
+// cannot report 'drift'."
+
+test("harnessDriftVerdict reports CLEAN on a matching install (the control that must not be skipped)", () => {
+  const files = { "skills/work/work-runner.mjs": "aaa", "hooks/context-wrap-nudge.mjs": "bbb" };
+  const v = harnessDriftVerdict({ manifest: { version: "0.2.0", files }, digests: { ...files } });
+  assert.equal(v.status, "clean");
+  assert.equal(v.ok, true);
+  assert.deepEqual([v.modified, v.missing, v.unexpected], [[], [], []]);
+  assert.match(v.reason, /matches its manifest/);
+  assert.doesNotMatch(v.reason, /HARNESS DRIFT/, "a clean install must never print the drift marker");
+});
+
+test("harnessDriftVerdict names the differing file, and distinguishes modified / missing / untracked", () => {
+  const files = { "a.mjs": "aaa", "b.mjs": "bbb", "c.mjs": "ccc" };
+  const v = harnessDriftVerdict({ manifest: { version: "0.2.0", files }, digests: { "a.mjs": "CHANGED", "b.mjs": "bbb", "rogue.mjs": "zzz" } });
+  assert.equal(v.status, "drift");
+  assert.equal(v.ok, false);
+  assert.deepEqual(v.modified, ["a.mjs"], "a changed byte must NAME the file, not just report a count");
+  assert.deepEqual(v.missing, ["c.mjs"]);
+  assert.deepEqual(v.unexpected, ["rogue.mjs"]);
+  assert.match(v.reason, /HARNESS DRIFT/);
+  for (const f of ["a.mjs", "c.mjs", "rogue.mjs"]) assert.ok(v.reason.includes(f), `${f} must appear in the operator-facing reason`);
+});
+
+test("an install with no manifest is ABSENT, never clean — it cannot attest to what it is running", () => {
+  for (const manifest of [null, undefined, {}, { version: "0.2.0" }]) {
+    const v = harnessDriftVerdict({ manifest, digests: {} });
+    assert.equal(v.ok, false, "a pre-manifest install passing would restore the exact false reassurance this replaces");
+    assert.equal(v.status, "absent");
+    assert.match(v.reason, /re-run install\.sh/i);
+  }
+});
+
+test("the SAME VERSION STRING with different content is drift — the case the version gate cannot see", () => {
+  // Both sides claim 0.2.0. That is precisely the measured 2026-07-31 failure.
+  const v = harnessDriftVerdict({
+    manifest: { version: "0.2.0", files: { "skills/work/work-runner.mjs": "sha-of-604211-bytes" } },
+    digests: { "skills/work/work-runner.mjs": "sha-of-566449-bytes" },
+  });
+  assert.equal(v.status, "drift");
+  assert.equal(v.version, "0.2.0", "the version is recorded and matching — and must not rescue the verdict");
+  assert.deepEqual(v.modified, ["skills/work/work-runner.mjs"]);
+});
+
+test("aggregateDigest is order-independent, folds in the path, and matches install.sh's definition", () => {
+  const a = aggregateDigest({ "x.mjs": "1", "y.mjs": "2" });
+  assert.equal(a, aggregateDigest({ "y.mjs": "2", "x.mjs": "1" }), "key order must not change the digest");
+  assert.notEqual(a, aggregateDigest({ "x.mjs": "2", "y.mjs": "1" }), "swapping hashes between paths must change it");
+  assert.notEqual(a, aggregateDigest({ "x.mjs": "1", "z.mjs": "2" }), "renaming a file must change it");
+  // Pin the exact wire definition install.sh computes in shell: `path:sha256` lines, sorted, joined by
+  // "\n", NO trailing newline. If these two definitions drift apart, every cross-host comparison reports
+  // drift between two byte-identical installs — a check that can no longer say "clean".
+  const expected = createHash("sha256").update("x.mjs:1\ny.mjs:2").digest("hex");
+  assert.equal(a, expected);
+});
+
+test("measureHarnessDrift WALKS the tree, so a file absent from the manifest is still found", async () => {
+  // Regression control. The first implementation re-hashed only the paths the manifest listed, which
+  // structurally cannot discover an untracked file — it reported `untracked: []` for a rogue file. The
+  // acceptance run caught it. That is the defect class this plan exists to remove: a check that cannot
+  // produce the failing answer.
+  const dir = await mkdtemp(join(tmpdir(), "harness-drift-"));
+  try {
+    await mkdir(join(dir, "skills", "work"), { recursive: true });
+    await mkdir(join(dir, "hooks"), { recursive: true });
+    await writeFile(join(dir, "skills", "work", "work-runner.mjs"), "SHIPPED");
+    await writeFile(join(dir, "hooks", "context-wrap-nudge.mjs"), "HOOK");
+    const files = {
+      "skills/work/work-runner.mjs": createHash("sha256").update("SHIPPED").digest("hex"),
+      "hooks/context-wrap-nudge.mjs": createHash("sha256").update("HOOK").digest("hex"),
+    };
+    await writeFile(join(dir, HARNESS_MANIFEST_FILE), JSON.stringify({ version: "0.2.0", content_digest: aggregateDigest(files), files }));
+
+    assert.equal((await measureHarnessDrift(dir)).status, "clean", "control: a faithful copy reads clean");
+
+    // (a) one byte changed -> named
+    await writeFile(join(dir, "skills", "work", "work-runner.mjs"), "SHIPPEE");
+    let v = await measureHarnessDrift(dir);
+    assert.equal(v.status, "drift");
+    assert.deepEqual(v.modified, ["skills/work/work-runner.mjs"]);
+    await writeFile(join(dir, "skills", "work", "work-runner.mjs"), "SHIPPED");
+    assert.equal((await measureHarnessDrift(dir)).status, "clean", "and it must UNLATCH when repaired");
+
+    // (b) a rogue file the manifest never listed
+    await writeFile(join(dir, "skills", "work", "rogue.mjs"), "// never shipped");
+    v = await measureHarnessDrift(dir);
+    assert.deepEqual(v.unexpected, ["skills/work/rogue.mjs"], "the walk is the whole point of this test");
+    await rm(join(dir, "skills", "work", "rogue.mjs"));
+
+    // (c) a deleted shipped file
+    await rm(join(dir, "hooks", "context-wrap-nudge.mjs"));
+    v = await measureHarnessDrift(dir);
+    assert.deepEqual(v.missing, ["hooks/context-wrap-nudge.mjs"]);
+    await writeFile(join(dir, "hooks", "context-wrap-nudge.mjs"), "HOOK");
+
+    // (d) run state under tmp/ is NOT drift — install.sh excludes it, and a check that reds the moment
+    // anything runs is a check nobody reads.
+    await mkdir(join(dir, "skills", "work", "tmp", "work", "run1"), { recursive: true });
+    await writeFile(join(dir, "skills", "work", "tmp", "work", "run1", "events.jsonl"), "{}\n");
+    assert.equal((await measureHarnessDrift(dir)).status, "clean", "runtime state under tmp/ must never read as drift");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

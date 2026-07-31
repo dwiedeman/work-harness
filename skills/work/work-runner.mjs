@@ -6762,6 +6762,150 @@ export async function checkTokenReporter({
   return legs;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// HARNESS DRIFT (P0.3) — version equality is a CLAIM; a content digest is a MEASUREMENT.
+//
+// The defect this closes was observed twice, on two different hosts, and neither host could see it:
+// `~/.claude/skills` is a plain directory (no `.git`), and an install that predates ~12 commits still
+// reports the same `VERSION` string as the checkout it drifted from, because the version was never
+// bumped across those commits. Measured on the mini at 2026-07-31 BEFORE re-installing: seven shipped
+// files differed — `work-runner.mjs` alone by 37,762 bytes — while both sides reported `0.2.0`.
+//
+// That is the same class of defect the version-skew gate (DER-2748/2779) exists to prevent, one level
+// up: the gate compares what two hosts CLAIM to be running, and two hosts running different code make
+// the identical claim. So the skew check is not merely silent here — it is actively reassuring.
+//
+// The fix is to record, at install time, a sha256 per shipped file, and to compare digests rather than
+// version strings. `install.sh` writes the manifest; `preflight` re-measures the installed tree against
+// it. The manifest also carries `source_commit`, so a stale-but-untampered install can still be placed
+// against origin by an operator (the drift above was exactly that shape: nothing tampered, everything
+// old).
+export const HARNESS_MANIFEST_FILE = "INSTALL-MANIFEST.json";
+
+// sha256 of one file's bytes. Returns null for an unreadable/absent file rather than throwing, so a
+// MISSING file is reported as missing instead of collapsing the whole check into an exception — the
+// same fail-loud-per-file discipline `skillsHashCommand` uses when it refuses to hash a short list.
+export async function fileDigest(path) {
+  try { return createHash("sha256").update(await readFile(path)).digest("hex"); }
+  catch { return null; }
+}
+
+// One aggregate digest over a {path: sha256} map. Sorted by path so it is order-independent, and it
+// folds the PATH in as well as the hash — otherwise renaming a file to another file's name, or
+// dropping one and duplicating another, would preserve the aggregate.
+//
+// This MUST stay byte-identical to install.sh's `CONTENT_DIGEST`: `path:sha256` lines, LC_ALL=C sort,
+// joined by "\n" with no trailing newline. Two definitions of one digest that disagree would make every
+// cross-host comparison report drift between two identical installs — a check that cannot say "clean".
+// The unit suite pins the agreement by recomputing this from a real manifest's own `files` map.
+export function aggregateDigest(files = {}) {
+  const lines = Object.keys(files).sort().map((p) => `${p}:${files[p]}`);
+  return createHash("sha256").update(lines.join("\n")).digest("hex");
+}
+
+// Compare a recorded install manifest against the digests measured NOW. Pure, so both directions are
+// unit-testable without touching ~/.claude: the acceptance criterion for this item is explicitly that a
+// clean install reports CLEAN, because "a drift check that cannot report clean is as useless as one
+// that cannot report drift."
+//
+// `absent` is deliberately its own status rather than a pass. A pre-manifest install cannot attest to
+// anything, and reporting that as CLEAN would reintroduce the exact false reassurance this replaces.
+export function harnessDriftVerdict({ manifest, digests = {} } = {}) {
+  if (!manifest || typeof manifest !== "object" || !manifest.files) {
+    return {
+      status: "absent",
+      ok: false,
+      modified: [], missing: [], unexpected: [],
+      reason: `no ${HARNESS_MANIFEST_FILE} — this install predates content-digest attestation and cannot ` +
+        "prove what it is running. Re-run install.sh. (An install that cannot attest is NOT a clean one.)",
+    };
+  }
+  const recorded = manifest.files;
+  const modified = [];
+  const missing = [];
+  for (const path of Object.keys(recorded).sort()) {
+    const now = digests[path];
+    if (now == null) missing.push(path);
+    else if (now !== recorded[path]) modified.push(path);
+  }
+  // A file present in the install but absent from the manifest is drift too: it is either a leftover
+  // from an older layout or something that was never shipped, and both mislead a reader of this tree.
+  const unexpected = Object.keys(digests).filter((p) => !(p in recorded)).sort();
+  const ok = !modified.length && !missing.length && !unexpected.length;
+  const parts = [];
+  if (modified.length) parts.push(`${modified.length} MODIFIED (${modified.join(", ")})`);
+  if (missing.length) parts.push(`${missing.length} MISSING (${missing.join(", ")})`);
+  if (unexpected.length) parts.push(`${unexpected.length} UNTRACKED (${unexpected.join(", ")})`);
+  return {
+    status: ok ? "clean" : "drift",
+    ok,
+    modified, missing, unexpected,
+    version: manifest.version ?? null,
+    source_commit: manifest.source_commit ?? null,
+    installed_at: manifest.installed_at ?? null,
+    content_digest: manifest.content_digest ?? null,
+    reason: ok
+      ? `install matches its manifest (${Object.keys(recorded).length} files, version ${manifest.version ?? "?"}, ` +
+        `source_commit ${String(manifest.source_commit ?? "?").slice(0, 12)}, installed ${manifest.installed_at ?? "?"})`
+      : `HARNESS DRIFT — ${parts.join("; ")}. The installed tree is NOT what install.sh wrote. ` +
+        "Re-run install.sh from a clean checkout; do not dispatch until this is clean.",
+  };
+}
+
+// The install roots the manifest attests to, and the exclusions install.sh applies when writing it.
+// Kept beside `measureHarnessDrift` because the two must agree: a path install.sh hashes but this walk
+// skips reads as MISSING on every clean install, and a path this walk finds but install.sh skips reads
+// as UNTRACKED on every clean install. Either way the check reds forever and stops being read.
+export const HARNESS_MANIFEST_ROOTS = ["skills", "hooks"];
+const manifestExcluded = (rel) => rel.split("/").includes("tmp") || basename(rel) === ".DS_Store";
+
+// Every file under `roots`, relative to `dest`. Absent roots yield nothing rather than throwing — a
+// hooks-less install is a drift finding (MISSING), not a crash.
+async function walkInstalledFiles(dest, roots = HARNESS_MANIFEST_ROOTS) {
+  const out = [];
+  const walk = async (rel) => {
+    let entries;
+    try { entries = await readdir(join(dest, rel), { withFileTypes: true }); }
+    catch { return; }
+    for (const ent of entries) {
+      const childRel = `${rel}/${ent.name}`;
+      if (manifestExcluded(childRel)) continue;
+      if (ent.isDirectory()) await walk(childRel);
+      else if (ent.isFile()) out.push(childRel);
+    }
+  };
+  for (const root of roots) await walk(root);
+  return out;
+}
+
+// Read + re-measure an installed tree against its own manifest. `dest` is the install root (~/.claude).
+//
+// This WALKS THE TREE rather than only re-hashing the paths the manifest lists. Hashing just the listed
+// paths was the first implementation, and its own acceptance control caught the flaw: it reported
+// `untracked: []` for a rogue file placed in the install, because a file absent from the manifest is
+// exactly the file such a loop never visits. That is the defect class this whole plan is about — a check
+// that cannot produce the failing answer — so the walk is the fix, not the report wording.
+export async function measureHarnessDrift(dest) {
+  let manifest = null;
+  try { manifest = JSON.parse(await readFile(join(dest, HARNESS_MANIFEST_FILE), "utf8")); }
+  catch { return harnessDriftVerdict({ manifest: null }); }
+  const digests = {};
+  const seen = new Set();
+  for (const rel of await walkInstalledFiles(dest)) {
+    seen.add(rel);
+    const d = await fileDigest(join(dest, rel));
+    if (d != null) digests[rel] = d;
+  }
+  // A manifest path the walk did not reach (deleted, or under a root that no longer exists) still needs
+  // a probe, so it is reported MISSING rather than silently dropping out of both sides of the compare.
+  for (const rel of Object.keys(manifest.files ?? {})) {
+    if (seen.has(rel)) continue;
+    const d = await fileDigest(join(dest, rel));
+    if (d != null) digests[rel] = d;
+  }
+  return harnessDriftVerdict({ manifest, digests });
+}
+
 // The files whose skew between hosts silently loses telemetry or gates. `session-token-report.mjs` joined
 // the list because a remote skills dir without it makes EVERY mini lead gap its token spend while
 // `skills-sync` reported "in sync" on work-runner.mjs alone.
@@ -8250,6 +8394,16 @@ export async function runSubcommand(argv) {
       // the script they call is absent, stale, or fabricates zeros — see checkTokenReporter, which SMOKE
       // RUNS it rather than asserting a file exists.
       for (const leg of await checkTokenReporter({ skillsDir, cwd: process.cwd() })) add(leg.name, leg.ok, leg.detail);
+      // 6c. HARNESS DRIFT (P0.3) — is the installed tree what install.sh actually wrote? Every check
+      // above this line tests the ENVIRONMENT; this one tests the harness's own bytes, which until now
+      // nothing did. `VERSION` equality is a claim two divergent installs make identically (measured:
+      // seven files differing at a shared `0.2.0`), so this compares sha256 per shipped file instead.
+      // An absent manifest reds rather than passes: an install that cannot attest is not a clean one.
+      {
+        const dest = process.env.CLAUDE_HOME || join(homedir(), ".claude");
+        const drift = await measureHarnessDrift(dest);
+        add("harness-drift", drift.ok, drift.ok ? drift.reason : `${drift.reason}`);
+      }
       // 7. Skills skew vs remote hosts — a lead on the mini following a stale brief loses gates silently,
       // and a remote skills dir without session-token-report.mjs makes every mini lead gap its spend, so
       // BOTH files are hashed (a missing file yields no hash at all ⇒ SKEW, never a matching-broken pair).
@@ -8260,6 +8414,34 @@ export async function runSubcommand(argv) {
         const lh = String(localHash.stdout ?? "").trim();
         const rh = String(remoteHash.stdout ?? "").trim();
         add(`skills-sync:${hostName}`, !!lh && lh === rh, lh === rh ? `in sync (${SKILLS_SYNC_FILES.join(" + ")})` : `SKEW in ${SKILLS_SYNC_FILES.join(" + ")}${lh ? "" : " (a LOCAL file is missing — re-run install.sh)"} — rsync -a ~/.claude/skills/work/ ${hostCfg.ssh}:.claude/skills/work/`);
+        // P0.3, cross-host half: `skills-sync` above covers TWO files, so a host can differ in
+        // SKILL.md, prep-runner.mjs or the config example and still read "in sync" — which is how a
+        // seven-file drift hid behind a green check. The manifest's `content_digest` covers every
+        // shipped file at once, so an unbumped-version drift refuses a dispatch exactly like a
+        // version mismatch does. Absent on either side ⇒ report it, never treat two absences as a match.
+        {
+          const localMan = await measureHarnessDrift(process.env.CLAUDE_HOME || join(homedir(), ".claude"));
+          const remoteMan = await runCommand({
+            command: "ssh",
+            args: [hostCfg.ssh, `cat ~/.claude/${HARNESS_MANIFEST_FILE} 2>/dev/null || true`],
+            timeoutMs: 20000,
+          }).catch(() => ({ exitCode: 1, stdout: "" }));
+          let remoteDigest = null, remoteVersion = null;
+          try {
+            const m = JSON.parse(String(remoteMan.stdout ?? "").trim());
+            remoteDigest = m?.content_digest ?? null;
+            remoteVersion = m?.version ?? null;
+          } catch { /* absent or unparseable ⇒ null, reported below */ }
+          const localDigest = localMan.content_digest ?? null;
+          const ok = !!localDigest && !!remoteDigest && localDigest === remoteDigest;
+          add(`harness-digest:${hostName}`, ok, ok
+            ? `identical content digest (${localDigest.slice(0, 12)}, version ${localMan.version})`
+            : !localDigest ? `LOCAL has no ${HARNESS_MANIFEST_FILE} — re-run install.sh here first`
+            : !remoteDigest ? `${hostName} has no ${HARNESS_MANIFEST_FILE} — ssh ${hostCfg.ssh} 'cd ~/Projects/work-harness && git pull --ff-only && ./install.sh'`
+            : `CONTENT DRIFT vs ${hostName}: ${localDigest.slice(0, 12)} (v${localMan.version}) vs ${remoteDigest.slice(0, 12)} (v${remoteVersion})` +
+              `${localMan.version === remoteVersion ? " — SAME VERSION STRING, DIFFERENT CODE. This is exactly the drift a version check cannot see." : ""}` +
+              ` — re-install on ${hostName}`);
+        }
       }
       // 8. Stale side-copies of the runner (H6) — leads that find them misdiagnose the harness.
       {

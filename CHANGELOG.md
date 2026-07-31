@@ -15,6 +15,47 @@ run materially different harness code against **one shared ledger** with no way 
 gate itself gained the missing half below — attesting the *acting* process's own version, not only
 versions already recorded in the ledger — in DER-2779.
 
+## [0.3.0] — 2026-07-31
+
+The harness-upgrade wave from run `20260730T233426Z-der-2869-der-2864` (23 PRs, 20h08m, 3.84B tokens),
+implementing `docs/plans/2026-07-31-harness-upgrades.md`. Per-item status, including the findings that
+did **not** survive re-verification, is in `docs/state/2026-07-31-harness-upgrade-status.md`.
+
+**Why this version exists at all** is the wave's headline finding. Measured on two hosts on 2026-07-31:
+seven shipped files differed — `work-runner.mjs` alone by 37,762 bytes — while **both sides reported
+`VERSION` 0.2.0**, because the version was never bumped across ~12 commits and `~/.claude/skills` is not
+a git repo. The 0.2.0 skew machinery compares version *strings*, so it did not merely fail to see this;
+it reported the two divergent hosts as **agreeing**. Version equality was a claim, never a measurement.
+
+### Added
+
+- **`INSTALL-MANIFEST.json` (P0.3).** `install.sh` now records `{version, installed_at, source_commit,
+  content_digest, files{path: sha256}}`, hashing the tree it actually **wrote** (walking `$DEST`, not
+  `$SRC`, so a `cp` that dropped a file cannot still produce a matching manifest). Runtime state under
+  `tmp/` is excluded — a drift check that reds the moment anything runs is one nobody reads.
+- **`preflight` check `harness-drift`.** Re-measures the installed tree against its manifest and prints
+  **`HARNESS DRIFT`** naming every modified / missing / untracked file. An install with **no** manifest
+  reports `absent`, not clean: an install that cannot attest to what it is running is not a clean one.
+- **`preflight` check `harness-digest:<host>`.** Compares whole-tree `content_digest` across hosts, where
+  the existing `skills-sync` leg compares only two files — which is how a seven-file drift hid behind a
+  green check. When the digests differ but the versions match, it says so in those words.
+- **CI job `skills/** requires a VERSION bump`.** A PR touching `skills/**` must bump `VERSION` or carry
+  a `no-version-bump:` trailer, so opting out is a recorded, greppable decision rather than an omission.
+  Control-tested against real history: it produces the failing answer on `f4ef1b3..658d97e`, a merged PR
+  that changed shipped code under an unchanged version.
+
+### Notes
+
+- `aggregateDigest()` in `work-runner.mjs` and `CONTENT_DIGEST` in `install.sh` are two implementations
+  of one wire definition (`path:sha256` lines, sorted, newline-joined, no trailing newline). The suite
+  pins their agreement by recomputing one from a real manifest's own `files` map — if they drift apart,
+  every cross-host comparison reports drift between two byte-identical installs.
+- The drift walk **enumerates the tree** rather than re-hashing only the paths the manifest lists. The
+  first implementation did the latter and its own acceptance control caught the flaw: it reported
+  `untracked: []` for a rogue file, because a file absent from the manifest is exactly the file such a
+  loop never visits. Same defect class as everything else in this wave — a check that could not produce
+  the failing answer.
+
 ## [Unreleased]
 
 The 2026-07-30 cold-eyes remediation wave: nine fixes against the 21 findings of a cold-eyes review of

@@ -19,6 +19,44 @@ if [ ! -f "$SRC/VERSION" ]; then
 fi
 cp "$SRC/VERSION" "$DEST/VERSION"
 
+# P0.3 — VERSION is a CLAIM; this manifest is a MEASUREMENT.
+#
+# The version file above is necessary but provably not sufficient: on 2026-07-31 two hosts both reported
+# `0.2.0` while seven shipped files differed (work-runner.mjs by 37,762 bytes), because the version was
+# never bumped across ~12 commits. `~/.claude/skills` is not a git repo, so neither host had any way to
+# notice, and the skew gate — which compares version STRINGS — reported them as agreeing. A gate that
+# reassures two divergent hosts is worse than no gate.
+#
+# So record a sha256 per shipped file plus an aggregate `content_digest`. `preflight` re-measures the
+# installed tree against this (both directions: it must be able to print CLEAN as well as DRIFT), and the
+# cross-host check compares aggregates so an unbumped-version drift refuses a dispatch. `source_commit`
+# is recorded because the drift actually observed was stale-but-untampered — nothing modified, everything
+# old — which per-file hashes alone cannot distinguish from a fresh install.
+echo "Recording content digests → $DEST/INSTALL-MANIFEST.json"
+SOURCE_COMMIT="$(git -C "$SRC" rev-parse HEAD 2>/dev/null || echo unknown)"
+INSTALLED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+# Hash what was actually COPIED, walking $DEST — not $SRC. Hashing the source would attest to the bytes
+# we meant to install rather than the bytes that landed, and a `cp` that silently dropped a file would
+# still produce a matching manifest. The point is to measure the tree preflight will later re-measure.
+#
+# `tmp/` is excluded because the runner writes run state under skills/work/tmp/; including it would make
+# every install drift against itself the moment anything ran, and a drift check that always reds is one
+# nobody reads.
+DIGEST_LINES="$(cd "$DEST" && find skills hooks -type f ! -path '*/tmp/*' ! -name '.DS_Store' \
+  | LC_ALL=C sort \
+  | while IFS= read -r f; do printf '%s:%s\n' "$f" "$(shasum -a 256 "$f" | cut -d' ' -f1)"; done)"
+# The aggregate is sha256 over those `path:sha256` lines joined by newline, NO trailing newline —
+# byte-identical to `aggregateDigest()` in work-runner.mjs, which the unit suite pins with a control that
+# recomputes this from the manifest's own files map. Two definitions of one digest that disagree would
+# make every cross-host comparison read as drift.
+CONTENT_DIGEST="$(printf '%s' "$DIGEST_LINES" | shasum -a 256 | cut -d' ' -f1)"
+{
+  printf '{\n  "version": "%s",\n  "installed_at": "%s",\n  "source_commit": "%s",\n  "content_digest": "%s",\n  "files": {\n' \
+    "$(cat "$SRC/VERSION")" "$INSTALLED_AT" "$SOURCE_COMMIT" "$CONTENT_DIGEST"
+  printf '%s\n' "$DIGEST_LINES" | awk -F: 'NR>1{printf ",\n"} {printf "    \"%s\": \"%s\"", $1, $2}'
+  printf '\n  }\n}\n'
+} > "$DEST/INSTALL-MANIFEST.json"
+
 echo
 echo "Installed:"
 find "$DEST/skills/work" "$DEST/skills/work-lead" "$DEST/skills/work-shepherd" \
