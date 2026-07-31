@@ -1040,14 +1040,32 @@ test("evaluateQueryOutput: numeric mode reads the number, and ONLY when stdout i
   // on macOS for the command most likely to want it — a mode that cannot fire is not a mode.
   assert.deepEqual(evaluateQueryOutput("       5\n", 5, { numeric: true }), { count: 5, ok: true });
   // The bare-integer guard is the second half of the rule: `grep -c` over MULTIPLE files emits
-  // `path:count` lines — a per-file breakdown that must fall back to line counting, never read as 5.
-  assert.deepEqual(evaluateQueryOutput("a.txt:3\nb.txt:2\n", 3, { numeric: true }), { count: 2, ok: false });
-  assert.deepEqual(evaluateQueryOutput("a\nb\nc\n", 3, { numeric: true }), { count: 3, ok: true });
-  // CONTROLS — default (non-numeric) behaviour is untouched, including the fail-closed empty cases.
+  // `path:count` lines — a per-file breakdown that must never be read as 5.
+  //
+  // DER-2841 INVERTED WHAT HAPPENS NEXT. These three assertions used to pin the LINE-COUNTING FALLBACK
+  // (`{count: 2, ok: false}` here), and that fallback was the defect: it reports the number of ROWS, i.e.
+  // the number of FILES SEARCHED, and a file with `0` matches counts as a match. It was only ever
+  // accidentally safe — safe here because this fixture's floor is 3, and wrong the moment the floor is 1.
+  // The refusal now carries a reason instead.
+  const rows = evaluateQueryOutput("a.txt:3\nb.txt:2\n", 3, { numeric: true });
+  assert.equal(rows.failed, true, "a counting pipeline whose stdout is not one number is refused, not counted");
+  assert.equal(rows.ok, false);
+  assert.equal(rows.count, 0, "and it contributes NO count — 2 was the file tally, never a measurement");
+  assert.match(rows.failure, /path:count|not a single number/i, "the refusal must say WHY, so the author can narrow the query");
+  // THE CASE THAT MAKES IT A DEFECT RATHER THAN AN INACCURACY: zero real matches, floor of 1. The old
+  // fallback returned {count: 2, ok: TRUE} — a query that measured nothing, certified as evidence.
+  const allZero = evaluateQueryOutput("a.txt:0\nb.txt:0\n", 1, { numeric: true });
+  assert.equal(allZero.ok, false, "ZERO matches across two files must never pass a floor of 1");
+  assert.equal(allZero.failed, true);
+  // Same rule for any other non-scalar stdout from a counting pipeline.
+  assert.equal(evaluateQueryOutput("a\nb\nc\n", 3, { numeric: true }).failed, true);
+  assert.equal(evaluateQueryOutput("-3\n", 1, { numeric: true }).failed, true, "a negative is not a count");
+  // CONTROLS — default (non-numeric) behaviour is untouched, including the fail-closed empty cases. These
+  // are what stop the change above from being 'refuse everything'.
   assert.deepEqual(evaluateQueryOutput("5\n", 5), { count: 1, ok: false });
-  assert.deepEqual(evaluateQueryOutput("", 1, { numeric: true }), { count: 0, ok: false });
+  assert.deepEqual(evaluateQueryOutput("a\nb\nc\n", 3), { count: 3, ok: true });
+  assert.deepEqual(evaluateQueryOutput("", 1, { numeric: true }), { count: 0, ok: false }, "empty has nothing to misread; its exit status already spoke");
   assert.deepEqual(evaluateQueryOutput(null, 1, { numeric: true }), { count: 0, ok: false });
-  assert.deepEqual(evaluateQueryOutput("-3\n", 1, { numeric: true }), { count: 1, ok: true }, "a negative is not a count — it is one line of output");
 });
 
 test("validatePlan: a run that FAILED cannot be honoured, even when its stamped count clears the floor (DER-2783)", () => {
@@ -1136,22 +1154,85 @@ test("CLI query-check: a `grep -c`-terminated pipeline counts by NUMBER, not by 
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
-test("CLI query-check: `grep -c` over MULTIPLE files is a per-file breakdown, not a count (DER-2783)", async () => {
+test("CLI query-check: `grep -c` over MULTIPLE files is REFUSED, not counted (DER-2783, DER-2841)", async () => {
   const dir = await mkdtemp(join(tmpdir(), "prep-multifile-"));
   try {
     await writeFile(join(dir, "a.txt"), "x\nx\nx\n", "utf8");
     await writeFile(join(dir, "b.txt"), "x\nx\n", "utf8");
     const planPath = join(dir, "plan.json");
-    // stdout is "a.txt:3\nb.txt:2" — 5 matches, but the OUTPUT is two lines and no bare integer. Numeric
-    // mode must decline it; reading the first number, or summing, would be inventing a total grep never
-    // reported. Fail-closed at 2 is the correct answer, and the message must say 2.
+    // stdout is "a.txt:3\nb.txt:2" — 5 matches, but the OUTPUT is two rows and no bare integer. Numeric
+    // mode declines it, and DER-2841 changed what happens next: the old line-counting fallback answered
+    // "2", which is the FILE TALLY, and this test used to assert that number. It read as fail-closed only
+    // because this fixture's floor is 3. The end-to-end proof that it was not fail-closed is the
+    // companion test below, where the same shape passes a floor of 1 with zero matches present.
     const q = { name: "x matches", query: `grep -c 'x' a.txt b.txt`, window: "5 matches across 2 files", expectAtLeast: 3 };
     await writeFile(planPath, JSON.stringify(goodPlan([goodIssue({ evidenceQueries: [q] })])), "utf8");
     const res = await runSubcommand(["query-check", planPath, "--repo-root", dir]);
     assert.equal(res.exitCode, 1, res.stdout);
-    assert.match(res.stdout, /returned 2 < 3/);
-    assert.doesNotMatch(res.stdout, /returned 5|returned 3 </);
+    assert.match(res.stdout, /path:count|not a single number/i, `the refusal must name the shape:\n${res.stdout}`);
+    // Never a number it did not measure — not the 5 it could have summed, and not the 2 it used to print.
+    assert.doesNotMatch(res.stdout, /returned 5|returned 2 </, res.stdout);
   } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("CLI query-check: ONE real match plus two zero-count files used to satisfy a floor of THREE (DER-2841)", async () => {
+  // THE DEFECT, end to end and at the surface an author actually reads. `grep -c 'x' a.txt b.txt c.txt`
+  // prints "a.txt:1\nb.txt:0\nc.txt:0" — the old fallback counted three ROWS, and `3 >= 3` stamped a
+  // single match as three. The inflation is exactly the number of files searched.
+  //
+  // The fixture must have at least ONE match, and that is not incidental: with no matches anywhere grep
+  // exits 1, DER-2783's exit-status gate refuses the query before its output is read, and the test would
+  // pass identically on the parent — a check that cannot fail for the reason its name gives. (The first
+  // draft of this test used an all-zero fixture and did exactly that.)
+  const dir = await mkdtemp(join(tmpdir(), "prep-inflate-"));
+  try {
+    await writeFile(join(dir, "a.txt"), "x\n", "utf8");
+    await writeFile(join(dir, "b.txt"), "nothing\n", "utf8");
+    await writeFile(join(dir, "c.txt"), "nothing\n", "utf8");
+    const planPath = join(dir, "plan.json");
+    const q = { name: "inflated", query: `grep -c 'x' a.txt b.txt c.txt`, window: "one real match", expectAtLeast: 3 };
+    await writeFile(planPath, JSON.stringify(goodPlan([goodIssue({ evidenceQueries: [q] })])), "utf8");
+    const res = await runSubcommand(["query-check", planPath, "--repo-root", dir]);
+    assert.equal(res.exitCode, 1, `one match must not satisfy a floor of three:\n${res.stdout}`);
+    assert.match(res.stdout, /path:count|not a single number/i, `and the refusal must name the shape:\n${res.stdout}`);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("evidence queries: a trailing `|| true` / `; true` / `| cat` is refused (DER-2810)", () => {
+  // DER-2783 made a nonzero exit a FAILED run. Four characters reopened it: these suffixes exit 0 with
+  // stdout `0`, move the counting command off the end of the pipeline so numeric mode does not apply, and
+  // the single line `0` is line-counted as 1 — `ok 1 >= 1`, from a query that matched nothing.
+  for (const q of [`grep -c 'x' f.txt || true`, `grep -c 'x' f.txt ; true`, `grep -c 'x' f.txt | cat`]) {
+    const problems = evidenceQueryShellProblems(q);
+    assert.ok(problems.length, `${JSON.stringify(q)} must be refused, got ${JSON.stringify(problems)}`);
+    assert.match(problems.join("\n"), /suppresses the exit status|pass-through/,
+      `the refusal must name the mechanism for ${JSON.stringify(q)}: ${problems.join("; ")}`);
+  }
+  // CONTROLS — the refusal is by exact trailing command, not a heuristic over the string. A fix that
+  // refused every multi-stage pipeline would break the documented evidence-query form entirely.
+  for (const q of [`git log --oneline | grep -c 'fix('`, `grep -rn 'x' . | head -5`, `grep -c 'x' f.txt | wc -l`, `git log | sort | uniq -c`]) {
+    assert.deepEqual(evidenceQueryShellProblems(q), [], `${JSON.stringify(q)} is legitimate and must still run`);
+  }
+  // A trailing stage that genuinely TRANSFORMS output is still allowed to fall back to line counting —
+  // the deliberate scope decision, stated so a later reader does not widen it by accident.
+  assert.deepEqual(evidenceQueryShellProblems(`grep -c 'x' f.txt | head -1`), []);
+});
+
+test("evidence queries: a query beginning with a bare separator is refused, naming the operator (DER-2808)", () => {
+  // The leading empty segment used to be dropped silently, so `stages[0]` was the `wc -l` stage — a stage
+  // that was never the query's first command. Harmless only by luck (it is a shell syntax error), but a
+  // blind spot in the PARSE rather than in the verdict, and any consumer trusting stages[0] inherits it.
+  for (const [q, op] of [["| wc -l", "|"], ["|| true", "||"], ["&& grep -c x f", "&&"], ["; ls", ";"]]) {
+    const problems = evidenceQueryShellProblems(q);
+    assert.ok(problems.length, `${JSON.stringify(q)} must be refused`);
+    assert.match(problems[0], /begins with the separator/, `${JSON.stringify(q)}: ${problems[0]}`);
+    assert.ok(problems[0].includes(`\`${op}\``), `the refusal must NAME the operator ${op}: ${problems[0]}`);
+  }
+  // …and the parse reports no stages at all, so a consumer cannot read a phantom first command.
+  assert.deepEqual(parseEvidenceQuery("| wc -l").stages, []);
+  // CONTROL: the same commands without the leading separator are untouched.
+  assert.deepEqual(evidenceQueryShellProblems("wc -l < f.txt"), []);
+  assert.equal(parseEvidenceQuery("git log --oneline | grep -c 'fix('").stages.length, 2);
 });
 
 test("CLI query-check: numeric mode needs a PIPE — a `;`-joined trailing `wc -l` counted nothing upstream (DER-2783)", async () => {

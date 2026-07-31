@@ -119,6 +119,45 @@ would otherwise conclude the file had drifted.
   exact construction, zero matches yields `0` and a grep error yields `""`, and `[ "${ran:-0}" -lt 1 ]`
   fails the job on both — against a control with a real match, which passes. Every other hit in the repo
   is prose describing the banned construction, not the construction.
+- **DER-2841 / DER-2810 / DER-2808 (P1) — three ways for an evidence query to be stamped `ok` while
+  having measured nothing.** DER-2783 established the rule all three defeat: a run that did not exit 0 is
+  a FAILED run, not a count. They are bundled because they collide on the same three functions
+  (`parseEvidenceQuery`, `queryCountsNumerically`, `evaluateQueryOutput`) and the same `stages` array.
+  - **DER-2841 — a multi-file `grep -c` count inflated to the number of files SEARCHED.** `grep -c`/`rg -c`
+    over multiple files print `path:count` ROWS, not a scalar. Numeric mode correctly declined the
+    non-scalar, and the LINE-COUNTING FALLBACK behind it was the defect: it counted the rows, so a file
+    matching **zero** times counted as a match. Measured on the parent, with the fixture the review names:
+    `grep -c 'x' a.txt b.txt c.txt` where only `a.txt` matches once prints `a.txt:1 / b.txt:0 / c.txt:0`,
+    exits **0**, and was stamped **`3 ≥ 3`** — one match certified as three. The inflation is exactly the
+    number of files searched, so a wider search produces a more convincing fabricated count.
+    A counting pipeline whose stdout is not a single number is now **refused with the reason**, rather
+    than line-counted. Refusing is chosen over summing the rows deliberately: a summed number is only
+    correct if every row parsed, whereas a refusal tells the author to narrow the query. `evaluateQueryRun`
+    previously hardcoded `failed: false` over the evaluator's verdict, which would have discarded the new
+    refusal at birth — it now carries it out.
+    *At least one file must match for this to be reachable end to end*: with no matches anywhere `grep -c`
+    exits 1 and DER-2783's gate refuses the query before its output is read. An all-zero fixture is
+    therefore refused identically on the parent and proves nothing — the first draft of both regressions
+    used one, and passed on the parent for a reason that had nothing to do with this defect.
+  - **DER-2810 — `… || true`, `… ; true` and `… | cat` each buy a pass.** The first two exit 0 with stdout
+    `0`; all three move the counting command off the end of the pipeline, so numeric mode does not apply
+    and the single line `0` is line-counted as **1**, clearing a floor of 1. Refused at the validator by
+    exact trailing command name — not by a heuristic over the raw string, which is what made this
+    unfixable inside DER-2783's scope. The deliberate scope decision the issue asked for: only `true`,
+    `:`, `cat` and `tee` are refused as trailing stages, because none can ADD information to an evidence
+    query and all can subtract it. A trailing `head`/`sort`/`awk` still falls back to line counting —
+    those genuinely transform the output, and refusing them would break working queries.
+  - **DER-2808 — a query beginning with a bare separator lost its leading segment silently.** `| wc -l`
+    parsed to ONE stage with no problem raised, so `stages[0]` was a stage that was never the query's
+    first command. Harmless only by luck (such a query is a shell syntax error, so it produces no output
+    and fails on the count), but a blind spot in the PARSE rather than in the verdict, which any future
+    consumer of `stages[0]` inherits. Now refused with the operator named. The contract comment above
+    `queryCountsNumerically` documented this case as a deliberate residual and is amended in the same
+    diff — it would otherwise describe behavior its own file no longer has.
+  Also corrected here: `e2e.test.mjs`'s header claimed **four** proven-live defect pins and listed
+  DER-2810 among them, but only three pins exist and DER-2810 never had one — the count was one more than
+  the file could back, with the sentence "the pins below" doing the vouching. That is this suite's own
+  rule turned on itself, so it is fixed rather than footnoted.
 - **DER-2837 (P1) — an UNDER-counted `blockers` field authorized a merge.** `gateEvidenceVerdict` read
   the `review_findings` event's `blockers` number and never asked whether it described that event's own
   `findings` list. The one consistency check that existed — in `gateAdjudicationVerdict` — compared
@@ -338,13 +377,13 @@ would otherwise conclude the file had drifted.
 
 ### Known follow-ups
 
-- **DER-2808** — `parseEvidenceQuery("| wc -l")` yields an empty first stage with no problem raised; a
-  query that opens on a bare pipe should be refused as malformed rather than silently parsed.
 - **DER-2809** — the `Number("") === 0` env-read family: an empty `WORK_WATCH_POLL_MS` (and siblings
   sharing the coercion) reads as `0` rather than "unset", turning a poll loop into a ~5ms spin instead of
   its intended default.
-- **DER-2810** — `grep -c x file || true` exits 0 and is stamped `ok 1 ≥ 1`; four characters (`|| true`)
-  are enough to falsify DER-2783's exit-status guarantee from outside the evaluator it fixed.
+
+_(**DER-2808** and **DER-2810** were listed here and are now CLOSED — see the evidence-query entry under
+`[Unreleased]` above. Removed from this list in the same change that fixed them: a follow-up list that
+still names a closed defect is the same drift as a comment describing code that no longer exists.)_
 
 ## [0.2.0] — 2026-07-29
 
