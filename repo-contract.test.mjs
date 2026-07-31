@@ -95,9 +95,18 @@ test("DER-2780: no shipped doc or comment still claims harness-version skew is u
     /is deliberately NOT in this entry/i,
     /does not copy `?VERSION`?/i,
     /copies[^.\n]*but NOT `?VERSION`?/i,
+    // DER-2840: owner equality does NOT exclude forks — one owner may hold both a repository and a fork
+    // of it. Three shipped files asserted that it did ("a fork never is" / "a fork never does"), and the
+    // one this guard would have missed is the one that mattered most: see the .json note below.
+    /a fork never (is|does)/i,
   ];
+  // `*.json` is in scope deliberately. The DER-2840 sweep found the false claim above in THREE files, and
+  // `skills/work/work.config.example.json` — the file README.md and install.sh both tell an adopter to
+  // copy into their own repo, and which this suite elsewhere calls "the ONLY adopter doc" — was the one a
+  // .md/.mjs/.sh-only sieve could not see. The most load-bearing prose in this repo is a JSON doc value,
+  // so a guard that skips .json has a hole exactly where it can least afford one.
   const files = gitFiles("*.md")
-    .concat(gitFiles("*.mjs"), gitFiles("*.sh"))
+    .concat(gitFiles("*.mjs"), gitFiles("*.sh"), gitFiles("*.json"))
     .filter((f) => !f.endsWith(".test.mjs"));
   assert.ok(files.length >= 10, `expected shipped docs/sources to be tracked, found ${files.length}`);
   const hits = [];

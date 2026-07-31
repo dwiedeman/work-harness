@@ -1107,8 +1107,11 @@ test("legitimate evidence queries still RUN and still pass after DER-2841/2810/2
 // is satisfied by a repository that is NOT the target repository: owner equality is strictly weaker than
 // repository identity. A same-org fork therefore passed the gate and could repoint a tracked unit.
 //
-// The unit suite proves the predicate and the fold. This proves the PROGRAM: a real `reconcile-pr-events`
-// subprocess, a real `gh` on PATH, and the field list the harness actually sends.
+// The unit suite proves the predicate and the fold. What THIS adds is the real `reconcile-pr-events`
+// SUBPROCESS (`cli()`) rather than the unit suite's in-process `runSubcommand`, driving the field list
+// the harness actually sends. The `gh` here is a PATH stub written below — Tier A is hermetic and calls
+// no real `gh` (see the tier definition at the top of this file); the unit suite's `withFakeGh` uses the
+// same stub technique, so the stub is not what distinguishes this test. The subprocess is.
 
 const D2840_OWNER = "acme";
 

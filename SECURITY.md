@@ -155,8 +155,10 @@ Closed, in the order they were addressed:
    events.~~ Closed by DER-2840 — `isCrossRepository === false` is now required alongside the owner
    check, because one owner may hold both a repository and a fork of it.
 
-No known gaps are open at this time. That is a statement about the findings above, not a claim that
-none exist — see *Reporting a vulnerability*.
+Roadmap items 1–5 are closed. That is a statement about those five findings only. It is **not** a claim
+that the harness has no open weaknesses: authenticated privileged-event ingress is out of scope below,
+the read-any-path exposure described under *Evidence queries execute WITHOUT a shell* remains the stated
+residual risk, and unknown gaps are why *Reporting a vulnerability* exists.
 
 Authenticated privileged-event ingress is **explicitly out of scope** for now; see the trust-boundary
 section above for what that implies.

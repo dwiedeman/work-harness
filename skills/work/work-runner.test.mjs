@@ -8158,7 +8158,12 @@ test("DER-2778: the trusted-PR-author set is CONFIG-driven, defaults to deny, an
     assert.equal(WR.getTrustedCommentAuthors().has(bot), true, "the review bot's comments stay trusted (DER-2737)");
     assert.equal(WR.getTrustedPrAuthors().has(bot), false, "but the review bot is NOT a trusted PR author");
     assert.deepEqual(
-      deriveCloudPrEvents({ pr: d2778Fork({ author: { login: bot }, headRepositoryOwner: { login: D2778_OWNER } }), runIssues: ["DER-9"] }),
+      // `isCrossRepository: false` is REQUIRED here, exactly as above: `d2778Fork` omits the field, so
+      // without it DER-2840's fail-closed branch denies this row before the trusted-author property in
+      // this assertion's own message is ever exercised — the assertion would pass for the wrong reason
+      // and stay green even if the review bot were added to `trustedPrAuthors`. Verified by control:
+      // with the bot trusted, this returns [] without the field and the two lifecycle events with it.
+      deriveCloudPrEvents({ pr: d2778Fork({ author: { login: bot }, headRepositoryOwner: { login: D2778_OWNER }, isCrossRepository: false }), runIssues: ["DER-9"] }),
       [],
       "a PR opened by the review bot must not derive lifecycle events for a run unit",
     );

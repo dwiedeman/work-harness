@@ -47,8 +47,12 @@ would otherwise conclude the file had drifted.
   rate_limit` reads with no call between them ⇒ delta 0), the field set costs 1 point at the 100×100
   ceiling both without and with `isCrossRepository` — free. Evidence: the fork case is RED on
   `origin/main` at the predicate, at the production fold, and end to end through a real
-  `reconcile-pr-events` subprocess; a mutation audit neutering the new return to `true` turns exactly the
-  two defect cases red and leaves both controls green, so the gate is load-bearing.
+  `reconcile-pr-events` subprocess; a mutation audit neutering the new return to `true` turns **all three**
+  of those cases red — two in `work-runner.test.mjs` (457 tests, 2 fail) and one in `e2e.test.mjs` (47
+  tests, 1 fail) — and leaves every control green, so the gate is load-bearing. *(An earlier draft of this
+  entry said "exactly the two defect cases", which is wrong and contradicted the three levels enumerated
+  in the same sentence. The count is stated here as measured, with its denominators, because a maintainer
+  re-running the audit gets three and would otherwise have to work out what broke.)*
 - **DER-2839 (P1) — a remote read that FAILED was reported as a remote that was EMPTY, and that erased a
   completion-blocking damage signal.** The remote ledger tail ran as
   `tail -n +N <path> 2>/dev/null || true`. That suffix answers every question with success: a MISSING
@@ -323,9 +327,12 @@ would otherwise conclude the file had drifted.
   SHA — reading it as "proven new work" and dropping a real pending kickback out of `kickbacks_pending`. A
   PR now counts as this run's own only when its author is the repo owner or a configured
   `trustedPrAuthors` login **and** its head repository owner matches the target repo; an unresolvable SHA
-  now fails closed rather than open. *(This entry as written claimed the owner check alone excluded forks
-  — "a fork never does". That is false when one owner holds both a repository and a fork of it, which is
-  the defect DER-2840 closes below. Corrected here rather than left standing, because it is the sentence a
+  now fails closed rather than open. *(This entry as written asserted parenthetically that the owner check
+  alone already excluded every fork. That is false when one owner holds both a repository and a fork of
+  it, which is the defect DER-2840 closes (its entry is at the top of this section — `[Unreleased]` is
+  newest-first). The false wording is described rather than quoted, because `repo-contract.test.mjs` now
+  sieves shipped prose for it literally and cannot tell a quotation from a live claim. Corrected here
+  rather than left standing, because it is the sentence a
   reader would use to conclude the hole was already shut.)* `trustedPrAuthors` is deliberately a separate
   allowlist from `trustedCommentAuthors` (DER-2737) — the review bot's *comments* are trusted input, but a
   PR it opens is not one of your leads. (PR #23)
@@ -469,7 +476,9 @@ Each fix below landed with a regression test that was **observed failing on the 
   `issues[]`, and both `reap` interpolations are `shellQuote`d. **This closed the comment vector only** —
   a *retargeted* unit stayed reachable through PR-*list* state (`gh pr list` + branch/title matching, no
   comment involved at all), which a fork PR could exploit to silently drop a pending kickback; that half
-  was closed by DER-2778 (`[Unreleased]`, above).
+  was closed by DER-2778 (`[Unreleased]`, above) — and only fully by DER-2840, which closed the same-owner
+  fork that DER-2778's owner-equality check still admitted. Named here because this entry points a reader
+  at DER-2778 as the closer, and on its own would hand them the retracted conclusion.
 - **#19 — evidence queries are validated read-only before a shell runs them.** `prep-runner`'s
   `query-check` passed `evidenceQueries[].query` to `spawnSync(…, {shell: true})` behind only a *shape*
   check, and a plan is often assembled from issue text and lead output — so plan content could execute
