@@ -6557,6 +6557,66 @@ test("DER-2741 (#16): idle watch does not re-parse the whole ledger every tick",
   }
 });
 
+test("DER-2839: the #16 invariant also holds on the --pull-hosts path (the side-effect block)", async () => {
+  // The test above runs `watch` WITHOUT `--pull-hosts`, so the whole side-effect block — pull, reconcile,
+  // and the pull-failure evidence gate — never executes there. It is structurally blind to a regression
+  // inside it, and that blindness is not hypothetical: DER-2839's first evidence gate called `readEvents`
+  // on every ~45s cycle and this suite stayed green. A perf invariant that only one flag combination can
+  // violate needs a case that USES that combination.
+  const root = await mkdtemp(join(tmpdir(), "wr-pullperf-"));
+  // `mkRepoWithHosts` writes its argument as the WHOLE work.config.json, so the `hosts` wrapper is
+  // load-bearing: without it `getHosts()` falls back to the default single local host, `--pull-hosts mini`
+  // selects nothing, and the entire side-effect block under test never executes. The first draft omitted
+  // it and passed against a deliberately reintroduced per-cycle read — a fixture defect that presented as
+  // a green gate.
+  const repoRoot = await mkRepoWithHosts({
+    hosts: {
+      local: { cap: 2 },
+      mini: { enabled: true, cap: 2, ssh: "example-mini-host", ledgerRoot: join(root, "no-such-remote") },
+    },
+  });
+  const prevPoll = process.env.WORK_WATCH_POLL_MS;
+  const prevPull = process.env.WORK_WATCH_PULL_INTERVAL_MS;
+  const prevPath = process.env.PATH;
+  try {
+    const { runId } = await runSubcommand(["init-run", "--project", "sandbox", "--runs-root", root, "--repo-root", repoRoot]);
+    const dir = join(root, runId);
+    for (let i = 0; i < 200; i += 1) {
+      await appendEvent(dir, { actor: "orch", type: "token_usage", total_tokens: i, ts: new Date(Date.UTC(2026, 6, 30, 10, 0, i)).toISOString() });
+    }
+    const size = (await readFile(join(dir, "events.jsonl"), "utf8")).length;
+    // An `ssh` that always fails: the FAILURE path is the expensive one (it is the branch that may need
+    // the evidence set), so this is the worst case, not the happy one.
+    const bin = join(root, "bin");
+    await mkdir(bin, { recursive: true });
+    await writeFile(join(bin, "ssh"), "#!/bin/sh\nprintf 'no such file\\n' >&2\nexit 1\n", "utf8");
+    await chmod(join(bin, "ssh"), 0o755);
+    process.env.PATH = `${bin}:${prevPath}`;
+    process.env.WORK_WATCH_POLL_MS = "5";
+    // MANY side-effect cycles inside a 1s watch. Without this the block runs exactly ONCE (it is 45s
+    // apart in production), a per-cycle whole-ledger read is indistinguishable from a one-off, and the
+    // gate below cannot fail — which is precisely what the first draft of this test did.
+    process.env.WORK_WATCH_PULL_INTERVAL_MS = "1";
+    WR.resetLedgerReadStats();
+    await runSubcommand(["watch", "--run", runId, "--runs-root", root, "--repo-root", repoRoot,
+      "--pull-hosts", "mini", "--nudge-since", "0", "--timeout", "1"]);
+    const s = { ...WR.LEDGER_READ_STATS };
+    assert.ok(s.polls >= 20, `ANTI-VACUITY: expected many polls, got ${s.polls}`);
+    // THE GATE, stated against the number of CYCLES rather than as a bare constant: entry cursor
+    // resolution + the wake payload's fold + at most ONE lazy seed of the evidence set. With ~20+ pull
+    // cycles, a per-cycle read lands far outside this.
+    assert.ok(s.fullReads <= 3, `whole-ledger reads must not scale with pull cycles: ${s.fullReads} reads over ${s.polls} polls`);
+    assert.ok(s.fullBytes <= size * 3 + 4096, `bytes parsed must not scale with pull cycles: ${s.fullBytes} over a ${size}-byte ledger`);
+  } finally {
+    if (prevPoll === undefined) delete process.env.WORK_WATCH_POLL_MS; else process.env.WORK_WATCH_POLL_MS = prevPoll;
+    if (prevPull === undefined) delete process.env.WORK_WATCH_PULL_INTERVAL_MS; else process.env.WORK_WATCH_PULL_INTERVAL_MS = prevPull;
+    process.env.PATH = prevPath;
+    await applyRepoConfig("/nonexistent-reset");
+    await rm(root, { recursive: true, force: true });
+    await rm(repoRoot, { recursive: true, force: true });
+  }
+});
+
 test("DER-2741: the ledger tail reads only NEW bytes, buffers a torn partial line, and rebuilds if the file shrinks", async () => {
   assert.equal(typeof WR.createLedgerTail, "function", "expected an offset-cursored tail reader");
   const root = await mkdtemp(join(tmpdir(), "wr-tail-"));

@@ -3821,10 +3821,49 @@ function heldFragmentPathFor(runDir, host) {
   return join(runDir, `${LEDGER_HELD_FILE_PREFIX}${host}${LEDGER_HELD_FILE_SUFFIX}`);
 }
 
+// One host's current hold. DER-2839: the failure path needs to REPORT the hold it is preserving —
+// returning `held: null` there would launder "I did not look" into "there is nothing held" one layer
+// above the shell defect this exists to close.
+//
+// Three outcomes, deliberately distinct (Codex review of this change, #2 — the first draft collapsed the
+// last two into `null` and so reproduced the very laundering it exists to prevent, one layer up):
+//
+//   null                            no hold file — a fact, established by ENOENT
+//   { unreadable: true, … }         a hold EXISTS but cannot be vouched for (unreadable / malformed)
+//   the record                      a hold we can age
+//
+// The middle case matches `readHeldFragments`, whose header already states the rule for the whole family:
+// "FAIL-CLOSED on an unreadable/undatable record: a hold we cannot age is one we cannot vouch for, so it
+// counts as stale rather than silently disappearing."
+async function readHeldFragmentFor(runDir, host) {
+  let raw;
+  try {
+    raw = await readFile(heldFragmentPathFor(runDir, host), "utf8");
+  } catch (err) {
+    // Only a genuinely ABSENT file is "no hold". A permission error or any other read failure is a hold
+    // whose state is unknown — never absence.
+    return err?.code === "ENOENT" ? null : { unreadable: true, bytes: null, first_seen_at: null, stale: true };
+  }
+  try {
+    const rec = JSON.parse(raw);
+    // PARSING is not the bar — AGEING is (Codex round 2, #3: `{}` parsed fine, so it slipped past as a
+    // valid record and reported `{bytes: null, first_seen_at: null}` with no `unreadable` flag, which
+    // reads as a hold in good standing). `readHeldFragments` sets the same rule for the family: a record
+    // it cannot date is stale. A hold whose `first_seen_at` will not parse is one we cannot vouch for.
+    if (rec && typeof rec === "object" && !Array.isArray(rec)
+      && Number.isFinite(Date.parse(String(rec.first_seen_at ?? "")))) return rec;
+  } catch { /* malformed ⇒ unreadable, below */ }
+  return { unreadable: true, bytes: null, first_seen_at: null, stale: true };
+}
+
 // `fragment: null` ⇒ nothing is held any more: the record is DELETED, which is how the signal
 // self-clears the moment the writer finishes the line. `cursor` is the post-pull cursor, i.e. the identity
 // of the held line — a fragment at a NEW cursor is a different line and starts its own clock, so a host
 // that tears one line after another cannot inherit an ancient first-seen time.
+//
+// CALLER CONTRACT (DER-2839): only ever call this after a read that SUCCEEDED. `fragment: null` means
+// "the remote had no partial line", which is a fact only a completed read can establish — a failed read
+// knows nothing, and passing null for it deletes a live damage signal.
 async function recordHeldFragment(runDir, host, { fragment, cursor }) {
   const path = heldFragmentPathFor(runDir, host);
   if (fragment == null) {
@@ -4135,6 +4174,18 @@ export function watchPollMs() {
   const raw = Number(process.env.WORK_WATCH_POLL_MS);
   if (!Number.isFinite(raw)) return 2500;
   return Math.min(60000, Math.max(5, Math.floor(raw)));
+}
+
+// How often `watch` runs its side-effect block (pull-hosts / reconcile-*). 45s in production; a seam only
+// so a test can drive MANY cycles without waiting 45 seconds each — the same shape as WORK_WATCH_POLL_MS
+// above. DER-2839: without it, the #16 "work per poll does not scale with history" invariant is
+// untestable on the `--pull-hosts` path, because a hermetic watch only ever reaches ONE cycle and a
+// per-cycle whole-ledger read is indistinguishable from a one-off. That is not a hypothetical — the first
+// version of this test bounded total reads, and a deliberately reintroduced per-cycle read passed it.
+export function watchPullIntervalMs() {
+  const raw = Number(process.env.WORK_WATCH_PULL_INTERVAL_MS);
+  if (!Number.isFinite(raw)) return 45000;
+  return Math.min(600000, Math.max(1, Math.floor(raw)));
 }
 
 // Parse raw ledger lines pulled from a remote host's local events.jsonl (the mini), tagging each with
@@ -5819,18 +5870,61 @@ async function readCursor(runDir, host) {
 // append the new events (host-tagged), advance the cursor. Exactly-once; shared by the `pull-host`
 // subcommand and the folded-in `watch` pull. Real ssh — callers gate it (subcommand invocation / the
 // watch --pull-hosts flag), and watch treats a throw as best-effort (the mini is never a hard dep).
+// THE remote read command — one builder, because `pull-host --dry-run` prints it and the pull executes
+// it, and a separately-written second copy is a preview that can drift from what actually runs.
+//
+// DER-2839: this used to end in `2>/dev/null || true`. That suffix answers every question with success:
+// a MISSING remote ledger, an UNREADABLE one, and a failed read all exited 0 with empty stdout, which is
+// byte-for-byte what a healthy remote with nothing new returns. The pull then took the empty-body path
+// and called `recordHeldFragment(…, {fragment: null})`, DELETING the held-fragment record — so a read
+// that never happened erased the completion-blocking damage signal DER-2776 exists to preserve. That is
+// the exact inversion DER-2776 was written to prevent, arriving through the shell instead of the parser.
+//
+// So: no suppression and no laundering. `tail`'s exit status propagates through ssh, "I could not read
+// it" and "it was empty" become different facts — the distinction `classifyKillProbe` already draws for
+// the kill probe — and the remote's stderr survives to say WHY.
+// The path is SHELL-QUOTED (Codex review of this change, #5). `ssh host <string>` is evaluated by the
+// remote shell, and the path is built from `ledgerRoot` (config) and the run id — so an entirely valid
+// `ledgerRoot: "/Volumes/Work Ledger"` split into two operands and made every pull fail, and a
+// metacharacter in either component was interpreted remotely. Pre-existing on main, but this builder is
+// now the only place that constructs it, so it is the only place that has to be right. `cursor` is
+// arithmetic on a parsed integer and is not interpolated as text.
+function remoteLedgerTailCommand(remotePath, cursor) {
+  const path = String(remotePath);
+  // A leading `~/` is left OUTSIDE the quotes so the remote shell still expands it (Codex round 2, #1:
+  // quoting the whole string turned a `ledgerRoot: "~/work-ledger"` into a literal path and would have
+  // failed every pull on such a host). Everything after it is quoted, so the space/metacharacter fix
+  // holds. No config in this repo uses a `~` root today — this exists so the tightening cannot silently
+  // break one that does.
+  const tilde = path.startsWith("~/");
+  const quoted = tilde ? `~/${shellQuote(path.slice(2))}` : shellQuote(path);
+  return `tail -n +${cursor + 1} ${quoted}`;
+}
+
 async function pullHostInto(runDir, hostName, runId) {
   const host = getHosts()[hostName];
   if (!host) throw new Error(`unknown host "${hostName}"`);
   const cursor = await readCursor(runDir, hostName);
   const remotePath = `${host.ledgerRoot}/${runId}/events.jsonl`;
-  const remote = `tail -n +${cursor + 1} ${remotePath} 2>/dev/null || true`;
-  const res = await runCommand({ command: "ssh", args: [host.ssh, remote] });
-  // The remote command ends in `|| true`, so a nonzero exit is ssh ITSELF failing — nothing was read.
-  // Return without touching the cursor OR the held-fragment record: clearing the latter here would
-  // restart a stuck line's age clock on every network flap, which is how an age signal becomes a lie.
+  const res = await runCommand({ command: "ssh", args: [host.ssh, remoteLedgerTailCommand(remotePath, cursor)] });
+  // A nonzero exit is now either ssh itself failing OR the remote read failing — and the two are the same
+  // fact for this caller: NOTHING WAS READ. Return without touching the cursor OR the held-fragment
+  // record. Clearing the latter here would restart a stuck line's age clock on every network flap (and,
+  // before this fix, delete it outright on a remote that had simply not been created yet), which is how
+  // an age signal becomes a lie. The hold is READ BACK and reported rather than reported as null: this
+  // pull learned nothing about it, and "null" here would mean "nothing is held".
   if (res.exitCode !== 0) {
-    return { host: hostName, pulled: 0, quarantined: 0, cursor, held: null, pull_failed: true };
+    const held = await readHeldFragmentFor(runDir, hostName);
+    const why = String(res.stderr ?? "").trim().split("\n").filter(Boolean).pop() || `exit ${res.exitCode}`;
+    return {
+      host: hostName, pulled: 0, quarantined: 0, cursor,
+      // `unreadable` rides along when the hold exists but could not be vouched for — the same fail-closed
+      // shape `readHeldFragments` reports, rather than a `null` that would read as "nothing held".
+      held: held
+        ? { bytes: held.bytes ?? null, first_seen_at: held.first_seen_at ?? null, ...(held.unreadable ? { unreadable: true, stale: true } : {}) }
+        : null,
+      pull_failed: true, pull_error: why,
+    };
   }
   const body = String(res.stdout ?? "");
   // DER-2776 — two arithmetic facts this line used to get wrong, both of which lose events:
@@ -8221,8 +8315,10 @@ export async function runSubcommand(argv) {
       const host = getHosts()[o.host];
       if (!host) throw new Error(`unknown host "${o.host}"`);
       if (o.dryRun) {
+        // Same builder as the executing path (DER-2839) — a hand-written second copy is a preview that
+        // silently stops describing what runs.
         const cursor = await readCursor(runDir, o.host);
-        const remote = `tail -n +${cursor + 1} ${host.ledgerRoot}/${o.runId}/events.jsonl 2>/dev/null || true`;
+        const remote = remoteLedgerTailCommand(`${host.ledgerRoot}/${o.runId}/events.jsonl`, cursor);
         return { stdout: `ssh ${host.ssh} ${shellQuote(remote)}` };
       }
       return { stdout: JSON.stringify(await pullHostInto(runDir, o.host, o.runId)) };
@@ -8285,13 +8381,58 @@ export async function runSubcommand(argv) {
       const reconcilePrEvents = !!o.reconcilePrEvents;
       const repoRoot = o.repoRoot ?? process.cwd();
       const pollMs = watchPollMs();
-      const PULL_INTERVAL_MS = 45000;
+      const PULL_INTERVAL_MS = watchPullIntervalMs();
       const started = Date.now();
       let lastSideEffect = 0; // 0 ⇒ run pull/reconcile immediately on entry, then every ~45s
+      // DER-2839 (Codex review of that change, #1): `pullHostInto` now REPORTS a failed remote read, and
+      // this loop is its primary automatic consumer. Discarding the result — as it did — meant a mini
+      // whose ledger is permanently unreadable stopped ingesting events indefinitely while the operator
+      // saw routine watch output: the failure signal the fix introduced, silently thrown away by the one
+      // caller that runs unattended.
+      //
+      // Latched per host and cleared by the next SUCCESSFUL pull, so it re-surfaces on every wake until
+      // it is actually fixed — the same treatment as spawn_failures/gate_missing. Reported, never fatal:
+      // the pre-start window before a remote host first writes its ledger is a legitimate failure, and
+      // making it fatal would wedge the mini lane on a routine race.
+      const pullFailures = new Map();
+      // Hosts this run has dispatched a lead to. Seeded LAZILY and at most ONCE per watch process, then
+      // kept current from the tail's fresh events below.
+      //
+      // DER-2741 (#16) is an explicit invariant of this loop — "work per poll scales with new activity,
+      // not with total history" — and the first draft of this evidence gate broke it by calling
+      // `readEvents` (a whole-ledger parse) on every ~45s side-effect cycle. On the 100k-event / 9.8 MB
+      // ledger that benchmark uses, a single 240s watch would have added ~6 full parses while completely
+      // idle. The existing idle-watch perf test did not catch it because it runs without `--pull-hosts`,
+      // so the side-effect block never executes there.
+      let dispatchHosts = null;
       for (;;) {
         if ((pullHostNames.length || reconcileMerged || reconcilePrEvents) && Date.now() - lastSideEffect >= PULL_INTERVAL_MS) {
           for (const h of pullHostNames) {
-            try { await pullHostInto(runDir, h, o.runId); } catch { /* mini best-effort; next cycle retries */ }
+            try {
+              const pulled = await pullHostInto(runDir, h, o.runId);
+              if (!pulled?.pull_failed) { pullFailures.delete(h); continue; }
+              // Surface only with positive evidence that a readable ledger should exist: we have read
+              // from this host before (a cursor past 0, or a held fragment), or the run dispatched a lead
+              // there. Otherwise the failure is indistinguishable from "that host has not started yet",
+              // which is a routine race and not news. `--pull-hosts auto` selects every ENABLED host,
+              // which is not the same set as the hosts a run USES — without this gate a run that
+              // dispatched everything locally carries a failure banner for an idle `mini` on every wake,
+              // forever, and a banner that is always on is one operators learn to skim (Codex round 2,
+              // #2). The ledger is consulted only on the failure path, and only until the answer is
+              // known — a healthy run never reads it here at all.
+              const everRead = (pulled.cursor ?? 0) > 0 || pulled.held != null;
+              if (!everRead && dispatchHosts === null) {
+                dispatchHosts = new Set(
+                  (await readEvents(runDir)).filter((e) => e.type === "lead_spawned" && e.host).map((e) => e.host),
+                );
+              }
+              if (everRead || dispatchHosts?.has(h)) pullFailures.set(h, pulled.pull_error || `exit ${pulled.exitCode ?? "?"}`);
+              else pullFailures.delete(h);
+            } catch (err) {
+              // A throw is also "the pull did not happen" — it must not be quieter than a nonzero exit.
+              // Unconditional: a throw is a harness/ssh fault, never the not-started-yet race above.
+              pullFailures.set(h, String(err?.message ?? err));
+            }
           }
           if (reconcileMerged) {
             try { await reconcileMergedInto(runDir, o.runId, repoRoot); } catch { /* gh best-effort */ }
@@ -8329,6 +8470,11 @@ export async function runSubcommand(argv) {
               // as healthy in-flight work. Role failures (no issue) appear as "shepherd"/"orch".
               spawn_failures: (st.spawn_failures ?? []).map((f) => f.issue ?? f.role),
               reap_failures: (st.reap_failures ?? []).map((f) => f.issue),
+              // DER-2839: hosts whose remote ledger could not be READ this cycle — missing, unreadable, or
+              // an ssh failure. Distinct from `held_fragment_stale` (a tail stuck MID-LINE, where the read
+              // succeeded) because the remedy differs: nothing here has been ingested at all. Carries the
+              // remote's own stderr, so the operator gets the reason and not just the fact.
+              pull_failed: [...pullFailures].map(([host, why]) => ({ host, why })),
               // DER-2744: in-flight lanes whose transcript persistence was never proven. Every
               // transcript-reading instrument is blind for these, and a blind lane looks exactly like a
               // dead one — so it belongs next to leads_dead, not in a report nobody runs.
@@ -8372,6 +8518,10 @@ export async function runSubcommand(argv) {
         if (step.events.length) {
           const fresh = dedupeLedgerEvents(step.events);
           if (fresh.length) cursorId = tail.lastEventId ?? cursorId;
+          // Keep the pull-failure evidence set current from the NEW bytes we already parsed, so a lead
+          // dispatched to a host mid-watch is recognised without a second whole-ledger read (DER-2741's
+          // invariant). Only when the set has been seeded — otherwise the lazy seed below picks it up.
+          if (dispatchHosts) for (const e of fresh) if (e.type === "lead_spawned" && e.host) dispatchHosts.add(e.host);
           if (!wakeSet || fresh.some((e) => wakeSet.has(e.type))) {
             return {
               stdout: await wakePayload("event", {

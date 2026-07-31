@@ -28,7 +28,7 @@
 // prevent: a check that cannot fail is not evidence.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, writeFile, appendFile, readFile, rm, access } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, appendFile, readFile, rm, access, chmod } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
@@ -595,6 +595,314 @@ test("query-check pipes stage-to-stage without a shell (DER-2836)", async (t) =>
   const r = await S.run();
   assert.equal(r.code, 0, `a two-stage pipeline must still run:\n${r.out}`);
   assert.match(r.out, /1 ≥ 1/, `the second stage must have consumed the first's output:\n${r.out}`);
+});
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// DER-2839 — a remote read that FAILED must not be reported as a remote that was EMPTY
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+//
+// The remote tail used to end in `2>/dev/null || true`. That suffix collapses three different remote
+// answers — "the file is missing", "I am not allowed to read it", "the read failed" — into the single
+// answer "it read fine and there was nothing there". The empty-body path then calls recordHeldFragment
+// with a null fragment, which DELETES the held-fragment record: the completion-blocking damage signal
+// DER-2776 exists to preserve is erased by a read that never happened.
+//
+// This is the inversion DER-2776 was written to prevent, arriving through the shell instead of the
+// parser: uncertainty laundered into a clean receipt. The harness already draws the distinction it
+// needed here — classifyKillProbe's "'I could not look' and 'it is dead' are different facts" — so the
+// fix is to let the read FAIL (propagate tail's exit status) and preserve both the cursor and the hold.
+//
+// The fixture is a real `pull-host` subprocess against a real ssh stub that runs the remote command
+// locally with a real `tail`, so what is under test is the command the harness actually builds.
+
+// A run whose config declares a `mini` host, plus a stub `ssh` that executes the remote command against
+// a local directory standing in for the remote ledger root.
+// `remoteDirName` puts the ledger root in a SUBDIRECTORY of that name — the seam for exercising a path
+// that needs shell quoting (a space, a metacharacter) without weakening the default fixture.
+async function newPullHostRun(t, { remoteDirName = null } = {}) {
+  const runsRoot = await mkdtemp(join(tmpdir(), "wh-e2e-ph-runs-"));
+  const repoRoot = await mkdtemp(join(tmpdir(), "wh-e2e-ph-repo-"));
+  const remoteBase = await mkdtemp(join(tmpdir(), "wh-e2e-ph-remote-"));
+  const remoteRoot = remoteDirName ? join(remoteBase, remoteDirName) : remoteBase;
+  if (remoteDirName) await mkdir(remoteRoot, { recursive: true });
+  t.after(() => Promise.all([runsRoot, repoRoot, remoteBase].map((d) => rm(d, { recursive: true, force: true }))));
+
+  await mkdir(join(repoRoot, ".claude"), { recursive: true });
+  await writeFile(join(repoRoot, ".claude", "work.config.json"), JSON.stringify({
+    hosts: {
+      local: { cap: 2 },
+      mini: { enabled: true, cap: 2, ssh: "example-mini-host", ledgerRoot: remoteRoot },
+    },
+  }), "utf8");
+
+  // `ssh <host> <command>` → run <command> locally. Real /bin/sh, real tail, real exit codes: the point
+  // of this fixture is that the harness's own command string is what decides the outcome. The command is
+  // also LOGGED verbatim, so a test can compare what executed against what `--dry-run` printed.
+  // The stub lives OUTSIDE the ledger root, so a ledger root with a space in it does not put a space in
+  // PATH — which would break the fixture for a reason unrelated to the case under test.
+  const bin = join(remoteBase, "bin");
+  await mkdir(bin, { recursive: true });
+  const sshStub = join(bin, "ssh");
+  const sshLog = join(remoteBase, "ssh.log");
+  await writeFile(sshStub, `#!/bin/sh\nprintf '%s\\n' "$2" >> ${JSON.stringify(sshLog)}\nexec /bin/sh -c "$2"\n`, "utf8");
+  await chmod(sshStub, 0o755);
+
+  const env = { PATH: `${bin}:${process.env.PATH}` };
+  const init = await cli(["init-run", "--project", "sandbox", "--runs-root", runsRoot, "--repo-root", repoRoot], { env });
+  succeeded(init);
+  const runId = init.stdout.trim().split("\n").filter(Boolean).pop();
+  const runDir = join(runsRoot, runId);
+  const remoteDir = join(remoteRoot, runId);
+  await mkdir(remoteDir, { recursive: true });
+  const remoteLedger = join(remoteDir, "events.jsonl");
+  const heldPath = join(runDir, "sync-held.mini.json");
+
+  return {
+    runId, runDir, remoteLedger, heldPath,
+    writeRemote: (text) => writeFile(remoteLedger, text, "utf8"),
+    pull: (extra = []) => cli(
+      ["pull-host", "--run", runId, "--host", "mini", "--repo-root", repoRoot, "--runs-root", runsRoot, ...extra],
+      { env },
+    ),
+    cursor: async () => Number.parseInt(await readFile(join(runDir, "sync-cursor.mini"), "utf8").catch(() => "0"), 10) || 0,
+    // Tolerant: a missing hold file must fail as an ASSERTION about behaviour, not as an ENOENT. A test
+    // that crashes on the parent proves nothing about what the parent does.
+    held: async () => JSON.parse(await readFile(heldPath, "utf8").catch(() => "null")),
+    sshCommands: async () => (await readFile(sshLog, "utf8").catch(() => "")).split("\n").filter(Boolean),
+    // The unattended consumer: `watch` folds the per-host pull into its poll cycle. A short timeout is
+    // enough — the pull runs immediately on entry, before the first wait.
+    watch: () => cli(
+      ["watch", "--run", runId, "--runs-root", runsRoot, "--repo-root", repoRoot, "--pull-hosts", "mini", "--timeout", "1"],
+      { env },
+    ),
+    append: (ev) => cli(["append", "--run", runId, "--runs-root", runsRoot, JSON.stringify(ev)], { env }),
+  };
+}
+
+const PH_LINE1 = `${JSON.stringify({ actor: "lead:DER-9", type: "lead_spawned", issue: "DER-9", ts: "2026-07-30T10:00:00.000Z" })}\n`;
+const PH_TORN = '{"actor":"lead:DER-9","type":"pr_opened","issue":"DER-9","pr":';
+
+// Two ways for the remote read to fail. Both used to exit 0 with empty stdout, and both therefore looked
+// identical to a clean pull that found nothing new. Parameterised because a fix that only handles the
+// missing file leaves the unreadable one laundered — the "incomplete change across a family" shape.
+for (const [mode, breakRemote] of [
+  ["the remote ledger is MISSING", async (R) => rm(R.remoteLedger, { force: true })],
+  ["the remote ledger is UNREADABLE", async (R) => chmod(R.remoteLedger, 0o000)],
+]) {
+  test(`FAULT ${mode}: the pull FAILS, and does not clear the held fragment or move the cursor (DER-2839)`, async (t) => {
+    const R = await newPullHostRun(t);
+
+    // Set the scene with a real torn tail, so there is a hold worth destroying.
+    await R.writeRemote(`${PH_LINE1}${PH_TORN}`);
+    succeeded(await R.pull());
+    const before = await R.held();
+    assert.ok(before?.first_seen_at,
+      `CONTROL: the fixture must actually produce a hold, or the assertion below is vacuous — got ${JSON.stringify(before)}`);
+    assert.equal(await R.cursor(), 1, "CONTROL: the one complete line was merged");
+
+    await breakRemote(R);
+    const r = await R.pull();
+
+    // 1. THE ASSERTION THAT FAILS ON THE PARENT COMMIT. On the parent the hold file was deleted here, by
+    //    a pull that read nothing at all.
+    const after = await R.held();
+    assert.ok(after?.first_seen_at,
+      `a read that FAILED must not clear the held fragment — the hold is gone, got ${JSON.stringify(after)}`);
+    assert.equal(after.first_seen_at, before.first_seen_at, "…and must not restart the hold's age clock");
+
+    // 2. And the failure is REPORTED as a failure, not as a clean empty pull.
+    assert.equal(r.timedOut, false, "pull-host TIMED OUT — UNKNOWN, not a failure");
+    const rep = JSON.parse(r.stdout);
+    assert.equal(rep.pull_failed, true, `a failed read must say so rather than reporting a clean zero:\n${r.out}`);
+    assert.equal(rep.pulled, 0);
+    assert.equal(await R.cursor(), 1, "a pull that read nothing must not move the cursor");
+
+    // 3. The RESPONSE CONTRACT, not just the on-disk state. Without these, an implementation that kept
+    //    the hold on disk but reported `held: null` with no reason would pass everything above — and
+    //    `held: null` is precisely the "nothing is held" laundering this fix exists to remove, one layer
+    //    up from the shell. (Codex review of this change, #3.)
+    assert.equal(rep.held?.first_seen_at, before.first_seen_at,
+      `the failure response must REPORT the hold it preserved, got ${JSON.stringify(rep.held)}`);
+    assert.ok(typeof rep.pull_error === "string" && rep.pull_error.trim(),
+      `the failure must carry a reason, got ${JSON.stringify(rep.pull_error)}`);
+    // The reason must be the REMOTE'S OWN stderr, which is the whole point of dropping `2>/dev/null`.
+    // The first draft of this assertion listed `exit \d+` as an accepted match — the generic fallback
+    // used when there is no stderr at all, i.e. it accepted the very placeholder its message forbade,
+    // and would have stayed green if the suppression came back. (Codex round 2, #4.)
+    assert.doesNotMatch(rep.pull_error, /^exit \d+$/,
+      `"${rep.pull_error}" is the no-stderr fallback, not a reason — the remote's stderr was discarded`);
+    assert.match(rep.pull_error, /No such file|not permitted|Permission denied|cannot open/i,
+      `the reason must describe the ACTUAL failure: ${JSON.stringify(rep.pull_error)}`);
+  });
+}
+
+// A hold that EXISTS but cannot be vouched for is not an absent hold. `readHeldFragments` already states
+// this rule for the whole family ("a hold we cannot age is one we cannot vouch for, so it counts as stale
+// rather than silently disappearing"); the failure path must not disagree with its own sibling.
+// (Codex review of this change, #2 — the first draft returned a bare null here.)
+test("FAULT an UNREADABLE hold record reports as unknown, never as 'nothing held' (DER-2839)", async (t) => {
+  const R = await newPullHostRun(t);
+  await R.writeRemote(`${PH_LINE1}${PH_TORN}`);
+  succeeded(await R.pull());
+  assert.ok((await R.held())?.first_seen_at, "CONTROL: a real hold exists before it is corrupted");
+
+  await writeFile(R.heldPath, "{ this is not json", "utf8"); // the hold is there; it cannot be read
+  await rm(R.remoteLedger, { force: true });                 // …and the remote read fails too
+  const rep = JSON.parse((await R.pull()).stdout);
+
+  assert.equal(rep.pull_failed, true);
+  assert.notEqual(rep.held, null,
+    `an unreadable hold must not be reported as no hold at all, got ${JSON.stringify(rep.held)}`);
+  assert.equal(rep.held?.unreadable, true, `…it must say it is unvouchable: ${JSON.stringify(rep.held)}`);
+  assert.equal(rep.held?.stale, true, "…and count as stale, matching readHeldFragments' stated rule");
+});
+
+// PARSING is not the bar — AGEING is. `{}` is valid JSON and a valid object, so it slipped past the first
+// draft's structural check and reported as a hold in good standing with a null age. The family rule is
+// `readHeldFragments`': a record it cannot date is stale. (Codex round 2, #3.)
+test("FAULT a hold record that PARSES but cannot be aged is still unvouchable (DER-2839)", async (t) => {
+  const R = await newPullHostRun(t);
+  await R.writeRemote(`${PH_LINE1}${PH_TORN}`);
+  succeeded(await R.pull());
+  assert.ok((await R.held())?.first_seen_at, "CONTROL: a real, ageable hold exists first");
+
+  await writeFile(R.heldPath, "{}", "utf8"); // parses; carries no first_seen_at
+  await rm(R.remoteLedger, { force: true });
+  const rep = JSON.parse((await R.pull()).stdout);
+  assert.equal(rep.held?.unreadable, true,
+    `a hold with no ageable first_seen_at must not read as one in good standing, got ${JSON.stringify(rep.held)}`);
+
+  // CONTROL: a record that parses AND dates is still accepted — the check must not reject every hold.
+  await writeFile(R.heldPath, JSON.stringify({ host: "mini", cursor: 1, first_seen_at: "2026-07-30T10:00:00.000Z", bytes: 12 }), "utf8");
+  const ok = JSON.parse((await R.pull()).stdout);
+  assert.equal(ok.held?.unreadable, undefined, `a well-formed hold must still be vouched for, got ${JSON.stringify(ok.held)}`);
+  assert.equal(ok.held?.first_seen_at, "2026-07-30T10:00:00.000Z");
+});
+
+// THE CONTROL that stops the two cases above from being satisfied by a fix that simply calls every pull a
+// failure — which would wedge the mini lane while looking like a security improvement.
+test("a genuinely empty-but-successful remote read still succeeds and holds nothing (DER-2839 control)", async (t) => {
+  const R = await newPullHostRun(t);
+  await R.writeRemote(PH_LINE1); // one complete line, no tear
+  succeeded(await R.pull());
+  assert.equal(await R.cursor(), 1);
+  assert.equal(await R.held(), null, "a clean pull holds nothing");
+
+  const r = await R.pull(); // nothing new past the cursor: a real, successful, empty read
+  succeeded(r);
+  const rep = JSON.parse(r.stdout);
+  assert.notEqual(rep.pull_failed, true, `an empty-but-successful read is NOT a failure:\n${r.out}`);
+  assert.equal(rep.pulled, 0);
+  assert.equal(await R.cursor(), 1, "…and it does not move the cursor either");
+});
+
+// The second site. `pull-host --dry-run` PRINTS the command instead of running it, and printed a
+// separately-written copy of the same string — so the operator's preview could drift from what executes.
+// Asserting they are the same string is what makes one builder the only way to keep this green.
+test("the dry-run preview prints the SAME command the pull executes, with no `|| true` (DER-2839)", async (t) => {
+  const R = await newPullHostRun(t);
+  await R.writeRemote(PH_LINE1);
+
+  // The strong form: capture what the ssh stub was ACTUALLY handed, and compare the preview against it.
+  // Asserting only that the preview lacks `|| true` would stay green if production drifted to a
+  // different path, cursor, or separately-built command — which is the whole failure mode a preview has.
+  // (Codex review of this change, #4.)
+  //
+  // ORDER MATTERS, and the first draft of this test got it wrong: a successful pull ADVANCES the cursor,
+  // so a preview taken afterwards correctly prints `tail -n +2` against an executed `tail -n +1` and the
+  // comparison fails on a real difference that is not drift. Both must be observed at the SAME cursor —
+  // the dry-run first (it advances nothing), then the pull.
+  const r = await R.pull(["--dry-run"]);
+  succeeded(r);
+  succeeded(await R.pull());
+  const executed = await R.sshCommands();
+  assert.equal(executed.length, 1, `expected exactly one ssh command, saw ${executed.length}`);
+  // The preview prints `ssh <host> <shell-quoted command>`; unwrap it back to the command itself.
+  const printed = r.stdout.trim();
+  const m = printed.match(/^ssh \S+ (.*)$/s);
+  assert.ok(m, `the preview must print an ssh invocation, got ${JSON.stringify(printed)}`);
+  const preview = m[1].startsWith("'") && m[1].endsWith("'")
+    ? m[1].slice(1, -1).replace(/'\\''/g, "'")
+    : m[1];
+  assert.equal(preview, executed[0],
+    `the preview must be the command that runs.\n  preview:  ${preview}\n  executed: ${executed[0]}`);
+
+  // …and neither carries the laundering, stated on the executed string so this cannot pass on a preview
+  // that merely looks clean.
+  assert.doesNotMatch(executed[0], /\|\|\s*true/, `the executed command still masks its exit status: ${executed[0]}`);
+  assert.doesNotMatch(executed[0], /2>\s*\/dev\/null/, `the executed command still discards the reason: ${executed[0]}`);
+});
+
+// `pull-host` is the operator's manual call; `watch --pull-hosts` is the one that runs UNATTENDED, and it
+// awaited the pull and discarded the result. So a mini whose ledger is permanently unreadable stopped
+// ingesting events indefinitely while the operator saw routine watch output — the failure signal this fix
+// introduces, thrown away by its own primary consumer. (Codex review of this change, #1.)
+test("FAULT `watch --pull-hosts` SURFACES a failed remote read instead of swallowing it (DER-2839)", async (t) => {
+  const R = await newPullHostRun(t);
+  await R.writeRemote(PH_LINE1);
+
+  // CONTROL FIRST: a healthy host reports NO pull failure. Without this, the assertion below passes on an
+  // implementation that reports every host as failing, forever.
+  const healthy = await R.watch();
+  succeeded(healthy);
+  assert.deepEqual(JSON.parse(healthy.stdout).pending.pull_failed, [],
+    `a healthy host must not be reported as failing:\n${healthy.out}`);
+
+  await rm(R.remoteLedger, { force: true });
+  const broken = await R.watch();
+  succeeded(broken);
+  const failures = JSON.parse(broken.stdout).pending.pull_failed;
+  assert.equal(failures.length, 1, `the unreadable host must surface on the wake, got ${JSON.stringify(failures)}`);
+  assert.equal(failures[0].host, "mini", "…named");
+  assert.match(failures[0].why, /No such file|cannot open/i,
+    `…and carrying the remote's own reason, got ${JSON.stringify(failures[0].why)}`);
+});
+
+// The other half of that signal: a host the run has NEVER read from and NEVER dispatched to has no ledger
+// because nothing has run there. Reporting it every wake would put a permanent banner on a healthy run —
+// and a banner that is always on is one operators learn to skim, which destroys the signal above rather
+// than adding to it. (Codex round 2, #2.)
+test("`watch --pull-hosts` stays SILENT about a host the run never used (DER-2839)", async (t) => {
+  const R = await newPullHostRun(t);
+  await rm(R.remoteLedger, { force: true }); // never written: nothing was ever dispatched to mini
+
+  const r = await R.watch();
+  succeeded(r);
+  assert.deepEqual(JSON.parse(r.stdout).pending.pull_failed, [],
+    `a host that never started is not a failure to report:\n${r.out}`);
+
+  // …but the silence is EVIDENCE-BASED, not blanket. Dispatch a lead there and the same unreadable
+  // ledger becomes news. Without this control the test above would also pass on a fix that simply
+  // deleted the signal.
+  succeeded(await R.append({ actor: "orch", type: "lead_spawned", issue: "DER-9", host: "mini", worktree: "/wt/DER-9" }));
+  const after = await R.watch();
+  succeeded(after);
+  const failures = JSON.parse(after.stdout).pending.pull_failed;
+  assert.equal(failures.length, 1,
+    `once the run dispatched to that host, an unreadable ledger IS news, got ${JSON.stringify(failures)}`);
+  assert.equal(failures[0].host, "mini");
+
+  // …and it CLEARS on the next successful pull. Without this the latch could be write-only: a signal that
+  // arrives correctly and then never goes away is a permanent banner by another route. (Codex round 3, #4
+  // — an earlier draft of the CHANGELOG claimed this was covered when it was not.)
+  await R.writeRemote(PH_LINE1);
+  const healed = await R.watch();
+  succeeded(healed);
+  assert.deepEqual(JSON.parse(healed.stdout).pending.pull_failed, [],
+    `a successful pull must clear the latch, got ${healed.stdout}`);
+});
+
+// The path is interpolated into a string the REMOTE SHELL evaluates. A `ledgerRoot` containing a space is
+// valid configuration and used to split into two operands, failing every pull. (Codex review, #5 —
+// pre-existing on main, closed here because the shared builder is now the only site that constructs it.)
+test("a remote ledger path containing a space still pulls (DER-2839, shell-quoting)", async (t) => {
+  const R = await newPullHostRun(t, { remoteDirName: "Work Ledger" });
+  await R.writeRemote(PH_LINE1);
+  const r = await R.pull();
+  succeeded(r);
+  const rep = JSON.parse(r.stdout);
+  assert.notEqual(rep.pull_failed, true, `a space in ledgerRoot must not fail the pull:\n${r.out}`);
+  assert.equal(rep.pulled, 1, `the line must actually be merged, got ${JSON.stringify(rep)}`);
 });
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
