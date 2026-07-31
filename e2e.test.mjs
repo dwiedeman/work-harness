@@ -21,11 +21,18 @@
 //
 // DEFECT PINS — read before "fixing" a failure in this file
 //
-// Four fold defects are PROVEN LIVE (DER-2323, DER-2602, DER-2824, DER-2810). The pins below assert the
-// CURRENT BROKEN behavior on purpose. When the matching issue lands, the pin goes RED and must be
-// INVERTED — that redness is the intended signal, not a regression. Without the pins, an all-green E2E
-// while four defects are live would manufacture exactly the false confidence this repo's rules exist to
+// THREE fold defects are PROVEN LIVE (DER-2323, DER-2602, DER-2824) and each has a pin below, as does a
+// fourth PROVEN-LIVE evidence-query defect (DER-2900) pinned with the query cases further down. The pins
+// assert the CURRENT BROKEN behavior on purpose. When the matching issue lands, the pin goes RED and must
+// be INVERTED — that redness is the intended signal, not a regression. Without the pins, an all-green E2E
+// while three defects are live would manufacture exactly the false confidence this repo's rules exist to
 // prevent: a check that cannot fail is not evidence.
+//
+// This paragraph used to say FOUR and list DER-2810 — which never had a pin, so the count was one more
+// than the file could back up, and the sentence "the pins below" was doing the vouching. DER-2810 is now
+// FIXED (see the evidence-query cases at the end of this file), so it belongs in neither list. Cited
+// because it is this file's own rule turned on itself: a claim about coverage is only worth what an
+// actual check behind it is worth, and this one had none.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, mkdir, writeFile, appendFile, readFile, rm, access, chmod } from "node:fs/promises";
@@ -903,6 +910,192 @@ test("a remote ledger path containing a space still pulls (DER-2839, shell-quoti
   const rep = JSON.parse(r.stdout);
   assert.notEqual(rep.pull_failed, true, `a space in ledgerRoot must not fail the pull:\n${r.out}`);
   assert.equal(rep.pulled, 1, `the line must actually be merged, got ${JSON.stringify(rep)}`);
+});
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// DER-2841 / DER-2810 / DER-2808 — an evidence query must not be able to buy a pass it did not earn
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+//
+// DER-2783 established the rule these three defeat from different directions: a run that did not exit 0
+// is a FAILED run, not a count. Each of these is a way to be stamped `ok N ≥ 1` while having measured
+// nothing, and all three are shaped like something an author would plausibly write.
+//
+//   DER-2841  `grep -c PATTERN a.txt b.txt` prints `path:count` ROWS. Numeric mode declines a non-scalar,
+//             and the line-counting fallback then counted the ROWS — i.e. the number of files SEARCHED.
+//             Files matching zero times counted as matches. The wider the search, the bigger the lie.
+//   DER-2810  `… || true` / `… ; true` / `… | cat` each exit 0 with stdout `0` and move the counting
+//             command off the end of the pipeline, so the single line `0` is line-counted as 1.
+//   DER-2808  a query beginning with a bare separator silently lost its leading segment in the parse.
+//
+// Driven through the real `prep-runner.mjs` subprocess against a real filesystem, because the defect is
+// in what an author READS at the surface, not in a predicate's return value.
+
+// A repo with two files and a plan whose single evidence query is `query`.
+async function planWithQuery(t, query, { expectAtLeast = 1, files = {} } = {}) {
+  const root = await mkdtemp(join(tmpdir(), "wh-e2e-ev-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  for (const [name, body] of Object.entries(files)) await writeFile(join(root, name), body, "utf8");
+  const planPath = join(root, "plan.json");
+  await writeFile(planPath, JSON.stringify({
+    evidenceQueries: [{ name: "claim", query, window: "n/a", expectAtLeast }],
+  }, null, 2), "utf8");
+  return { root, run: () => prep(["query-check", planPath, "--repo-root", root], { cwd: root }) };
+}
+
+const TWO_EMPTY = { "a.txt": "nothing here\n", "b.txt": "nor here\n" };
+
+// ONE real match plus TWO zero-count files — the fixture the issue names, and the only shape that reaches
+// this defect end to end. It matters that at least one file matches: with NO matches anywhere `grep -c`
+// exits 1 and DER-2783's exit-status gate refuses the query before its output is ever read, so an
+// all-zero fixture is refused on both the parent and the fix and proves nothing. Here grep exits 0, and
+// the three rows were counted as three matches.
+const ONE_MATCH_TWO_ZEROS = { "a.txt": "x\n", "b.txt": "nothing\n", "c.txt": "nothing\n" };
+
+test("FAULT multi-file `grep -c`: one real match is not three (DER-2841)", async (t) => {
+  // THE ASSERTION THAT FAILS ON THE PARENT. There, stdout is "a.txt:1\nb.txt:0\nc.txt:0", the fallback
+  // counted three ROWS, and `3 >= 3` stamped a single match as three. The inflation is exactly the number
+  // of files searched, so widening the search makes the fabricated count grow.
+  const S = await planWithQuery(t, `grep -c 'x' a.txt b.txt c.txt`, { expectAtLeast: 3, files: ONE_MATCH_TWO_ZEROS });
+  const r = await S.run();
+  assert.equal(r.timedOut, false, "query-check TIMED OUT — UNKNOWN, not a refusal");
+  assert.equal(r.code, 1, `one match must not satisfy a floor of three:\n${r.out}`);
+  assert.match(r.out, /PER-FILE counts across 3 files/, `and it must say WHY, not just fail a floor:\n${r.out}`);
+  assert.match(r.out, /number of files SEARCHED/, `naming the wrong number the old fallback reported:\n${r.out}`);
+  assert.doesNotMatch(r.out, /\bok\s+plan evidenceQueries\[0\]/, `it must not be stamped ok:\n${r.out}`);
+});
+
+// The SAME fallback was wrong in the other direction too, which only came out while building the
+// over-refusal guard for it (Codex review of this change). `-H` forces the path prefix on a SINGLE file,
+// so stdout is `a.txt:2` — one unambiguous count. The old fallback line-counted it to **1** and failed a
+// floor of 2, so a legitimate query UNDER-reported; the first version of this fix then refused it
+// outright, telling the author to narrow a query that was already narrow.
+//
+// So this is a third defect, not a control: row-counting over-reported across many files and
+// under-reported on one prefixed file, and only a scalar ever gave the right answer. One row is now read
+// as the number it is. The real both-sides control is the "legitimate evidence queries" case below.
+// A prefixed single-file count is REFUSED, and the refusal must name the spelling that works.
+//
+// This replaces two tests that asserted the opposite. A carve-out read one `path:COUNT` / `COUNT path`
+// row as its number, so `grep -Hc PAT one.txt` and `wc -l one.txt` were counted rather than refused.
+// Adversarial probing showed that carve-out FAILS OPEN — `/^(.*):(\d+)$/` matches any line ending in
+// `:digits`, so `wc -l 'notes:2026'` read 2026 and PASSED a floor of 2000 against a true count of 3.
+// Fail-closed-and-wrong (the parent, which answered 1) beats fail-open-and-fabricated, so the carve-out
+// was reverted and the remedy moved into the message.
+for (const [label, query, files] of [
+  ["`grep -Hc` (prints `path:COUNT`)", `grep -Hc 'x' a.txt`, { "a.txt": "x\nx\n" }],
+  ["`wc -l FILE` (prints `COUNT path`)", `wc -l a.txt`, { "a.txt": "x\nx\n" }],
+]) {
+  test(`a prefixed single-file count is refused, naming a spelling that works — ${label} (DER-2841)`, async (t) => {
+    const S = await planWithQuery(t, query, { expectAtLeast: 2, files });
+    const r = await S.run();
+    assert.equal(r.code, 1, `a prefixed count must not be guessed at:\n${r.out}`);
+    assert.match(r.out, /wc -l < FILE|drop the `-H`|matching lines/,
+      `the refusal must name a working spelling, or the author is stuck:\n${r.out}`);
+  });
+}
+
+// THE REASON the carve-out is gone, asserted directly: a line that merely LOOKS like `path:count` must
+// never become the count. Both cases below PASSED on this branch before the reversal.
+for (const [label, query, floor, files] of [
+  ["a colon in the FILENAME", `wc -l 'notes:2026'`, 2000, { "notes:2026": "a\nb\nc\n" }],
+  ["a timestamp in a matched LINE", `grep -e -c t1.txt`, 30, { "t1.txt": "run -c at 12:34\n" }],
+]) {
+  test(`FAULT a number that is not a count cannot buy a pass — ${label} (DER-2841)`, async (t) => {
+    const S = await planWithQuery(t, query, { expectAtLeast: floor, files });
+    const r = await S.run();
+    assert.equal(r.code, 1, `a fabricated number must not clear a floor of ${floor}:\n${r.out}`);
+    assert.doesNotMatch(r.out, new RegExp(`${floor} ≥ ${floor}|\\b(2026|34) ≥`), `it read a number out of the TEXT:\n${r.out}`);
+  });
+}
+
+
+// DER-2810, stated as MEASURED rather than as filed. The issue predicts that all three suffixes are
+// stamped `ok 1 ≥ 1`. Only ONE of them is, and the difference is worth recording because it changes what
+// each test proves:
+//
+//   `| cat`      grep's `0` is PIPED through cat, so stdout is the line "0", the counting command is no
+//                longer last (numeric mode off), and one line clears a floor of 1. Measured on the
+//                parent: exit 0, `ok 1 ≥ 1`. A REAL false pass.
+//   `|| true`    the trailing `true` is joined by `||`/`;`, not a pipe, so ITS stdout — empty — is what
+//   `; true`     gets evaluated. Count 0, floor 1, refused. Measured on the parent: exit 1,
+//                `returned 0 < 1`. They mask the exit status but did NOT buy a pass in this executor.
+//
+// All three are still refused, because masking DER-2783's exit-status signal is the thing being closed
+// and `|| true` is one keystroke from a form that does pass (`|| echo 1`). But only the `| cat` case is
+// evidence of a closed FALSE PASS; the other two are evidence that the validator now refuses the shape.
+for (const [mechanism, suffix, provesFalsePass] of [
+  ["a trailing pipe into `cat`", "| cat", true],
+  ["`|| true`", "|| true", false],
+  ["`; true`", "; true", false],
+]) {
+  const what = provesFalsePass ? "cannot launder a zero-match query into a pass" : "is refused (it masks the exit status)";
+  test(`FAULT ${mechanism} ${what} (DER-2810)`, async (t) => {
+    const S = await planWithQuery(t, `grep -c 'ZZZ' a.txt ${suffix}`, { files: TWO_EMPTY });
+    const r = await S.run();
+    assert.equal(r.timedOut, false);
+    assert.equal(r.code, 1, `the suffix must not buy a pass:\n${r.out}`);
+    assert.match(r.out, /suppresses the exit status|pass-through/, `the refusal must name the mechanism:\n${r.out}`);
+    if (provesFalsePass) {
+      // Only this case can carry the claim, so only this case asserts it: on the parent this exact query
+      // printed `ok  plan evidenceQueries[0] "claim": 1 ≥ 1`.
+      assert.doesNotMatch(r.out, /1 ≥ 1/, `the parent stamped this ok 1 ≥ 1 — that must be gone:\n${r.out}`);
+    }
+  });
+}
+
+test("FAULT a query beginning with a bare separator is refused, naming the operator (DER-2808)", async (t) => {
+  const S = await planWithQuery(t, `| wc -l`, { files: TWO_EMPTY });
+  const r = await S.run();
+  assert.equal(r.code, 1, `a query with no leading command must be refused:\n${r.out}`);
+  assert.match(r.out, /begins with the separator/, `and name the operator:\n${r.out}`);
+});
+
+// PIN (DER-2900) — PROVEN LIVE, NOT FIXED HERE. `grep -c PATTERN file | wc -l` is stamped `ok 1 >= 1` for ANY
+// pattern, matching or not: `grep -c` prints one line ("0"), `wc -l` counts that ONE line, and numeric
+// mode reads the 1. The same shape passes with a trailing `| head -1` or `| sort`, which line-count the
+// single "0" to 1. Zero real matches, stamped as evidence.
+//
+// NOT fixed in this bundle, deliberately. The obvious rule — "refuse a counting command that is not the
+// last stage" — also refuses `rg -c PATTERN . | wc -l`, which legitimately answers "how many files
+// contain PATTERN". Telling those apart needs to know how many files the command searches, which is not
+// statically knowable, and a heuristic guess here is what DER-2810 was filed for in the first place.
+//
+// What this bundle DID fix is the part that was provably wrong: the refusal message used to RECOMMEND
+// `| wc -l` after a counting command. It now says to drop the `-c` and count matching lines instead.
+//
+// When DER-2900 lands this pin goes RED and must be INVERTED, not repaired.
+test("PIN DER-2900: `grep -c … | wc -l` still passes with ZERO matches — INVERT THIS WHEN DER-2900 LANDS", async (t) => {
+  const S = await planWithQuery(t, `grep -c 'ZZZ' a.txt | wc -l`, { files: TWO_EMPTY });
+  const r = await S.run();
+  assert.equal(r.code, 0,
+    "PIN IS RED: this query no longer passes, which means the defect was fixed — invert this pin rather than repairing it");
+  assert.match(r.out, /1 ≥ 1/, "…and the count it reports is the constant 1, not a measurement");
+  // The half that IS fixed: the guidance no longer sends authors here.
+  const refused = await planWithQuery(t, `grep -c 'x' a.txt b.txt c.txt`, { expectAtLeast: 3, files: ONE_MATCH_TWO_ZEROS });
+  const rr = await refused.run();
+  assert.match(rr.out, /drop the `-c`/i, `the remedy must not recommend the shape this pin describes:\n${rr.out}`);
+  assert.doesNotMatch(rr.out, /or end it in `\| wc -l`/, "the old, wrong advice must be gone");
+  assert.match(rr.out, /Do NOT append `\| wc -l` while KEEPING/, "…and it must warn against the pinned shape by name");
+});
+
+// THE CONTROLS. Without these, every case above is satisfied by a validator that refuses everything —
+// which would take the whole evidence gate offline while reading as a security improvement.
+test("legitimate evidence queries still RUN and still pass after DER-2841/2810/2808", async (t) => {
+  // Single file, bare integer: the documented numeric-mode shape, and the one DER-2783 exists to serve.
+  const single = await planWithQuery(t, `grep -c 'x' a.txt`, { expectAtLeast: 3, files: { "a.txt": "x\nx\nx\n" } });
+  const r1 = await single.run();
+  assert.equal(r1.code, 0, `a single-file counting query must still pass:\n${r1.out}`);
+  assert.match(r1.out, /3 ≥ 3/, `and read the NUMBER, not the line:\n${r1.out}`);
+
+  // A multi-file search ending in `| wc -l` — the remedy the refusal message actually recommends. If this
+  // failed, the message would be sending authors somewhere that does not work.
+  const piped = await planWithQuery(t, `grep -c 'x' a.txt b.txt | wc -l`, { expectAtLeast: 2, files: { "a.txt": "x\n", "b.txt": "x\nx\n" } });
+  const r2 = await piped.run();
+  assert.equal(r2.code, 0, `the remedy the refusal recommends must itself work:\n${r2.out}`);
+
+  // A non-counting pipeline is untouched by all of this.
+  const lines = await planWithQuery(t, `grep -rn 'x' a.txt`, { expectAtLeast: 2, files: { "a.txt": "x\nx\n" } });
+  assert.equal((await lines.run()).code, 0, "line-counting queries are unaffected");
 });
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────

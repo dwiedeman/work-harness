@@ -328,7 +328,16 @@ export function validatePlan(plan, opts = {}) {
       // Checked BEFORE the count and independently of it: `query-check` stamps 0 on a failed run, but 0
       // is also a legitimate measurement, so the count alone cannot tell the two apart. Without this
       // branch a hand-edited or re-stamped count would buy a query that never ran a pass here (DER-2783).
-      E(scopeId, `${label}: its last \`query-check\` run FAILED — the query exited nonzero or was killed, so its stamped count is a fail-closed 0, not a measurement. A query that cannot run is not evidence: fix the QUERY, then re-run \`query-check --record\`.`);
+      // The RECORDED reason wins when there is one. `failed` used to mean exactly one thing — a nonzero
+      // exit or a kill — and this message said so. DER-2841 widened it: a query that exits 0 and prints a
+      // per-file breakdown is also refused, and telling that author "the query exited nonzero or was
+      // killed" names a cause that did not happen and sends them to fix the wrong thing. Widening the
+      // flag without widening its explanation is the same class this bundle exists to close, so the
+      // stamped reason is carried here rather than re-derived from a flag that no longer implies it.
+      const why = typeof q.observed.failure === "string" && q.observed.failure.trim()
+        ? q.observed.failure.trim()
+        : "the query exited nonzero or was killed";
+      E(scopeId, `${label}: its last \`query-check\` run FAILED — ${why} So its stamped count is a fail-closed 0, not a measurement. A query that cannot run is not evidence: fix the QUERY, then re-run \`query-check --record\`.`);
     } else if (q.observed.count < q.expectAtLeast) {
       E(scopeId, `${label}: returned ${q.observed.count} < ${q.expectAtLeast} on its known-positive window (${q.window}) — the query is BLIND to the history it cites; fix the QUERY, not the floor`);
     }
@@ -1388,6 +1397,24 @@ export function parseEvidenceQuery(query) {
     segments[segments.length - 1].tokens.push(t);
   }
 
+  // DER-2808 — a query that BEGINS with a separator (`| wc -l`). The empty leading segment is dropped by
+  // the `if (!seg.tokens.length) continue` below, so the parse silently loses it: `stages[0]` is then the
+  // `wc -l` stage, and any consumer that trusts it to be the query's FIRST command reads a stage that
+  // never was. Harmless today only by luck — such a query is a shell syntax error, so it produces no
+  // output and the count floor fails it — but that is a blind spot in the PARSE, not a verdict, and
+  // `queryCountsNumerically` already has to carry a paragraph explaining the case rather than relying on
+  // it being impossible. Refused with the operator named, consistent with the validator's stated posture
+  // that an unparsed shape is refused rather than assumed safe.
+  // A leading NEWLINE is not this defect — it is ordinary leading whitespace, and a templated or indented
+  // multi-line query in a JSON plan legitimately starts with one. Refusing it was a regression this
+  // check introduced (`\ngit log --oneline | wc -l` worked before). Only a real control OPERATOR with
+  // nothing in front of it is the malformed shape DER-2808 is about, so leading newlines are dropped
+  // first and the check applies to what remains.
+  while (segments.length > 1 && !segments[0].tokens.length && segments[1].separator === "\n") segments.shift();
+  if (!segments[0].tokens.length && segments.length > 1) {
+    return refuse(`begins with the separator \`${segments[1].separator}\` — there is no command in front of it for it to join to, so the leading segment is empty. Remove it, or name the command that should produce the input.`);
+  }
+
   const out = [];
   const stages = [];
   for (const seg of segments) {
@@ -1473,6 +1500,30 @@ export function parseEvidenceQuery(query) {
     // hasOwn, not a bare index: a name like `constructor` must never reach Object.prototype.
     const rule = Object.hasOwn(QUERY_COMMAND_RULES, name) ? QUERY_COMMAND_RULES[name] : null;
     if (rule) out.push(...rule(words.map((w) => w.text)));
+  }
+
+  // DER-2810 — a TRAILING stage that can only destroy the signal the gate exists to read.
+  //
+  // DER-2783 made a nonzero exit a FAILED run, which closed `git log … | grep -c 'fix('` matching nothing
+  // being stamped `ok 1 ≥ 1`. Four characters reopened it: `… || true` and `… ; true` exit 0 with stdout
+  // `0`, and because the last stage is then `true` rather than a counting command, numeric mode does not
+  // apply — the line count is 1 and the query is stamped `ok 1 ≥ 1` again. `… | cat` reaches the same
+  // place by a third door: the counting command is no longer last, so numeric mode is off and the single
+  // line `0` counts as 1.
+  //
+  // Refused at the VALIDATOR rather than guessed at in the evaluator, by exact command name — not a
+  // heuristic over the raw string, which is what made this unfixable inside DER-2783's scope. The
+  // deliberate decision the issue asked for: `true`/`:` and the pure pass-throughs `cat`/`tee` are the
+  // only trailing stages refused, because none of them can ADD information to an evidence query and all
+  // of them can subtract it. A trailing `head`/`sort`/`awk` still falls back to line counting as before —
+  // those genuinely transform the output, and refusing them would break working queries.
+  const lastStage = stages.at(-1);
+  if (lastStage?.command && stages.length > 1) {
+    if (lastStage.command === "true" || lastStage.command === ":") {
+      out.push(`ends in \`${lastStage.separator} ${lastStage.command}\` — that suppresses the exit status of everything before it, which is the signal the evidence gate reads (DER-2783). A query that cannot fail is not evidence. Drop it.`);
+    } else if (lastStage.separator === "|" && (lastStage.command === "cat" || lastStage.command === "tee")) {
+      out.push(`ends in \`| ${lastStage.command}\` — a pass-through that adds nothing and moves the counting command off the end of the pipeline, so a count of \`0\` is read as ONE LINE of output and passes a floor of 1. Drop it.`);
+    }
   }
   return { problems: out, stages };
 }
@@ -1590,9 +1641,14 @@ const NUMERIC_COUNT_COMMANDS = new Map([
 // came before": a `;`/`&&`/`||`/newline-joined trailing `wc -l` counted NOTHING the earlier stage
 // produced, and its number is not this query's answer. `null` is the one other legitimate value — it
 // occurs only on a stage that is the whole query (`grep -c 'fix(' CHANGELOG.md`), which counts its own
-// operands and has no upstream to have missed. Note that a query beginning with a bare separator
-// (`| wc -l`) parses to a single stage whose separator is `"|"`, not `null`; it is a shell syntax error
-// that now fails on exit status, which is why this predicate must never be the only gate.
+// operands and has no upstream to have missed.
+//
+// DER-2808 removed the case this paragraph used to end on: a query beginning with a bare separator
+// (`| wc -l`) parsed to a single stage whose separator was `"|"`, and the comment recorded that as a
+// deliberate residual mitigated by DER-2783's exit-status gate. Such a query is now REFUSED by
+// `parseEvidenceQuery`, so it reaches this predicate with no stages at all. The closing point of that
+// paragraph still stands on its own and is why the refusal was worth making: this predicate must never
+// be the only gate.
 //
 // Known limit, stated rather than implied: a value that happens to be spelled like the counting flag
 // (`grep -e -c …`) reads as the flag here. It cannot promote anything on its own — numeric mode also
@@ -1613,17 +1669,86 @@ export function queryCountsNumerically(query) {
 }
 
 // Non-empty stdout lines are the match count — unless the pipeline ends in a counting command AND the
-// output is a single bare integer, in which case that integer IS the count. BOTH conditions are required:
-// `grep -c` over MULTIPLE files emits `path:count` lines, a per-file breakdown that must never be read as
-// a total. The trim is load-bearing on macOS — BSD `wc -l` right-aligns its number in a padded field, so
-// a strict `/^\d+$/` against raw stdout would leave numeric mode dead for the command most likely to want
-// it. A query that errors produces no stdout and so counts 0 — fail-closed, never "no output means clean".
+// output is a single bare integer, in which case that integer IS the count. The trim is load-bearing on
+// macOS — BSD `wc -l` right-aligns its number in a padded field, so a strict `/^\d+$/` against raw stdout
+// would leave numeric mode dead for the command most likely to want it. A query that errors produces no
+// stdout and so counts 0 — fail-closed, never "no output means clean".
+//
+// DER-2841 — when the last stage IS a counting command but its output is NOT one bare integer, the query
+// is REFUSED rather than line-counted. The old fallback is where this defect lived: `grep -c` over
+// MULTIPLE files emits `path:count` rows, so line counting returned the NUMBER OF FILES, and a file whose
+// count is `0` was counted as a match. Measured on the parent: `a.txt:0\nb.txt:0\n` against a floor of 1
+// returned `{count: 2, ok: true}` — a query with ZERO real matches certified as evidence. The failure is
+// silent, it scales with the number of files searched, and it looks MORE convincing the wider the search.
+//
+// Refusing is deliberately chosen over summing the rows, per the issue: a summed number is only correct
+// if every row parsed, so a partial parse would quietly under- or over-count, whereas a refusal tells the
+// author to narrow the query to something whose answer is a single number. Empty output keeps its
+// existing fail-closed reading (0 matches) — there is nothing to misread, and the run's exit status has
+// already spoken.
 export function evaluateQueryOutput(stdout, expectAtLeast, { numeric = false } = {}) {
   const text = String(stdout ?? "");
   const bare = text.trim();
-  if (numeric && /^\d+$/.test(bare)) {
-    const count = Number(bare);
-    return { count, ok: count >= expectAtLeast };
+  if (numeric) {
+    if (/^\d+$/.test(bare)) {
+      const count = Number(bare);
+      return { count, ok: count >= expectAtLeast };
+    }
+    if (bare !== "") {
+      // NO CARVE-OUT: a non-scalar is refused, full stop. That is a deliberate REVERSAL, recorded because
+      // the reasoning is the point.
+      //
+      // An earlier version of this fix accepted a SINGLE `path:COUNT` row (and later a single `COUNT path`
+      // row) as an unambiguous measurement, so a prefixed single-file count — `grep -Hc PAT one.txt` ->
+      // `one.txt:2`, `wc -l one.txt` -> `2 one.txt` — was not refused. Adversarial probing showed that
+      // carve-out FAILS OPEN, which is strictly worse than the under-count it was softening.
+      // `/^(.*):(\d+)$/` is greedy and has no notion of "count": it matches ANY line ending in `:digits`.
+      // Measured on this branch before the reversal:
+      //
+      //   wc -l 'notes:2026'   stdout `3 notes:2026`     -> read 2026, PASSED a floor of 2000 (truth: 3)
+      //   grep -e -c t1.txt    stdout `run -c at 12:34`  -> read 34,   PASSED a floor of 30   (truth: 1)
+      //
+      // The second needs no exotic filename: `-e -c` is a documented false positive of
+      // `queryCountsNumerically` (the VALUE `-c` reads as the counting flag), so numeric mode is on for a
+      // command emitting matched LINES, and any line containing `word:digits` becomes "the count". The
+      // parent was wrong on both — it line-counted to 1 — but wrong and FAIL-CLOSED. Trading a fail-closed
+      // wrong answer for a fail-open fabricated one is the exact inversion this bundle exists to close.
+      //
+      // Nothing correct is lost: the parent's answers for the prefixed forms were also wrong (1 for a
+      // 2-line file). The author loses a wrong number and gains a message naming the spelling that works.
+      // A softer rule may return only with a way to prove the number IS a count (e.g. binding the row's
+      // path to one of the query's own literal file operands, and selecting the pattern by command
+      // family) — not by pattern-matching text that merely looks like one.
+      const rows = bare.split("\n").map((l) => l.trim()).filter(Boolean);
+      const parsed = rows.map((l) => /^(.*):(\d+)$/.exec(l));
+      const shown = bare.length > 120 ? `${bare.slice(0, 120)}…` : bare;
+      // The per-file message only makes sense for a genuine BREAKDOWN. A single prefixed row
+      // (`grep -Hc PAT one.txt` -> `a.txt:2`) is not a breakdown across files, and telling that author
+      // "PER-FILE counts across 1 files" both reads as a bug and withholds the remedy they need — which
+      // is the spelling that produces a bare number, not "narrow to one file" on a query already narrow.
+      const allRows = rows.length > 1 && parsed.every(Boolean);
+      return {
+        count: 0,
+        ok: false,
+        failed: true,
+        failure: allRows
+          ? `the counting command reported PER-FILE counts across ${rows.length} files `
+            + `(got ${JSON.stringify(shown)}) — refusing to count them. Counting the ROWS reports the `
+            + "number of files SEARCHED, not the number of matches: a file with `0` matches counts as "
+            + "one. Summing them would report a total the command never reported, and is only correct if "
+            + "every row parsed. Count the matching LINES instead — `grep PATTERN a.txt b.txt | wc -l` "
+            + "(drop the `-c`) — which is what a match count is. Do NOT append `| wc -l` while KEEPING "
+            + "`-c`: that counts the ROWS of a count (i.e. the number of files), and over a single file "
+            + "it answers 1 for every pattern, matching or not."
+          : "the pipeline ends in a counting command but its output is not a number "
+            + `(got ${JSON.stringify(shown)}) — refusing to count it, because a number cannot be `
+            + "recovered from this safely: any text ending in `:digits` LOOKS like a count and is not "
+            + "one. The spelling that works depends on the command: for `wc -l FILE` (which prints "
+            + "`COUNT path`) use `wc -l < FILE`; for a prefixed `grep -Hc`/`rg -c` drop the `-H` and "
+            + "name ONE file so the output is a bare number; otherwise drop the counting flag and count "
+            + "the matching lines with `grep PATTERN file | wc -l`.",
+      };
+    }
   }
   const count = text.split("\n").filter((l) => l.trim()).length;
   return { count, ok: count >= expectAtLeast };
@@ -1649,7 +1774,12 @@ export function evaluateQueryRun(run, expectAtLeast, query) {
     return { count: 0, ok: false, failed: true, failure: `${why} — a run that did not exit 0 is a FAILED run, not a count; counted as 0, fail-closed. (grep/diff exit nonzero to REPORT "no match"/"they differ": if that IS the evidence, end the pipeline in something that consumes it — \`… | wc -l\` — so the exit status means what it says.)` };
   }
   const ev = evaluateQueryOutput(run?.stdout, expectAtLeast, { numeric: queryCountsNumerically(query) });
-  return { ...ev, failed: false, failure: null };
+  // DER-2841: the output evaluator can now REFUSE (a counting pipeline whose stdout is not one number),
+  // so its verdict is carried out rather than overwritten. Hardcoding `failed: false` here — as this line
+  // did — would discard the refusal the moment it was introduced: the query would report `count: 0,
+  // ok: false` with no reason attached, and the author would see a floor failure instead of the actual
+  // problem with their query.
+  return { ...ev, failed: ev.failed ?? false, failure: ev.failure ?? null };
 }
 
 export function collectEvidenceQueries(plan, issueId = null) {
@@ -1986,7 +2116,14 @@ export async function runSubcommand(argv) {
         // Exit status FIRST — output alone is not a pass. `failed` is stamped alongside the count so
         // `validate` can refuse a blind pass rather than re-deriving one from a 0 it cannot interpret.
         const ev = evaluateQueryRun(run, r.q.expectAtLeast, r.q.query);
-        r.q.observed = { count: ev.count, failed: ev.failed, at: new Date().toISOString() };
+        // `failure` is stamped alongside the flag so the REASON survives into the plan. Without it the
+        // only durable record is a boolean, and `validate` — which runs later, in a different process,
+        // off the plan file alone — has to guess the cause from a flag that now has more than one.
+        r.q.observed = {
+          count: ev.count, failed: ev.failed,
+          ...(ev.failed && ev.failure ? { failure: ev.failure } : {}),
+          at: new Date().toISOString(),
+        };
         if (ev.failed) { failures += 1; lines.push(`🔴 ${label}: ${ev.failure}`); }
         else if (!ev.ok) { failures += 1; lines.push(`🔴 ${label}: returned ${ev.count} < ${r.q.expectAtLeast} on its known-positive window (${r.q.window}) — the query is BLIND to the history it cites; fix the QUERY, not the floor`); }
         else lines.push(`ok   ${label}: ${ev.count} ≥ ${r.q.expectAtLeast} on ${r.q.window}`);
