@@ -958,21 +958,58 @@ test("FAULT multi-file `grep -c`: one real match is not three (DER-2841)", async
   const r = await S.run();
   assert.equal(r.timedOut, false, "query-check TIMED OUT — UNKNOWN, not a refusal");
   assert.equal(r.code, 1, `one match must not satisfy a floor of three:\n${r.out}`);
-  assert.match(r.out, /path:count|not a single number/i, `and it must say WHY, not just fail a floor:\n${r.out}`);
+  assert.match(r.out, /PER-FILE counts across 3 files/, `and it must say WHY, not just fail a floor:\n${r.out}`);
+  assert.match(r.out, /number of files SEARCHED/, `naming the wrong number the old fallback reported:\n${r.out}`);
   assert.doesNotMatch(r.out, /\bok\s+plan evidenceQueries\[0\]/, `it must not be stamped ok:\n${r.out}`);
 });
 
-for (const [mechanism, suffix] of [
-  ["`|| true`", "|| true"],
-  ["`; true`", "; true"],
-  ["a trailing pipe into `cat`", "| cat"],
+// The SAME fallback was wrong in the other direction too, which only came out while building the
+// over-refusal guard for it (Codex review of this change). `-H` forces the path prefix on a SINGLE file,
+// so stdout is `a.txt:2` — one unambiguous count. The old fallback line-counted it to **1** and failed a
+// floor of 2, so a legitimate query UNDER-reported; the first version of this fix then refused it
+// outright, telling the author to narrow a query that was already narrow.
+//
+// So this is a third defect, not a control: row-counting over-reported across many files and
+// under-reported on one prefixed file, and only a scalar ever gave the right answer. One row is now read
+// as the number it is. The real both-sides control is the "legitimate evidence queries" case below.
+test("FAULT a single-file `grep -Hc` under-reported its own count (DER-2841)", async (t) => {
+  const S = await planWithQuery(t, `grep -Hc 'x' a.txt`, { expectAtLeast: 2, files: { "a.txt": "x\nx\n" } });
+  const r = await S.run();
+  assert.equal(r.code, 0, `one prefixed row is a count, not a per-file breakdown:\n${r.out}`);
+  assert.match(r.out, /2 ≥ 2/, `and it must read the NUMBER (parent read the ROW, and answered 1):\n${r.out}`);
+});
+
+// DER-2810, stated as MEASURED rather than as filed. The issue predicts that all three suffixes are
+// stamped `ok 1 ≥ 1`. Only ONE of them is, and the difference is worth recording because it changes what
+// each test proves:
+//
+//   `| cat`      grep's `0` is PIPED through cat, so stdout is the line "0", the counting command is no
+//                longer last (numeric mode off), and one line clears a floor of 1. Measured on the
+//                parent: exit 0, `ok 1 ≥ 1`. A REAL false pass.
+//   `|| true`    the trailing `true` is joined by `||`/`;`, not a pipe, so ITS stdout — empty — is what
+//   `; true`     gets evaluated. Count 0, floor 1, refused. Measured on the parent: exit 1,
+//                `returned 0 < 1`. They mask the exit status but did NOT buy a pass in this executor.
+//
+// All three are still refused, because masking DER-2783's exit-status signal is the thing being closed
+// and `|| true` is one keystroke from a form that does pass (`|| echo 1`). But only the `| cat` case is
+// evidence of a closed FALSE PASS; the other two are evidence that the validator now refuses the shape.
+for (const [mechanism, suffix, provesFalsePass] of [
+  ["a trailing pipe into `cat`", "| cat", true],
+  ["`|| true`", "|| true", false],
+  ["`; true`", "; true", false],
 ]) {
-  test(`FAULT ${mechanism} cannot launder a zero-match query into a pass (DER-2810)`, async (t) => {
+  const what = provesFalsePass ? "cannot launder a zero-match query into a pass" : "is refused (it masks the exit status)";
+  test(`FAULT ${mechanism} ${what} (DER-2810)`, async (t) => {
     const S = await planWithQuery(t, `grep -c 'ZZZ' a.txt ${suffix}`, { files: TWO_EMPTY });
     const r = await S.run();
     assert.equal(r.timedOut, false);
     assert.equal(r.code, 1, `the suffix must not buy a pass:\n${r.out}`);
     assert.match(r.out, /suppresses the exit status|pass-through/, `the refusal must name the mechanism:\n${r.out}`);
+    if (provesFalsePass) {
+      // Only this case can carry the claim, so only this case asserts it: on the parent this exact query
+      // printed `ok  plan evidenceQueries[0] "claim": 1 ≥ 1`.
+      assert.doesNotMatch(r.out, /1 ≥ 1/, `the parent stamped this ok 1 ≥ 1 — that must be gone:\n${r.out}`);
+    }
   });
 }
 

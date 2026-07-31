@@ -1051,7 +1051,8 @@ test("evaluateQueryOutput: numeric mode reads the number, and ONLY when stdout i
   assert.equal(rows.failed, true, "a counting pipeline whose stdout is not one number is refused, not counted");
   assert.equal(rows.ok, false);
   assert.equal(rows.count, 0, "and it contributes NO count — 2 was the file tally, never a measurement");
-  assert.match(rows.failure, /path:count|not a single number/i, "the refusal must say WHY, so the author can narrow the query");
+  assert.match(rows.failure, /PER-FILE counts across 2 files/, "the refusal must say WHY, so the author can narrow the query");
+  assert.match(rows.failure, /number of files SEARCHED/, "…and name the wrong number the old fallback reported");
   // THE CASE THAT MAKES IT A DEFECT RATHER THAN AN INACCURACY: zero real matches, floor of 1. The old
   // fallback returned {count: 2, ok: TRUE} — a query that measured nothing, certified as evidence.
   const allZero = evaluateQueryOutput("a.txt:0\nb.txt:0\n", 1, { numeric: true });
@@ -1066,6 +1067,15 @@ test("evaluateQueryOutput: numeric mode reads the number, and ONLY when stdout i
   assert.deepEqual(evaluateQueryOutput("a\nb\nc\n", 3), { count: 3, ok: true });
   assert.deepEqual(evaluateQueryOutput("", 1, { numeric: true }), { count: 0, ok: false }, "empty has nothing to misread; its exit status already spoke");
   assert.deepEqual(evaluateQueryOutput(null, 1, { numeric: true }), { count: 0, ok: false });
+  // OVER-REFUSAL CONTROLS (Codex review of this change): ONE `path:count` row is an unambiguous
+  // measurement and must still be counted. `grep -Hc PATTERN one-file.txt` prints `one-file.txt:1`
+  // because -H forces the prefix, and `rg -c` prefixes by default — refusing those would reject a
+  // legitimate single-file count while telling the author to "narrow the query" that is already narrow.
+  assert.deepEqual(evaluateQueryOutput("a.txt:1\n", 1, { numeric: true }), { count: 1, ok: true });
+  assert.deepEqual(evaluateQueryOutput("./src/a.js:7\n", 5, { numeric: true }), { count: 7, ok: true });
+  // …and the boundary holds: TWO rows is the defect shape and stays refused, so the carve-out above
+  // cannot be widened into "sum whatever grep printed".
+  assert.equal(evaluateQueryOutput("a.txt:1\nb.txt:0\n", 1, { numeric: true }).failed, true);
 });
 
 test("validatePlan: a run that FAILED cannot be honoured, even when its stamped count clears the floor (DER-2783)", () => {
@@ -1169,7 +1179,7 @@ test("CLI query-check: `grep -c` over MULTIPLE files is REFUSED, not counted (DE
     await writeFile(planPath, JSON.stringify(goodPlan([goodIssue({ evidenceQueries: [q] })])), "utf8");
     const res = await runSubcommand(["query-check", planPath, "--repo-root", dir]);
     assert.equal(res.exitCode, 1, res.stdout);
-    assert.match(res.stdout, /path:count|not a single number/i, `the refusal must name the shape:\n${res.stdout}`);
+    assert.match(res.stdout, /PER-FILE counts across 2 files/, `the refusal must name the shape:\n${res.stdout}`);
     // Never a number it did not measure — not the 5 it could have summed, and not the 2 it used to print.
     assert.doesNotMatch(res.stdout, /returned 5|returned 2 </, res.stdout);
   } finally { await rm(dir, { recursive: true, force: true }); }
@@ -1194,14 +1204,20 @@ test("CLI query-check: ONE real match plus two zero-count files used to satisfy 
     await writeFile(planPath, JSON.stringify(goodPlan([goodIssue({ evidenceQueries: [q] })])), "utf8");
     const res = await runSubcommand(["query-check", planPath, "--repo-root", dir]);
     assert.equal(res.exitCode, 1, `one match must not satisfy a floor of three:\n${res.stdout}`);
-    assert.match(res.stdout, /path:count|not a single number/i, `and the refusal must name the shape:\n${res.stdout}`);
+    assert.match(res.stdout, /PER-FILE counts across 3 files/, `and the refusal must name the shape:\n${res.stdout}`);
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
 test("evidence queries: a trailing `|| true` / `; true` / `| cat` is refused (DER-2810)", () => {
-  // DER-2783 made a nonzero exit a FAILED run. Four characters reopened it: these suffixes exit 0 with
-  // stdout `0`, move the counting command off the end of the pipeline so numeric mode does not apply, and
-  // the single line `0` is line-counted as 1 — `ok 1 >= 1`, from a query that matched nothing.
+  // DER-2783 made a nonzero exit a FAILED run. `… | cat` reopened it: grep's `0` is piped through, the
+  // counting command is no longer last so numeric mode is off, and the single line `0` line-counts as 1 —
+  // `ok 1 >= 1` from a query that matched nothing (measured on the parent).
+  //
+  // `|| true` / `; true` do NOT reach that outcome in this executor — the trailing `true` is joined by
+  // `||`/`;` rather than a pipe, so its own empty stdout is what gets evaluated and the floor already
+  // fails. They are refused anyway because they mask the exit status DER-2783 exists to read, and the
+  // shape is one keystroke from one that does pass (`|| echo 1`). Stated here so a later reader does not
+  // infer from this test that all three were false passes; only `| cat` was.
   for (const q of [`grep -c 'x' f.txt || true`, `grep -c 'x' f.txt ; true`, `grep -c 'x' f.txt | cat`]) {
     const problems = evidenceQueryShellProblems(q);
     assert.ok(problems.length, `${JSON.stringify(q)} must be refused, got ${JSON.stringify(problems)}`);

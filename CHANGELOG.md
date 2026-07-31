@@ -139,9 +139,17 @@ would otherwise conclude the file had drifted.
     exits 1 and DER-2783's gate refuses the query before its output is read. An all-zero fixture is
     therefore refused identically on the parent and proves nothing — the first draft of both regressions
     used one, and passed on the parent for a reason that had nothing to do with this defect.
-  - **DER-2810 — `… || true`, `… ; true` and `… | cat` each buy a pass.** The first two exit 0 with stdout
-    `0`; all three move the counting command off the end of the pipeline, so numeric mode does not apply
-    and the single line `0` is line-counted as **1**, clearing a floor of 1. Refused at the validator by
+  - **DER-2810 — a trailing stage that can only destroy the signal the gate reads.** *Measured rather than
+    taken from the issue, which predicts all three suffixes are stamped `ok 1 ≥ 1`. Only one is.* With
+    `… | cat`, grep's `0` is piped through, so stdout is the line `0`, the counting command is no longer
+    last, numeric mode is off, and one line clears a floor of 1 — on the parent this exact query exits 0
+    and prints `ok 1 ≥ 1`, a real false pass. With `… || true` / `… ; true` the trailing `true` is joined
+    by `||`/`;` rather than a pipe, so **its** stdout — empty — is what gets evaluated: count 0, floor 1,
+    already refused on the parent (`returned 0 < 1`). They mask DER-2783's exit-status signal but did not
+    buy a pass in this executor. All three are refused regardless, because masking the signal is the thing
+    being closed and `|| true` is one keystroke from a form that does pass (`|| echo 1`) — but only the
+    `| cat` case is evidence of a closed false pass, and the regressions say so per case. Refused at the
+    validator by
     exact trailing command name — not by a heuristic over the raw string, which is what made this
     unfixable inside DER-2783's scope. The deliberate scope decision the issue asked for: only `true`,
     `:`, `cat` and `tee` are refused as trailing stages, because none can ADD information to an evidence

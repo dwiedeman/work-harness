@@ -1680,16 +1680,35 @@ export function evaluateQueryOutput(stdout, expectAtLeast, { numeric = false } =
       return { count, ok: count >= expectAtLeast };
     }
     if (bare !== "") {
+      // ONE `path:count` row is an unambiguous measurement, and refusing it would be an over-refusal:
+      // `grep -Hc PATTERN one-file.txt` prints `one-file.txt:1` for a single file because `-H` forces the
+      // path prefix, and `rg -c` prefixes by default. That row's number is the count — reading it is not
+      // "inventing a total grep never reported", which is the objection that rules out summing MANY rows.
+      // (Found by the Codex review of this change: the first version refused every prefixed form, so a
+      // legitimate single-file count was rejected with a message telling the author to narrow a query
+      // that was already narrow.)
+      const rows = bare.split("\n").map((l) => l.trim()).filter(Boolean);
+      const parsed = rows.map((l) => /^(.*):(\d+)$/.exec(l));
+      if (rows.length === 1 && parsed[0]) {
+        const count = Number(parsed[0][2]);
+        return { count, ok: count >= expectAtLeast };
+      }
       const shown = bare.length > 120 ? `${bare.slice(0, 120)}…` : bare;
+      const allRows = parsed.every(Boolean);
       return {
         count: 0,
         ok: false,
         failed: true,
-        failure: "the pipeline ends in a counting command but its output is not a single number "
-          + `(got ${JSON.stringify(shown)}) — refusing to count it. \`grep -c\`/\`rg -c\` over MULTIPLE `
-          + "files print `path:count` rows, and counting those ROWS reports the number of files searched, "
-          + "not the number of matches — a file with `0` matches counts as one. Narrow the query to a "
-          + "single file, or end it in `| wc -l` so the answer is one number.",
+        failure: allRows
+          ? `the counting command reported PER-FILE counts across ${rows.length} files `
+            + `(got ${JSON.stringify(shown)}) — refusing to count them. Counting the ROWS reports the `
+            + "number of files SEARCHED, not the number of matches: a file with `0` matches counts as "
+            + "one. Summing them would report a total the command never reported, and is only correct if "
+            + "every row parsed. Narrow the query to one file, or end it in `| wc -l` so the answer is "
+            + "one number."
+          : "the pipeline ends in a counting command but its output is not a number "
+            + `(got ${JSON.stringify(shown)}) — refusing to count it. End the query in \`| wc -l\` so `
+            + "the answer is one number, or drop the counting flag if lines are what you meant to count.",
       };
     }
   }
