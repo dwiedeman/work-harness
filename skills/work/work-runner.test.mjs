@@ -7981,7 +7981,14 @@ test("DER-2750 CONTROL: an UNTRACKED new draft PR is still discovered (narrowing
 const d2778Fork = (over = {}) => ({
   number: 4242, isDraft: false, headRefName: "attacker/patch-1", title: "fix: DER-9 typo",
   body: "hello claude.ai/code/session_01FORGED", headRefOid: "forkhead", comments: [],
-  author: { login: "drive-by-attacker" }, headRepositoryOwner: { login: "drive-by-attacker" }, ...over,
+  // DER-2840: `isCrossRepository: false` belongs in the BASE fixture, not only in the overrides that
+  // happen to need it. Without it every row built here is denied by the cross-repo branch BEFORE the
+  // author/owner property a given assertion names is reached — so each such assertion passes for the
+  // wrong reason. Measured: deleting the author-trust check from `prIdentityTrusted` fires 2 detectors
+  // with the field absent and 3 with it present, the third being this file's "an untrusted fork PR …
+  // derives ZERO events". The field is what keeps these assertions pointed at the half they claim.
+  author: { login: "drive-by-attacker" }, headRepositoryOwner: { login: "drive-by-attacker" },
+  isCrossRepository: false, ...over,
 });
 
 test("DER-2778: an untrusted fork PR titled with a run issue id derives ZERO events", () => {
@@ -8133,14 +8140,30 @@ test("DER-2778: the trusted-PR-author set is CONFIG-driven, defaults to deny, an
     await applyRepoConfig(join(dir, "no-config-here"));
     assert.equal(WR.getTrustedPrAuthors().size, 0, "an unconfigured repo trusts no PR author at all");
     assert.equal(WR.getRepoOwnerLogin(), null, "and cannot say who owns the repo, so no head is same-repo");
-    // The identity here is OTHERWISE COMPLETE — including `isCrossRepository: false` (DER-2840) — so the
-    // only thing left to deny it is the missing config. Without that field the row would be denied for
-    // TWO reasons, and this assertion would stay green even if the unconfigured-repo branch it names were
-    // deleted: a check that still runs but no longer discriminates the property in its own message.
+    // Deny-by-default, end to end: an otherwise-complete identity (including `isCrossRepository: false`,
+    // DER-2840) is still refused when nothing is configured.
     assert.equal(
       WR.prIdentityTrusted(trustedPr({})),
       false,
       "with no configured repo the default must be deny, not allow-all",
+    );
+    // …but the assertion above does NOT isolate the owner branch, and a previous version of this comment
+    // claimed it did. With no config the trusted-author set is empty, so the AUTHOR check short-circuits
+    // first and the owner branch never executes: deleting that branch outright leaves the whole suite at
+    // 457/457 green. Measured, not reasoned about. An exhaustive truth table over the predicate's inputs
+    // shows the branch changes the answer only when owner and head are both "", which `getRepoOwnerLogin`
+    // coalesces to null — so it is unreachable through config and no config-driven test can reach it.
+    //
+    // This is the isolating check, and it took two tries to get right — the first attempt passed
+    // `repoOwner: ""` while leaving the head as the owner login, so the HEAD check (`head !== owner`)
+    // denied it and deleting the owner branch changed nothing. It looked like an isolation and was not.
+    // The owner branch is the sole denier only when head and owner are BOTH "": the author set is handed
+    // in so the author check passes, and an empty head equals an empty owner so the head check passes
+    // too. Deleting `if (typeof owner !== "string" || !owner) return false` flips this to true.
+    assert.equal(
+      WR.prIdentityTrusted(trustedPr({ headRepositoryOwner: { login: "" } }), { trustedPrAuthors: [D2778_OWNER], repoOwner: "" }),
+      false,
+      "an empty repo owner must deny even when author and head agree — the owner branch, isolated",
     );
     await mkdir(join(dir, ".claude"), { recursive: true });
     await writeFile(join(dir, ".claude", "work.config.json"), JSON.stringify({
