@@ -1696,10 +1696,21 @@ export function evaluateQueryOutput(stdout, expectAtLeast, { numeric = false } =
       // (Found by the Codex review of this change: the first version refused every prefixed form, so a
       // legitimate single-file count was rejected with a message telling the author to narrow a query
       // that was already narrow.)
+      // Two single-row shapes are unambiguous, one per counting family, and both are what these commands
+      // print when given a file to name rather than a stream:
+      //   grep/rg -c FILE   ->  `path:COUNT`      (`-H` forces it; rg does it by default)
+      //   wc -l FILE        ->  `COUNT path`      (BSD right-aligns the number in a padded field)
+      // `wc -l FILE` was the second one found: it was refused, AND the refusal told the author to "drop
+      // the counting flag and count matching lines" — advice that means nothing for `wc`. The parent
+      // line-counted its single row to 1 for a 2-line file, so this is the same under-count as the
+      // prefixed grep form in a different spelling, not a new concession.
       const rows = bare.split("\n").map((l) => l.trim()).filter(Boolean);
-      const parsed = rows.map((l) => /^(.*):(\d+)$/.exec(l));
+      const parsed = rows.map((l) => /^(.*):(\d+)$/.exec(l) ?? /^(\d+)\s+(\S.*)$/.exec(l));
       if (rows.length === 1 && parsed[0]) {
-        const count = Number(parsed[0][2]);
+        // The count is group 2 for `path:COUNT` and group 1 for `COUNT path`; pick whichever IS the
+        // number rather than trusting position, so the two patterns cannot be transposed by a later edit.
+        const [, g1, g2] = parsed[0];
+        const count = Number(/^\d+$/.test(g2) ? g2 : g1);
         return { count, ok: count >= expectAtLeast };
       }
       const shown = bare.length > 120 ? `${bare.slice(0, 120)}…` : bare;

@@ -1076,6 +1076,18 @@ test("evaluateQueryOutput: numeric mode reads the number, and ONLY when stdout i
   // …and the boundary holds: TWO rows is the defect shape and stays refused, so the carve-out above
   // cannot be widened into "sum whatever grep printed".
   assert.equal(evaluateQueryOutput("a.txt:1\nb.txt:0\n", 1, { numeric: true }).failed, true);
+  // The OTHER single-row shape, one per counting family: `wc -l FILE` prints `COUNT path` (BSD pads the
+  // number). It was refused by the first draft of the carve-out, and the refusal told the author to "drop
+  // the counting flag and count matching lines" — advice that means nothing for `wc`. The parent
+  // line-counted its single row to 1 for a 2-line file, so this is the same UNDER-count as the prefixed
+  // grep form in a different spelling.
+  assert.deepEqual(evaluateQueryOutput("2 a.txt\n", 2, { numeric: true }), { count: 2, ok: true });
+  assert.deepEqual(evaluateQueryOutput("       7 a.txt\n", 7, { numeric: true }), { count: 7, ok: true });
+  // The number is read by WHICH GROUP IS NUMERIC, not by position, so the two patterns cannot be
+  // transposed by a later edit: `3:4` is path `3`, count `4`.
+  assert.equal(evaluateQueryOutput("3:4\n", 4, { numeric: true }).count, 4);
+  // …and wc's MULTI-file form (which also emits a `total` row) stays refused.
+  assert.equal(evaluateQueryOutput("2 a.txt\n1 b.txt\n3 total\n", 2, { numeric: true }).failed, true);
 });
 
 test("validatePlan: a run that FAILED cannot be honoured, even when its stamped count clears the floor (DER-2783)", () => {

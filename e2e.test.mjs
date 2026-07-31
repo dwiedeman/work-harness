@@ -973,6 +973,16 @@ test("FAULT multi-file `grep -c`: one real match is not three (DER-2841)", async
 // So this is a third defect, not a control: row-counting over-reported across many files and
 // under-reported on one prefixed file, and only a scalar ever gave the right answer. One row is now read
 // as the number it is. The real both-sides control is the "legitimate evidence queries" case below.
+test("FAULT a single-file `wc -l FILE` under-reported its own count (DER-2841)", async (t) => {
+  // `wc -l a.txt` prints `2 a.txt` — the count with the file NAMED. The parent line-counted that single
+  // row to 1 and failed a floor of 2. The same under-count as the prefixed grep form below, in the other
+  // counting family's spelling; found by adversarially probing the carve-out rather than by reading it.
+  const S = await planWithQuery(t, `wc -l a.txt`, { expectAtLeast: 2, files: { "a.txt": "x\nx\n" } });
+  const r = await S.run();
+  assert.equal(r.code, 0, `wc's own count must be read, not the row it printed it on:\n${r.out}`);
+  assert.match(r.out, /2 ≥ 2/, `parent answered 1 here:\n${r.out}`);
+});
+
 test("FAULT a single-file `grep -Hc` under-reported its own count (DER-2841)", async (t) => {
   const S = await planWithQuery(t, `grep -Hc 'x' a.txt`, { expectAtLeast: 2, files: { "a.txt": "x\nx\n" } });
   const r = await S.run();

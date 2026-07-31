@@ -135,6 +135,14 @@ would otherwise conclude the file had drifted.
     correct if every row parsed, whereas a refusal tells the author to narrow the query. `evaluateQueryRun`
     previously hardcoded `failed: false` over the evaluator's verdict, which would have discarded the new
     refusal at birth — it now carries it out.
+    *The same fallback was wrong in the OTHER direction too, in both counting families*, which only came
+    out under adversarial probing of the fix rather than by reading it: `grep -Hc PATTERN one.txt` prints
+    `one.txt:2` and `wc -l one.txt` prints `2 one.txt` — a count with the file NAMED — and the parent
+    line-counted each single row to **1**, failing a floor of 2. So row-counting over-reported across many
+    files and under-reported on one named file; only a bare scalar ever gave the right answer. One row of
+    either shape is now read as the number it is (chosen by which capture IS numeric, so the two patterns
+    cannot be transposed by a later edit); two or more of either stays refused, including `wc`'s
+    multi-file form with its `total` row.
     *At least one file must match for this to be reachable end to end*: with no matches anywhere `grep -c`
     exits 1 and DER-2783's gate refuses the query before its output is read. An all-zero fixture is
     therefore refused identically on the parent and proves nothing — the first draft of both regressions
