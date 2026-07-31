@@ -135,14 +135,23 @@ would otherwise conclude the file had drifted.
     correct if every row parsed, whereas a refusal tells the author to narrow the query. `evaluateQueryRun`
     previously hardcoded `failed: false` over the evaluator's verdict, which would have discarded the new
     refusal at birth — it now carries it out.
-    *The same fallback was wrong in the OTHER direction too, in both counting families*, which only came
-    out under adversarial probing of the fix rather than by reading it: `grep -Hc PATTERN one.txt` prints
-    `one.txt:2` and `wc -l one.txt` prints `2 one.txt` — a count with the file NAMED — and the parent
-    line-counted each single row to **1**, failing a floor of 2. So row-counting over-reported across many
-    files and under-reported on one named file; only a bare scalar ever gave the right answer. One row of
-    either shape is now read as the number it is (chosen by which capture IS numeric, so the two patterns
-    cannot be transposed by a later edit); two or more of either stays refused, including `wc`'s
-    multi-file form with its `total` row.
+    *A carve-out was tried here and REVERTED, which is worth recording because the reversal is the
+    finding.* Refusing every non-scalar also refused a prefixed SINGLE-file count — `grep -Hc PAT one.txt`
+    prints `one.txt:2`, `wc -l one.txt` prints `2 one.txt` — where the parent line-counted the row to 1.
+    So a carve-out read one such row as its number. Adversarial probing showed that carve-out **fails
+    open**, which is strictly worse than the under-count it softened: `/^(.*):(\d+)$/` is greedy and has
+    no notion of "count", so it matches ANY line ending in `:digits`. Measured on the branch before the
+    reversal — `wc -l 'notes:2026'` prints `3 notes:2026` and was read as **2026**, PASSING a floor of
+    2000 against a true count of 3; `grep -e -c file` (where `-e -c` is a documented false positive of
+    `queryCountsNumerically`, so numeric mode is on for a command emitting matched LINES) read **34** out
+    of the timestamp in `run -c at 12:34` and passed a floor of 30. The parent was wrong on both — it
+    answered 1 — but wrong and FAIL-CLOSED. Trading a fail-closed wrong answer for a fail-open fabricated
+    one is the exact inversion this bundle exists to close, so the carve-out is gone: a non-scalar is
+    refused, and the remedy moved into the message, which now names the spelling that works per command
+    (`wc -l < FILE`; drop `-H` and name one file; or drop the counting flag and count matching lines).
+    Nothing correct was lost — the parent's answers for those shapes were also wrong. A softer rule may
+    return only with a way to PROVE the number is a count (binding the row's path to one of the query's
+    own file operands, selecting the pattern by command family), not by matching text that looks like one.
     *At least one file must match for this to be reachable end to end*: with no matches anywhere `grep -c`
     exits 1 and DER-2783's gate refuses the query before its output is read. An all-zero fixture is
     therefore refused identically on the parent and proves nothing — the first draft of both regressions

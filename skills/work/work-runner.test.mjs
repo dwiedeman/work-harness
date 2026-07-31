@@ -6589,7 +6589,11 @@ test("DER-2839: the #16 invariant also holds on the --pull-hosts path (the side-
     // the evidence set), so this is the worst case, not the happy one.
     const bin = join(root, "bin");
     await mkdir(bin, { recursive: true });
-    await writeFile(join(bin, "ssh"), "#!/bin/sh\nprintf 'no such file\\n' >&2\nexit 1\n", "utf8");
+    // The stub LOGS every invocation, because the invariant is about SIDE-EFFECT CYCLES and the poll
+    // count is only a proxy for them. Gating anti-vacuity on polls made this test fail under full-suite
+    // load (5 polls instead of 20) — a flaky gate is as useless as one that cannot fail.
+    const sshLog = join(root, "ssh.calls");
+    await writeFile(join(bin, "ssh"), `#!/bin/sh\nprintf 'x\\n' >> ${JSON.stringify(sshLog)}\nprintf 'no such file\\n' >&2\nexit 1\n`, "utf8");
     await chmod(join(bin, "ssh"), 0o755);
     process.env.PATH = `${bin}:${prevPath}`;
     process.env.WORK_WATCH_POLL_MS = "5";
@@ -6601,11 +6605,15 @@ test("DER-2839: the #16 invariant also holds on the --pull-hosts path (the side-
     await runSubcommand(["watch", "--run", runId, "--runs-root", root, "--repo-root", repoRoot,
       "--pull-hosts", "mini", "--nudge-since", "0", "--timeout", "1"]);
     const s = { ...WR.LEDGER_READ_STATS };
-    assert.ok(s.polls >= 20, `ANTI-VACUITY: expected many polls, got ${s.polls}`);
+    // ANTI-VACUITY on the thing under test: how many times the side-effect block actually RAN. Three is
+    // enough to separate "constant" from "per-cycle" — the mutant adds one whole-ledger read per cycle,
+    // so 3 cycles puts it at 5 against a bound of 3 — and is reachable even on a loaded machine.
+    const cycles = (await readFile(sshLog, "utf8").catch(() => "")).split("\n").filter(Boolean).length;
+    assert.ok(cycles >= 3, `ANTI-VACUITY: the side-effect block must have run several times, got ${cycles} (polls: ${s.polls})`);
     // THE GATE, stated against the number of CYCLES rather than as a bare constant: entry cursor
     // resolution + the wake payload's fold + at most ONE lazy seed of the evidence set. With ~20+ pull
     // cycles, a per-cycle read lands far outside this.
-    assert.ok(s.fullReads <= 3, `whole-ledger reads must not scale with pull cycles: ${s.fullReads} reads over ${s.polls} polls`);
+    assert.ok(s.fullReads <= 3, `whole-ledger reads must not scale with pull cycles: ${s.fullReads} reads over ${cycles} cycles`);
     assert.ok(s.fullBytes <= size * 3 + 4096, `bytes parsed must not scale with pull cycles: ${s.fullBytes} over a ${size}-byte ledger`);
   } finally {
     if (prevPoll === undefined) delete process.env.WORK_WATCH_POLL_MS; else process.env.WORK_WATCH_POLL_MS = prevPoll;

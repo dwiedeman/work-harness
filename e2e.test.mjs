@@ -973,22 +973,41 @@ test("FAULT multi-file `grep -c`: one real match is not three (DER-2841)", async
 // So this is a third defect, not a control: row-counting over-reported across many files and
 // under-reported on one prefixed file, and only a scalar ever gave the right answer. One row is now read
 // as the number it is. The real both-sides control is the "legitimate evidence queries" case below.
-test("FAULT a single-file `wc -l FILE` under-reported its own count (DER-2841)", async (t) => {
-  // `wc -l a.txt` prints `2 a.txt` — the count with the file NAMED. The parent line-counted that single
-  // row to 1 and failed a floor of 2. The same under-count as the prefixed grep form below, in the other
-  // counting family's spelling; found by adversarially probing the carve-out rather than by reading it.
-  const S = await planWithQuery(t, `wc -l a.txt`, { expectAtLeast: 2, files: { "a.txt": "x\nx\n" } });
-  const r = await S.run();
-  assert.equal(r.code, 0, `wc's own count must be read, not the row it printed it on:\n${r.out}`);
-  assert.match(r.out, /2 ≥ 2/, `parent answered 1 here:\n${r.out}`);
-});
+// A prefixed single-file count is REFUSED, and the refusal must name the spelling that works.
+//
+// This replaces two tests that asserted the opposite. A carve-out read one `path:COUNT` / `COUNT path`
+// row as its number, so `grep -Hc PAT one.txt` and `wc -l one.txt` were counted rather than refused.
+// Adversarial probing showed that carve-out FAILS OPEN — `/^(.*):(\d+)$/` matches any line ending in
+// `:digits`, so `wc -l 'notes:2026'` read 2026 and PASSED a floor of 2000 against a true count of 3.
+// Fail-closed-and-wrong (the parent, which answered 1) beats fail-open-and-fabricated, so the carve-out
+// was reverted and the remedy moved into the message.
+for (const [label, query, files] of [
+  ["`grep -Hc` (prints `path:COUNT`)", `grep -Hc 'x' a.txt`, { "a.txt": "x\nx\n" }],
+  ["`wc -l FILE` (prints `COUNT path`)", `wc -l a.txt`, { "a.txt": "x\nx\n" }],
+]) {
+  test(`a prefixed single-file count is refused, naming a spelling that works — ${label} (DER-2841)`, async (t) => {
+    const S = await planWithQuery(t, query, { expectAtLeast: 2, files });
+    const r = await S.run();
+    assert.equal(r.code, 1, `a prefixed count must not be guessed at:\n${r.out}`);
+    assert.match(r.out, /wc -l < FILE|drop the `-H`|matching lines/,
+      `the refusal must name a working spelling, or the author is stuck:\n${r.out}`);
+  });
+}
 
-test("FAULT a single-file `grep -Hc` under-reported its own count (DER-2841)", async (t) => {
-  const S = await planWithQuery(t, `grep -Hc 'x' a.txt`, { expectAtLeast: 2, files: { "a.txt": "x\nx\n" } });
-  const r = await S.run();
-  assert.equal(r.code, 0, `one prefixed row is a count, not a per-file breakdown:\n${r.out}`);
-  assert.match(r.out, /2 ≥ 2/, `and it must read the NUMBER (parent read the ROW, and answered 1):\n${r.out}`);
-});
+// THE REASON the carve-out is gone, asserted directly: a line that merely LOOKS like `path:count` must
+// never become the count. Both cases below PASSED on this branch before the reversal.
+for (const [label, query, floor, files] of [
+  ["a colon in the FILENAME", `wc -l 'notes:2026'`, 2000, { "notes:2026": "a\nb\nc\n" }],
+  ["a timestamp in a matched LINE", `grep -e -c t1.txt`, 30, { "t1.txt": "run -c at 12:34\n" }],
+]) {
+  test(`FAULT a number that is not a count cannot buy a pass — ${label} (DER-2841)`, async (t) => {
+    const S = await planWithQuery(t, query, { expectAtLeast: floor, files });
+    const r = await S.run();
+    assert.equal(r.code, 1, `a fabricated number must not clear a floor of ${floor}:\n${r.out}`);
+    assert.doesNotMatch(r.out, new RegExp(`${floor} ≥ ${floor}|\\b(2026|34) ≥`), `it read a number out of the TEXT:\n${r.out}`);
+  });
+}
+
 
 // DER-2810, stated as MEASURED rather than as filed. The issue predicts that all three suffixes are
 // stamped `ok 1 ≥ 1`. Only ONE of them is, and the difference is worth recording because it changes what
@@ -1054,8 +1073,9 @@ test("PIN DER-2900: `grep -c … | wc -l` still passes with ZERO matches — INV
   // The half that IS fixed: the guidance no longer sends authors here.
   const refused = await planWithQuery(t, `grep -c 'x' a.txt b.txt c.txt`, { expectAtLeast: 3, files: ONE_MATCH_TWO_ZEROS });
   const rr = await refused.run();
-  assert.match(rr.out, /DROP the `-c`/, `the remedy must not recommend the shape this pin describes:\n${rr.out}`);
+  assert.match(rr.out, /drop the `-c`/i, `the remedy must not recommend the shape this pin describes:\n${rr.out}`);
   assert.doesNotMatch(rr.out, /or end it in `\| wc -l`/, "the old, wrong advice must be gone");
+  assert.match(rr.out, /Do NOT append `\| wc -l` while KEEPING/, "…and it must warn against the pinned shape by name");
 });
 
 // THE CONTROLS. Without these, every case above is satisfied by a validator that refuses everything —

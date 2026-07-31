@@ -1689,32 +1689,38 @@ export function evaluateQueryOutput(stdout, expectAtLeast, { numeric = false } =
       return { count, ok: count >= expectAtLeast };
     }
     if (bare !== "") {
-      // ONE `path:count` row is an unambiguous measurement, and refusing it would be an over-refusal:
-      // `grep -Hc PATTERN one-file.txt` prints `one-file.txt:1` for a single file because `-H` forces the
-      // path prefix, and `rg -c` prefixes by default. That row's number is the count — reading it is not
-      // "inventing a total grep never reported", which is the objection that rules out summing MANY rows.
-      // (Found by the Codex review of this change: the first version refused every prefixed form, so a
-      // legitimate single-file count was rejected with a message telling the author to narrow a query
-      // that was already narrow.)
-      // Two single-row shapes are unambiguous, one per counting family, and both are what these commands
-      // print when given a file to name rather than a stream:
-      //   grep/rg -c FILE   ->  `path:COUNT`      (`-H` forces it; rg does it by default)
-      //   wc -l FILE        ->  `COUNT path`      (BSD right-aligns the number in a padded field)
-      // `wc -l FILE` was the second one found: it was refused, AND the refusal told the author to "drop
-      // the counting flag and count matching lines" — advice that means nothing for `wc`. The parent
-      // line-counted its single row to 1 for a 2-line file, so this is the same under-count as the
-      // prefixed grep form in a different spelling, not a new concession.
+      // NO CARVE-OUT: a non-scalar is refused, full stop. That is a deliberate REVERSAL, recorded because
+      // the reasoning is the point.
+      //
+      // An earlier version of this fix accepted a SINGLE `path:COUNT` row (and later a single `COUNT path`
+      // row) as an unambiguous measurement, so a prefixed single-file count — `grep -Hc PAT one.txt` ->
+      // `one.txt:2`, `wc -l one.txt` -> `2 one.txt` — was not refused. Adversarial probing showed that
+      // carve-out FAILS OPEN, which is strictly worse than the under-count it was softening.
+      // `/^(.*):(\d+)$/` is greedy and has no notion of "count": it matches ANY line ending in `:digits`.
+      // Measured on this branch before the reversal:
+      //
+      //   wc -l 'notes:2026'   stdout `3 notes:2026`     -> read 2026, PASSED a floor of 2000 (truth: 3)
+      //   grep -e -c t1.txt    stdout `run -c at 12:34`  -> read 34,   PASSED a floor of 30   (truth: 1)
+      //
+      // The second needs no exotic filename: `-e -c` is a documented false positive of
+      // `queryCountsNumerically` (the VALUE `-c` reads as the counting flag), so numeric mode is on for a
+      // command emitting matched LINES, and any line containing `word:digits` becomes "the count". The
+      // parent was wrong on both — it line-counted to 1 — but wrong and FAIL-CLOSED. Trading a fail-closed
+      // wrong answer for a fail-open fabricated one is the exact inversion this bundle exists to close.
+      //
+      // Nothing correct is lost: the parent's answers for the prefixed forms were also wrong (1 for a
+      // 2-line file). The author loses a wrong number and gains a message naming the spelling that works.
+      // A softer rule may return only with a way to prove the number IS a count (e.g. binding the row's
+      // path to one of the query's own literal file operands, and selecting the pattern by command
+      // family) — not by pattern-matching text that merely looks like one.
       const rows = bare.split("\n").map((l) => l.trim()).filter(Boolean);
-      const parsed = rows.map((l) => /^(.*):(\d+)$/.exec(l) ?? /^(\d+)\s+(\S.*)$/.exec(l));
-      if (rows.length === 1 && parsed[0]) {
-        // The count is group 2 for `path:COUNT` and group 1 for `COUNT path`; pick whichever IS the
-        // number rather than trusting position, so the two patterns cannot be transposed by a later edit.
-        const [, g1, g2] = parsed[0];
-        const count = Number(/^\d+$/.test(g2) ? g2 : g1);
-        return { count, ok: count >= expectAtLeast };
-      }
+      const parsed = rows.map((l) => /^(.*):(\d+)$/.exec(l));
       const shown = bare.length > 120 ? `${bare.slice(0, 120)}…` : bare;
-      const allRows = parsed.every(Boolean);
+      // The per-file message only makes sense for a genuine BREAKDOWN. A single prefixed row
+      // (`grep -Hc PAT one.txt` -> `a.txt:2`) is not a breakdown across files, and telling that author
+      // "PER-FILE counts across 1 files" both reads as a bug and withholds the remedy they need — which
+      // is the spelling that produces a bare number, not "narrow to one file" on a query already narrow.
+      const allRows = rows.length > 1 && parsed.every(Boolean);
       return {
         count: 0,
         ok: false,
@@ -1724,13 +1730,17 @@ export function evaluateQueryOutput(stdout, expectAtLeast, { numeric = false } =
             + `(got ${JSON.stringify(shown)}) — refusing to count them. Counting the ROWS reports the `
             + "number of files SEARCHED, not the number of matches: a file with `0` matches counts as "
             + "one. Summing them would report a total the command never reported, and is only correct if "
-            + "every row parsed. Narrow the query to ONE file, or DROP the `-c` and count the matching "
-            + "lines instead: `grep PATTERN a.txt b.txt | wc -l`. Do NOT append `| wc -l` while keeping "
-            + "`-c` — that counts the ROWS of a count (i.e. the number of files), and over a single file "
+            + "every row parsed. Count the matching LINES instead — `grep PATTERN a.txt b.txt | wc -l` "
+            + "(drop the `-c`) — which is what a match count is. Do NOT append `| wc -l` while KEEPING "
+            + "`-c`: that counts the ROWS of a count (i.e. the number of files), and over a single file "
             + "it answers 1 for every pattern, matching or not."
           : "the pipeline ends in a counting command but its output is not a number "
-            + `(got ${JSON.stringify(shown)}) — refusing to count it. Drop the counting flag and count `
-            + "the matching lines instead (`grep PATTERN file | wc -l`), which is what a match count is.",
+            + `(got ${JSON.stringify(shown)}) — refusing to count it, because a number cannot be `
+            + "recovered from this safely: any text ending in `:digits` LOOKS like a count and is not "
+            + "one. The spelling that works depends on the command: for `wc -l FILE` (which prints "
+            + "`COUNT path`) use `wc -l < FILE`; for a prefixed `grep -Hc`/`rg -c` drop the `-H` and "
+            + "name ONE file so the output is a bare number; otherwise drop the counting flag and count "
+            + "the matching lines with `grep PATTERN file | wc -l`.",
       };
     }
   }

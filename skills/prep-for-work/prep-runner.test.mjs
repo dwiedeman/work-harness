@@ -1067,26 +1067,19 @@ test("evaluateQueryOutput: numeric mode reads the number, and ONLY when stdout i
   assert.deepEqual(evaluateQueryOutput("a\nb\nc\n", 3), { count: 3, ok: true });
   assert.deepEqual(evaluateQueryOutput("", 1, { numeric: true }), { count: 0, ok: false }, "empty has nothing to misread; its exit status already spoke");
   assert.deepEqual(evaluateQueryOutput(null, 1, { numeric: true }), { count: 0, ok: false });
-  // OVER-REFUSAL CONTROLS (Codex review of this change): ONE `path:count` row is an unambiguous
-  // measurement and must still be counted. `grep -Hc PATTERN one-file.txt` prints `one-file.txt:1`
-  // because -H forces the prefix, and `rg -c` prefixes by default — refusing those would reject a
-  // legitimate single-file count while telling the author to "narrow the query" that is already narrow.
-  assert.deepEqual(evaluateQueryOutput("a.txt:1\n", 1, { numeric: true }), { count: 1, ok: true });
-  assert.deepEqual(evaluateQueryOutput("./src/a.js:7\n", 5, { numeric: true }), { count: 7, ok: true });
-  // …and the boundary holds: TWO rows is the defect shape and stays refused, so the carve-out above
-  // cannot be widened into "sum whatever grep printed".
+  // A prefixed single row is REFUSED, not read. An earlier version of this fix accepted one
+  // `path:COUNT` / `COUNT path` row as unambiguous; adversarial probing showed it FAILS OPEN, because
+  // /^(.*):(\d+)$/ matches ANY line ending in `:digits` — `wc -l 'notes:2026'` prints `3 notes:2026` and
+  // was read as 2026, passing a floor of 2000 against a true count of 3. These four are the pin on that
+  // reversal: fail-closed-and-wrong beats fail-open-and-fabricated.
+  assert.equal(evaluateQueryOutput("a.txt:1\n", 1, { numeric: true }).failed, true);
+  assert.equal(evaluateQueryOutput("2 a.txt\n", 2, { numeric: true }).failed, true);
+  assert.equal(evaluateQueryOutput("3 notes:2026\n", 2000, { numeric: true }).failed, true,
+    "a colon in the FILENAME must not become the count");
+  assert.equal(evaluateQueryOutput("run -c at 12:34\n", 30, { numeric: true }).failed, true,
+    "a timestamp in a matched LINE must not become the count");
+  // …and the multi-row defect shape is unchanged.
   assert.equal(evaluateQueryOutput("a.txt:1\nb.txt:0\n", 1, { numeric: true }).failed, true);
-  // The OTHER single-row shape, one per counting family: `wc -l FILE` prints `COUNT path` (BSD pads the
-  // number). It was refused by the first draft of the carve-out, and the refusal told the author to "drop
-  // the counting flag and count matching lines" — advice that means nothing for `wc`. The parent
-  // line-counted its single row to 1 for a 2-line file, so this is the same UNDER-count as the prefixed
-  // grep form in a different spelling.
-  assert.deepEqual(evaluateQueryOutput("2 a.txt\n", 2, { numeric: true }), { count: 2, ok: true });
-  assert.deepEqual(evaluateQueryOutput("       7 a.txt\n", 7, { numeric: true }), { count: 7, ok: true });
-  // The number is read by WHICH GROUP IS NUMERIC, not by position, so the two patterns cannot be
-  // transposed by a later edit: `3:4` is path `3`, count `4`.
-  assert.equal(evaluateQueryOutput("3:4\n", 4, { numeric: true }).count, 4);
-  // …and wc's MULTI-file form (which also emits a `total` row) stays refused.
   assert.equal(evaluateQueryOutput("2 a.txt\n1 b.txt\n3 total\n", 2, { numeric: true }).failed, true);
 });
 
@@ -1239,7 +1232,14 @@ test("a refused count records WHY, and validate states that cause — not 'exite
     assert.equal(observed.failed, true);
     assert.ok(typeof observed.failure === "string" && observed.failure.trim(),
       `the REASON must be stamped, not just the flag — got ${JSON.stringify(observed)}`);
-    assert.match(observed.failure, /PER-FILE counts/);
+    // BOUND TO THE EVALUATOR'S OWN RETURN, not to a substring. A mutation that stamped the constant
+    // "PER-FILE counts — placeholder" satisfied a /PER-FILE counts/ regex and left the whole suite green
+    // — the exact "message names the actual failure, assertion accepts a placeholder" trap this repo
+    // bans. The recorded reason must EQUAL what evaluateQueryOutput produced for this very output.
+    const expected = evaluateQueryOutput("a.txt:1\nb.txt:0\n", 2, { numeric: true }).failure;
+    assert.ok(expected, "fixture check: the evaluator must actually produce a reason here");
+    assert.equal(observed.failure, expected,
+      `the stamped reason must BE the evaluator's, not merely look like it\n  stamped:  ${observed.failure}\n  expected: ${expected}`);
 
     const res = await runSubcommand(["validate", planPath]);
     const out = res.stdout + (res.stderr ?? "");
