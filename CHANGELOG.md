@@ -15,6 +15,104 @@ run materially different harness code against **one shared ledger** with no way 
 gate itself gained the missing half below — attesting the *acting* process's own version, not only
 versions already recorded in the ledger — in DER-2779.
 
+## [Unreleased]
+
+**`codex exec` returns as the DEFAULT gate of the first complete diff; the Claude panel becomes the
+backup (DER-3011).** 0.4.0 (below) dropped `codex exec` out of every brief when the panel became the
+primary gate. The founder decision of 2026-08-01 puts it back in exactly one slot and re-ranks the two:
+
+| | Round 1 | Revision rounds | Codex probe says unavailable |
+|---|---|---|---|
+| **Gate** | `codex exec` (default) **+** the 3-lens panel beside it | the panel alone | the panel alone, waiver on the receipt |
+
+The case for that slot rests on three measurements: overlap with the Claude lenses is only **~33%**
+(independent, not redundant — which is also what makes the panel a real backup rather than a duplicate),
+P1 yield **decays 53% → 24% → 31% → 11% → 0% by round** (so all of its value is in the first pass over a
+complete diff), and it rides a **separate subscription pool** — ~8 minutes, no Claude budget, no CI
+rounds. The 0.4.0 entry's "no brief renders the codex gate" is superseded: every ROUND-1 brief renders
+it, and no revision-round brief does.
+
+### Added
+
+- **`codex-probe`** — "is codex reachable RIGHT NOW", as a command instead of a recipe each role
+  re-derived. Runs the **stdin-closed** probe against the resolved binary (never a bare `codex`: a cmux
+  shim ahead of it hangs at 0% CPU byte-identically to a quota wall), judges the **text** — never CPU%,
+  never `codex login status`, which reports "Logged in using ChatGPT" while every call 401s — exits
+  nonzero when unreachable, and prints the ready-to-paste `--codex-waived` line. NO OUTPUT is `unknown`,
+  never "down". `--print-bin` resolves the binary for the host that runs it, which is why the brief
+  substitutes `$CODEX` instead of a path resolved on whichever machine rendered the brief.
+- **`panel-prompt --lens codex`** — the cross-vendor prompt: the union of all three lens mandates plus
+  every path-routed checklist, answering in the `codex-review-schema.json` shape. One process against
+  three, so splitting the mandate would hand it a third of the review; and the schema constrains fields
+  but not what `priority` MEANS, so the prompt supplies the semantics.
+- **`review-panel --codex-review <out.json> --codex-log <run.jsonl>` / `--codex-waived "<reason>"`** — the
+  round-1 attestation, recorded as `cross_vendor` on the panel receipt and printed by `ready` as
+  `xvendor=…`. Codex enters as a **lens of the same gate**, not a second event: its findings join the
+  union (so a codex P1 is a panel blocker, and the falsification pass can kill a cross-vendor false
+  positive by execution), and one receipt keeps one sha and one blocker count.
+
+### Changed
+
+- **A round-1 `review-panel` receipt must attest the gate, one way or the other.** A receipt silent about
+  whether codex ever looked is refused; so is a claim that codex ran with no JSONL carrying
+  `turn.completed` (a dead codex run exits 0, so findings alone cannot distinguish "reviewed and found
+  nothing" from "never ran"). The waiver is always one flag away and **never blocks** — codex availability
+  is bimodal (this harness has watched it die for a day and a half, sit behind a usage wall, and come back
+  live, inside one week), so degrading to a RECORDED WAIVER rather than to a stall is the whole design,
+  and no shipped copy asserts which way it is pointing on any given day. A revision round inherits round
+  1's answer, so `ready` — which reads only the latest gate event — can still report it.
+- **The panel block renders its real round number.** It hardcoded `--round 1` on every brief including a
+  kickback's; that was cosmetic until "round 1 only" came to depend on it.
+
+### Fixed
+
+- **The attestation is bound to a TREE and a UNIT, not to a filename.** It recorded only `log: <path>`,
+  which made it a claim about `/tmp/X.jsonl` — whatever was last written there. One codex run's artifacts
+  replayed clean at a different sha AND under a different issue, both printing "CODEX RAN". It now carries
+  `covered_sha` and `log_sha256`; re-submitting a digest against another tree or unit records
+  `status: "stale"` naming the tree codex really looked at, and `ready` renders stale as NOT covering this
+  tree. The findings still enter the union — dropping them would REMOVE blockers, the direction that ships
+  a defect; what changes is the claim on the receipt.
+- **A round-1 pre-PR fix loop now INHERITS instead of forcing a false claim.** The brief told a lead to
+  re-run the panel on the new head while hardcoding the codex artifact paths into that same command, so
+  re-attesting stale artifacts as RAN was the *default* path. Re-running at a new head with those flags
+  dropped now inherits round 1's answer (as STALE once the head has moved), and the brief says exactly
+  that: carrying it forward as stale is acceptable, claiming RAN on a tree codex never saw is not.
+- **`codex-probe` passes `--json` and treats a nonzero exit as never-healthy.** Without `--json` there is
+  no `turn.completed`, so `\bOK\b` alone decided success — over a prompt that literally asks for "OK".
+  Five broken shapes read HEALTHY, all exit 1: OK + a 500 stream error, OK + model-not-found, an error
+  containing the words "OK button", the 120s SIGKILL path, and plain OK at exit 1 (identical to exit 0).
+- **`--round` is validated as an ordinal**, and a revision round with nothing to carry forward is refused
+  rather than recorded as `status: "none"`. `1.5` and `0` both defeated the round-1 comparison, and
+  recording round 2 first was a one-flag bypass of the whole rule. The refusal never blocks — the waiver
+  is one flag away — it turns a silent skip into a recorded choice.
+- **`review-swap` no longer synthesizes a substitute reason.** Given none it stamped "codex was
+  unavailable as both a bot and a local `codex exec`" — a factual claim nothing measured, propagated onto
+  the receipt and rendered as established. It records `null` now, and the label prints "no reason
+  recorded", which is the true sentence.
+- **The blind-run warning was backwards.** A waived gate printed ⚠ while a `ran` with **zero** repository
+  commands printed nothing — yet the blind run is the one that reads as coverage while having reviewed
+  only the diff text (DER-2504: a 0-command run returned wholly fabricated findings). Both warn now.
+- **Both review parsers coerce a finding's `priority` through one shared helper.** The codex side used a
+  bare `Number.isFinite`, so the schema-legal string `"1"` became `null` — a P1 dropped out of the blocker
+  count, the under-counting direction. The helper is stricter than a bare `Number()` in the other
+  direction too: `Number(null)` is `0`, so the obvious coercion would promote a MISSING priority to P0.
+- Shipped prose that no longer described the code: `work-lead/SKILL.md`'s "this is the ONLY review your PR
+  gets", `codex-backstop`'s "codex is no longer in any brief", `proxyEnvPairs`' "the ONLY review path", the
+  README's dependency table, and `work/SKILL.md`'s claim that `review-usage` refuses on zero
+  `command_execution` (it never has — only `turn.completed` is completion provenance; command counts are
+  search-coverage evidence, and a healthy read-only client may suppress them).
+
+### Known limits (accepted, not defects)
+
+- **A revision-round codex attestation does not record that the shepherd ASKED for it.** `review-panel`
+  accepts `--codex-review`/`--codex-log` on any round, so a re-run on round 3 records a normal `ran` with
+  no trace of who requested it or why. The policy — panel-only on revisions unless the shepherd explicitly
+  asks — is therefore documented but not evidenced. Accepted: the round is on the receipt, so an auditor
+  can see that a revision-round run happened and ask who wanted it.
+- **`preflight`'s own codex probe still classifies success-first** and does not share
+  `classifyCodexProbe`, so the two can drift. It sits in a region another change owns; tracked as DER-3019.
+
 ## [0.4.0] — 2026-08-01
 
 **The pre-PR adversarial panel replaces the mandatory Codex review as the harness's primary review
@@ -111,7 +209,7 @@ it reported the two divergent hosts as **agreeing**. Version equality was a clai
 ### Added — posture C, the substitute review gate (Phase 1)
 
 There are **three** review postures, not two: normal, cloud-down, and **both-down**. Posture C ran for
-~16h of the source run — the Codex bot died 3h47m in, and `codex exec` hit a quota wall until Aug 4 —
+~16h of the source run — the Codex bot died 3h47m in, and `codex exec` hit a quota wall the same night —
 with **zero** harness support, so shepherd #4 hand-rolled it and shepherd #5 inherited it as
 undocumented tribal knowledge.
 
