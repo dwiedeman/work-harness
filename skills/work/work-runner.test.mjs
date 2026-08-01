@@ -29,6 +29,8 @@ import {
   harnessDriftVerdict, aggregateDigest, measureHarnessDrift, HARNESS_MANIFEST_FILE,
   resolveCodexBinFrom,
   parseLensVerdicts, reviewSwapEvent, gateShaRefusal, codexWaiverFrom, gateBlockerCountVerdict,
+  parsePanelLensOutput, parsePanelVerifyOutput, unionPanelFindings, applyFalsifications,
+  pathRoutedChecklists, panelLensPrompt, panelVerifyPrompt, parseDiffPaths, PANEL_LENS_IDS,
   reapRefusal, reapLeakGuidance, actorInstance, parseActorInstance, renderShepherdRotationBrief,
   stalenessCommand, stalenessVerdict, usageFloorNotes, parseSwapUsage, swapVerdict, sleepGapDetected,
   isMdnsHostName, tailscaleSees,
@@ -712,7 +714,7 @@ test("spawn-lead --lead-type dsv4 --dry-run: OpenRouter env, empty API key, tagg
   }
 });
 
-test("write-brief --lead-type dsv4: renders the mandatory external-review gate + concrete slot models", async () => {
+test("write-brief --lead-type dsv4: renders the adversarial panel + concrete slot models", async () => {
   const root = await mkdtemp(join(tmpdir(), "work-lt-"));
   await mkdir(join(root, ".claude"), { recursive: true });
   await writeFile(join(root, ".claude", "work.config.json"), JSON.stringify(LEADTYPE_CFG), "utf8");
@@ -720,26 +722,35 @@ test("write-brief --lead-type dsv4: renders the mandatory external-review gate +
     const { runId } = await runSubcommand(["init-run", "--project", "cmp", "--runs-root", root, "--repo-root", root]);
     const { briefPath } = await runSubcommand(["write-brief", "--run", runId, "DER-9", "--runs-root", root, "--repo-root", root, "--worktree", "/wt/DER-9", "--title", "cmp", "--lead-type", "dsv4"]);
     const brief = await readFile(briefPath, "utf8");
-    assert.match(brief, /Mandatory external adversarial review/);
-    assert.match(brief, /Adversarial review: <the model id the command printed>, round N, 0 open blockers/, "PR-body evidence line the shepherd audits");
-    assert.match(brief, /env -u ANTHROPIC_BASE_URL -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_API_KEY claude -p --output-format json --model opus/, "review runs on the subscription, in its own process");
-    assert.match(brief, /review-usage --run .* --issue DER-9 --round 1/, "the review self-reports its tokens into the ledger");
-    assert.match(brief, /Do NOT dispatch this as an Agent\/Task subagent/, "the measured failure mode is called out where it happens");
-    assert.match(brief, /cap 2 rounds/i);
+    assert.match(brief, /Mandatory adversarial review panel/);
+    assert.match(brief, /Adversarial panel: correctness\/security\/repro, <model>, round N, 0 open blockers/, "PR-body evidence line the shepherd audits");
+    assert.match(brief, /env -u ANTHROPIC_BASE_URL -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_API_KEY claude -p --output-format json --model opus/, "the panel runs on the subscription, in its own process");
+    assert.match(brief, /review-panel --run .* --issue DER-9 .* --round 1/, "the gate self-records into the ledger");
+    assert.match(brief, /never an Agent\/Task subagent/i, "the measured failure mode is called out where it happens");
+    // The round cap moved from 2 to 3 WITH an escalation rule (DER-2360): the panel is now the only
+    // review, so a third round is a real possibility rather than evidence of thrashing — but an
+    // unresolved BLOCKER after it stops the PR instead of deferring it.
+    assert.match(brief, /Round cap — 3, then stop/i);
+    assert.match(brief, /blocker-class findings are still unresolved after round 3/i, "the cap must say what happens AT the cap, or it is a number with no consequence");
     assert.match(brief, /\*\*Lead type:\*\* `dsv4`/);
     assert.match(brief, /deepseek\/deepseek-v4-flash/, "brief names the concrete subagent model");
     // A tier that doesn't self-delegate needs the Agent call spelled out — a lead that never dispatches
     // a subagent never runs the review gate either (measured 2026-07-24).
     assert.match(brief, /Build by DELEGATING/, "delegation is imperative on an external-reviewer lead type");
-    assert.match(brief, /git diff origin\/main\.\.\.HEAD > \/tmp\/DER-9-review\.diff/, "the gate ships a runnable block, not an intention");
+    assert.match(brief, /git diff origin\/main\.\.\.HEAD > \/tmp\/DER-9-panel-diff/, "the gate ships a runnable block, not an intention");
+    assert.match(brief, /does \*\*not\*\* spend your lead budget/, "on a subscription-billed type the brief must still say the reviewer is free to the lead");
 
+    // Every lead type gets the SAME gate now — that is the whole change. The kimi and claude briefs are
+    // the control: before DER-2360 they rendered self-review language and no shell-out at all.
     const { briefPath: kimiBrief } = await runSubcommand(["write-brief", "--run", runId, "DER-8", "--runs-root", root, "--repo-root", root, "--worktree", "/wt/DER-8", "--title", "cmp", "--lead-type", "kimi"]);
     const kb = await readFile(kimiBrief, "utf8");
-    assert.doesNotMatch(kb, /Mandatory external adversarial review/, "same-vendor reviewer → ordinary self-review language");
+    assert.match(kb, /Mandatory adversarial review panel/, "the panel is the gate on a same-vendor lead type too");
+    assert.match(kb, /claude -p --output-format json --model opus/, "a kimi lead's panel still shells out to the Claude subscription");
+    assert.doesNotMatch(kb, /Final adversarial self-review/, "self-review language is retired — the same model grading its own work is what this replaced");
     const { briefPath: claudeBrief } = await runSubcommand(["write-brief", "--run", runId, "DER-7", "--runs-root", root, "--repo-root", root, "--worktree", "/wt/DER-7", "--title", "cmp"]);
     const cb = await readFile(claudeBrief, "utf8");
-    assert.doesNotMatch(cb, /Mandatory external adversarial review/);
-    assert.doesNotMatch(cb, /\*\*Lead type:\*\*/, "default claude brief is unchanged");
+    assert.match(cb, /Mandatory adversarial review panel/, "a Claude lead gets the external gate too — DER-2360's whole premise");
+    assert.doesNotMatch(cb, /\*\*Lead type:\*\*/, "default claude brief still omits the lead-type banner");
   } finally {
     await applyRepoConfig("/nonexistent-reset");
     await rm(root, { recursive: true, force: true });
@@ -2351,12 +2362,19 @@ test("renderBrief: stamps the assigned budget and rewrites the scope contract", 
   const withBudget = renderBrief({ issueId: "DER-1", runId: "r", assignedBudget: { files: 9, additions: 500, issues: ["DER-1"] } });
   assert.match(withBudget, /## 🎯 Assigned budget — 9 files/);
   assert.match(withBudget, /assigned budget is 9 files \/ ~500 additions/);
-  assert.doesNotMatch(withBudget, /Aim for \*\*≤ ~800 additions/);
+  assert.doesNotMatch(withBudget, /Aim for \*\*≤ ~1,000 additions/);
+  // DER-2360 — the advisory size target is surfaced next to `plan_scope` in EVERY brief, including one
+  // that already carries an assigned budget. The two are not the same claim and the brief must not let
+  // them read as one: the assignment is binding, the target is the ceiling it sits under.
+  assert.match(withBudget, /PR size target — under 1,000 additions \(advisory/);
+  assert.match(withBudget, /assigned budget above \(~500 additions\) is the BINDING number/);
 
   // No plan → byte-compatible with the pre-plan brief.
   const without = renderBrief({ issueId: "DER-1", runId: "r" });
   assert.doesNotMatch(without, /Assigned budget/);
-  assert.match(without, /Aim for \*\*≤ ~800 additions/);
+  assert.match(without, /Aim for \*\*≤ ~1,000 additions/);
+  assert.match(without, /PR size target — under 1,000 additions \(advisory/);
+  assert.match(without, /SPLIT before it is written/, "with no assignment the target is the only sizing signal, so it must say what to DO about it");
 });
 
 test("renderCloudBrief: the cloud template carries the budget too (it never asked for a scope at all)", () => {
@@ -3285,18 +3303,54 @@ test("scoreReviewFidelity: preempt_rate is null on an empty cloud set (0/0 is no
   assert.equal(s.novel, 1);
 });
 
-test("renderBrief: the codex gate is rendered for EVERY lead type, with the search mandate", () => {
+test("DER-2360: the adversarial PANEL is the gate rendered for EVERY lead type, as a shell-out", () => {
+  // The panel REPLACED the codex gate here (auto-review off, 2026-08-01). Every property below is one
+  // the codex block had to have too — they are properties of a pre-PR gate, not of which model runs it.
+  const CFG = {
+    claude: {}, gpt: { proxy: true, leadModel: "gpt-5.6-sol", reviewerModel: "gpt-5.6-sol" },
+    dsv4: { proxy: true, leadModel: "deepseek/deepseek-v4-pro", reviewerModel: "opus", reviewerBilling: "subscription" },
+  };
   for (const leadType of [undefined, "claude", "gpt", "dsv4"]) {
-    const brief = renderBrief({ issueId: "DER-7", title: "t", worktree: "/w", branch: "b", runId: "R", runDir: "/rd", leadType });
-    assert.match(brief, /Mandatory Codex review/, `codex gate missing for leadType=${leadType}`);
-    assert.match(brief, /EXHAUSTIVE SEARCH IS REQUIRED/, `search mandate missing for leadType=${leadType}`);
-    assert.match(brief, /codex exec --json --sandbox read-only/, `codex command missing for leadType=${leadType}`);
-    // `--json` is LOAD-BEARING (DER-2518). `codexRunCompleted` parses exact producer events from
-    // that stream; without it `review-usage` cannot prove completion.
-    assert.match(brief, /codex exec --json /, `--json missing for leadType=${leadType} — review-usage will refuse to record every run`);
-    // The old anti-search instruction is what neutered the gate — it must not come back.
+    const brief = renderBrief({ issueId: "DER-7", title: "t", worktree: "/w", branch: "b", runId: "R", runDir: "/rd", leadType, leadTypeCfg: CFG[leadType ?? "claude"] });
+    assert.match(brief, /Mandatory adversarial review panel/, `panel gate missing for leadType=${leadType}`);
+    // A SHELL-OUT, never an Agent subagent. This is the property that decides whether the gate is real:
+    // a subagent inherits the lead's aliases and was measured reviewing on the flash tier.
+    assert.match(brief, /env -u ANTHROPIC_BASE_URL -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_API_KEY claude -p/, `panel is not a shell-out for leadType=${leadType}`);
+    assert.match(brief, /never an Agent\/Task subagent/i, `the measured alias-inheritance failure is unstated for leadType=${leadType}`);
+    // THREE distinct lenses, named. A panel that does not name its lenses cannot be audited for the
+    // redundancy that makes reviewers concur.
+    for (const lens of WR.PANEL_LENS_IDS) {
+      assert.ok(brief.includes(lens), `lens ${lens} missing from the brief for leadType=${leadType}`);
+    }
+    // The search mandate moved into `panel-prompt` (tested code) — the brief must still SAY the diff
+    // only seeds the search, because a lead that thinks the gate is diff-local will not wait for it.
+    assert.match(brief, /diff SEEDS the search/i, `search mandate missing for leadType=${leadType}`);
+    assert.match(brief, /panel-prompt --issue DER-7 --lens/, `the brief must render a runnable prompt step for leadType=${leadType}`);
+    assert.match(brief, /review-panel --run R .* --issue DER-7/, `the brief must render the recording step for leadType=${leadType}`);
+    // The retired blocks must not resurface: two gates both claiming to be THE gate is how a lead ends
+    // up running a fourth Opus review after the panel already ran on the same subscription.
+    assert.ok(!/Mandatory Codex review/.test(brief), `retired codex gate resurfaced for leadType=${leadType}`);
+    assert.ok(!/Mandatory external adversarial review/.test(brief), `retired external-review block resurfaced for leadType=${leadType}`);
     assert.ok(!/Do NOT dump the repo into its context/.test(brief), `stale anti-search line resurfaced for leadType=${leadType}`);
   }
+});
+
+test("DER-2360: the panel model comes from config per lead type, and a PROXY reviewerModel never leaks into it", () => {
+  // The shell-out is `claude -p --model <alias>`. `kimi`/`gpt` carry a `reviewerModel` naming their
+  // in-process same-vendor slot (`kimi-k3`, `gpt-5.6-sol`); passing either to `claude -p` names a model
+  // that does not exist on the subscription and the call errors out. The guard is `reviewerBilling`.
+  assert.equal(WR.panelReviewerModel({}), "opus", "an unconfigured type still gets a real panel");
+  assert.equal(WR.panelReviewerModel({ leadModel: "kimi-k3", reviewerModel: "kimi-k3" }), "opus", "a proxy reviewerModel must NOT become the shell-out alias");
+  assert.equal(WR.panelReviewerModel({ leadModel: "gpt-5.6-sol", reviewerModel: "gpt-5.6-sol" }), "opus");
+  assert.equal(WR.panelReviewerModel({ reviewerModel: "opus", reviewerBilling: "subscription" }), "opus", "dsv4's existing subscription config keeps working unchanged");
+  assert.equal(WR.panelReviewerModel({ panelModel: "sonnet" }), "sonnet", "the explicit per-type override wins");
+  assert.equal(WR.panelReviewerModel({ panelModel: "sonnet", reviewerModel: "opus", reviewerBilling: "subscription" }), "sonnet");
+  // …and it reaches the brief, rather than being computed and dropped.
+  const kimi = renderBrief({ issueId: "DER-7", runId: "R", leadType: "kimi", leadTypeCfg: { leadModel: "kimi-k3", reviewerModel: "kimi-k3" } });
+  assert.match(kimi, /--model opus/, "the kimi brief must shell out to opus, not to kimi-k3");
+  assert.ok(!/claude -p --output-format json --model kimi-k3/.test(kimi), "a proxy model reached the subscription shell-out");
+  const custom = renderBrief({ issueId: "DER-7", runId: "R", leadType: "x", leadTypeCfg: { panelModel: "sonnet" } });
+  assert.match(custom, /--model sonnet/);
 });
 
 test("renderBrief: step 1 points leads at the Code Review Rules as AUTHORING rules (W3)", () => {
@@ -3427,7 +3481,11 @@ test("readyVerdict (H5): UNKNOWN threads is never 0; every gate must return the 
   assert.equal(readyVerdict(base).ready, true);
   assert.equal(readyVerdict({ ...base, threads: null }).ready, false, "throttled null is UNKNOWN, not 0");
   assert.equal(readyVerdict({ ...base, draft: true }).ready, false);
-  assert.equal(readyVerdict({ ...base, onHead: false }).ready, false);
+  // DER-2360 — `onHead` (a codex COMMENT on this head) no longer blocks on its own, because the cloud
+  // bot's auto-review is off and that input is now false on essentially every PR. It still has to be
+  // able to return the failing answer, so the input that carries the hold is the GATE's coverage: a
+  // receipt that does not cover head blocks, and this line is the control that proves it can.
+  assert.equal(readyVerdict({ ...base, onHead: false, gate: { state: "stale-clean", blocks: false, label: "gate=stale-clean", sha: "a".repeat(40) } }).ready, false, "no bot review on head AND a stale receipt = nothing reviewed this tree");
   assert.equal(readyVerdict({ ...base, checks: "fail" }).ready, false);
   assert.equal(readyVerdict({ ...base, shardsPass: 3 }).ready, false);
   assert.equal(readyVerdict({ ...base, shardsPass: 5, shardsTotal: 4 }).ready, false, "impossible shard read = inconsistent instrument");
@@ -4867,7 +4925,11 @@ test("DER-2753: mergeMode:direct + an unready PR ⇒ NO merge call (the gate can
     ["pending check", { ...D2753_READY, checks: "pending" }, /checks=pending/],
     ["unreadable checks probe", { ...D2753_READY, checks: "unknown" }, /checks=UNKNOWN/],
     ["draft", { ...D2753_READY, draft: true }, /draft/],
-    ["codex behind head", { ...D2753_READY, onHead: false }, /codex not on head/],
+    // DER-2360 — "no bot review on head" alone is no longer a hold (auto-review is off, so it is true
+    // of every PR). The hold it became is "nothing reviewed THIS TREE": no bot comment on head AND the
+    // local receipt stamped at a different sha. The stale receipt is what makes this row block, which is
+    // why it is spelled out rather than inherited from D2753_READY's current gate.
+    ["nothing reviewed this head", { ...D2753_READY, onHead: false, gate: gateEvidenceVerdict({ head: "a".repeat(40), gate: { sha: "b".repeat(40), blockers: 0, findings: [] } }) }, /no review covering head/],
     // The gate event SHOWS the blocker it counts (DER-2837) — a count with no findings list is a shape
     // no producer writes, and it would hold this PR as `INCONSISTENT` rather than as the STALE case
     // this row exists to cover.
@@ -4950,7 +5012,10 @@ test("DER-2753/DER-2774: allowMergeWithoutChecks waives a VERIFIED-ABSENT check 
 
   // 5. The other gates are untouched by the opt-in.
   assert.equal(readyVerdict({ ...D2753_READY, checks: "absent", threads: 2, allowMergeWithoutChecks: true }).ready, false);
-  assert.equal(readyVerdict({ ...D2753_READY, checks: "absent", onHead: false, allowMergeWithoutChecks: true }).ready, false);
+  // The review hold is a separate axis from the checks waiver, so it is exercised with a receipt that
+  // does NOT cover head (DER-2360). With D2753_READY's current-at-head gate this row would pass for a
+  // reason that has nothing to do with `allowMergeWithoutChecks`, which is what it exists to pin.
+  assert.equal(readyVerdict({ ...D2753_READY, checks: "absent", onHead: false, allowMergeWithoutChecks: true, gate: { state: "stale-clean", blocks: false, label: "gate=stale-clean", sha: "b".repeat(40) } }).ready, false);
   // A truthy non-`true` value cannot loosen the gate (DER-2753's `=== true`, re-pinned on the new key).
   for (const truthy of ["yes", 1, {}]) {
     assert.equal(readyVerdict({ ...D2753_READY, checks: "absent", allowMergeWithoutChecks: truthy }).ready, false, `allowMergeWithoutChecks=${JSON.stringify(truthy)} must not waive`);
@@ -9937,4 +10002,325 @@ test("2.3 sleepGapDetected's FACTOR clause is load-bearing (mutation-covered)", 
   assert.ok(sleepGapDetected({ expectedMs: 100000, actualMs: 100000 * 8 }), "8x IS a sleep");
   assert.equal(sleepGapDetected({ expectedMs: 2500, actualMs: 2500 * 8 }), null,
     "…but 8x of a 2.5s tick is only 20s — under the 60s floor, so still not a sleep");
+});
+
+// ---- DER-2360: the adversarial panel as the PRIMARY pre-PR review gate -------------------------
+// The cloud bot's per-PR auto-review was switched off on 2026-08-01, so the panel is the only review a
+// PR gets before merge. Everything below tests the two properties that decision depends on: the gate
+// can REFUSE (a panel that did not really run cannot be recorded), and `ready` can tell a receipt that
+// covers this tree from one that does not.
+
+// A well-formed `claude -p --output-format json` envelope carrying a lens verdict. Built from the real
+// shape (see REVIEW_JSON above), because a fixture that drifts from the CLI's actual output is a test
+// that proves the parser handles a format nothing produces.
+const lensEnvelope = (body, { model = "claude-opus-5", provider = "firstParty", extra = {} } = {}) => JSON.stringify({
+  type: "result", subtype: "success", is_error: false, session_id: "s1",
+  result: `refuted: ${body.verdict === "clean" ? "false" : "true"} — see below\n\n\`\`\`json\n${JSON.stringify(body)}\n\`\`\`\n`,
+  modelUsage: { [model]: { inputTokens: 10, outputTokens: 20, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, costUSD: 0.1, provider } },
+  ...extra,
+});
+const CLEAN_LENS = { verdict: "clean", summary: "nothing found", findings: [] };
+const P1_LENS = {
+  verdict: "findings", summary: "one blocker",
+  findings: [{ title: "Tenant filter dropped on the read path", priority: 1, confidence: 0.9, file: "packages/db/src/x.ts", line_start: 42, line_end: 44, evidence: "ran the query with two tenants; both rows returned" }],
+};
+
+test("DER-2360 parsePanelLensOutput: every way a lens can come back unusable is INCOMPLETE, never clean", () => {
+  // Each of these has been observed in production, and each one would otherwise record as a 0-finding
+  // clean gate — which is strictly worse than not running the gate at all.
+  const cases = [
+    ["", /EMPTY/, "the zero-byte file: --allowedTools is variadic and swallows a prompt passed as an argument"],
+    ["not json at all", /not the JSON envelope/, "a prose reply cannot be a gate"],
+    [JSON.stringify({ type: "result", subtype: "error_during_execution", is_error: true }), /FAILED/, "a failed run is not a clean run"],
+    [JSON.stringify({ type: "result", subtype: "success", result: "   " }), /EMPTY result/, "silence is not a finding of nothing"],
+    [JSON.stringify({ type: "result", subtype: "success", result: "I looked and it seems fine to me." }), /no JSON verdict block/, "a verdict that cannot be read is not a verdict"],
+  ];
+  for (const [raw, re, why] of cases) {
+    const r = parsePanelLensOutput({ raw, lens: "correctness" });
+    assert.equal(r.ok, false, `must refuse: ${why}`);
+    assert.match(r.refusal, re, why);
+    assert.deepEqual(r.findings, [], "a refused lens contributes no findings");
+  }
+  // A finding with no title cannot later be falsified or adjudicated by reference.
+  const untitled = parsePanelLensOutput({ raw: lensEnvelope({ verdict: "findings", findings: [{ priority: 1, file: "a.ts" }] }), lens: "security" });
+  assert.equal(untitled.ok, false);
+  assert.match(untitled.refusal, /no `title`/);
+
+  // CONTROL — the same parser, on a real lens reply, must succeed and carry the OBSERVED model. This is
+  // the pairing that makes the refusals above mean something: without it they could all be a parser
+  // that returns false unconditionally.
+  const ok = parsePanelLensOutput({ raw: lensEnvelope(P1_LENS), lens: "security" });
+  assert.equal(ok.ok, true, ok.refusal ?? "");
+  assert.equal(ok.verdict, "findings");
+  assert.equal(ok.findings.length, 1);
+  assert.equal(ok.findings[0].priority, 1);
+  assert.deepEqual(ok.models, ["claude-opus-5"], "the model that ACTUALLY ran is read from modelUsage, never from the requested alias (DER-2293)");
+  assert.deepEqual(ok.providers, ["firstParty"]);
+});
+
+test("DER-2360 unionPanelFindings: majority PRIORITIZES, it never ERASES", () => {
+  const f = (title, priority, lensEvidence = null) => ({ title, priority, file: "a.ts", line_start: 10, line_end: 10, confidence: 0.5, evidence: lensEvidence });
+  // A finding raised by ONE lens survives. That is the point of a panel whose lenses fail differently:
+  // a 1-of-3 finding is the normal shape of what makes it worth running, not a weak signal to vote down.
+  const solo = unionPanelFindings({ correctness: [f("only correctness saw this", 1)], security: [], repro: [] });
+  assert.equal(solo.findings.length, 1, "a lone lens's finding must survive the union");
+  assert.equal(solo.findings[0].agreement, 1);
+  assert.deepEqual(solo.findings[0].lenses, ["correctness"]);
+
+  // Two lenses reporting the same defect merge into one entry that names both.
+  const merged = unionPanelFindings({ correctness: [f("same defect", 2)], security: [f("Same  Defect", 2)] });
+  assert.equal(merged.findings.length, 1, "one defect seen twice is one finding");
+  assert.equal(merged.findings[0].agreement, 2);
+
+  // THE ERASURE CONTROL. Two lenses call it P3, one calls it P1. A plain majority would resolve to P3
+  // and silently drop it out of the blocker count — deleting a blocker by vote, with nothing falsified.
+  const outvoted = unionPanelFindings({
+    correctness: [f("auth check runs after the descriptive error", 3)],
+    security: [f("auth check runs after the descriptive error", 1)],
+    repro: [f("auth check runs after the descriptive error", 3)],
+  });
+  assert.equal(outvoted.findings.length, 1);
+  assert.equal(outvoted.findings[0].priority, 1, "the blocker class is STICKY — a majority may not downgrade a P1 out of existence");
+  assert.equal(outvoted.dissent.length, 1, "the disagreement is RECORDED, not resolved into silence");
+  assert.deepEqual(outvoted.dissent[0].priorities, { correctness: 3, security: 1, repro: 3 });
+
+  // Below the blocker class, the majority does decide.
+  const ranked = unionPanelFindings({ a: [f("style", 3)], b: [f("style", 2)], c: [f("style", 3)] });
+  assert.equal(ranked.findings[0].priority, 3, "outside the blocker class, majority prioritizes");
+});
+
+test("DER-2360 applyFalsifications: a blocker dies only by POSITIVE evidence", () => {
+  const findings = [
+    { title: "Tenant filter dropped", priority: 1, file: "a.ts", line_start: 1 },
+    { title: "Minor naming", priority: 3, file: "b.ts", line_start: 2 },
+  ];
+  const proof = "ran `node -e \"require('./a').read({tenant:'t2'})\"` against two tenants; it returned 0 rows for the foreign tenant";
+
+  // No evidence at all — the shape of a verification pass that graded itself clean.
+  const empty = applyFalsifications({ findings, falsify: [{ ref: "Tenant filter dropped", evidence: "" }] });
+  assert.equal(empty.ok, false);
+  assert.match(empty.refusal, /NO evidence/);
+  assert.equal(empty.findings.length, 2, "a refused falsification must leave the set untouched");
+
+  // Hand-waving evidence. The length floor is crude on purpose and says so — it is the cheapest
+  // possible check that a command was actually run, not a judgement of the argument.
+  const thin = applyFalsifications({ findings, falsify: [{ ref: "Tenant filter dropped", evidence: "not a real bug" }] });
+  assert.equal(thin.ok, false);
+  assert.match(thin.refusal, /Positive falsification/);
+
+  // A reference that resolves to nothing must not silently record as applied.
+  const ghost = applyFalsifications({ findings, falsify: [{ ref: "a finding nobody made", evidence: proof }] });
+  assert.equal(ghost.ok, false);
+  assert.match(ghost.refusal, /matches no finding/);
+
+  // CONTROL — a real falsification with real evidence removes exactly one finding and keeps its proof.
+  const ok = applyFalsifications({ findings, falsify: [{ ref: "Tenant filter dropped", evidence: proof, by: "verify" }] });
+  assert.equal(ok.ok, true, ok.refusal ?? "");
+  assert.equal(ok.findings.length, 1);
+  assert.equal(ok.findings[0].title, "Minor naming");
+  assert.equal(ok.falsified.length, 1);
+  assert.equal(ok.falsified[0].evidence, proof, "the evidence is kept ON the event — a falsification nobody can audit is a deletion");
+});
+
+test("DER-2360 pathRoutedChecklists + panelLensPrompt: the repo's own defect classes are routed by path", () => {
+  // A migration reaches the security lens as a tenant-isolation question…
+  const dbSec = pathRoutedChecklists({ paths: ["packages/db/src/fleet.ts", "supabase/migrations/0042_x.sql"], lens: "security" });
+  assert.ok(dbSec.some((c) => c.id === "tenant-isolation"), "a DB/migration diff must route the RLS checklist");
+  // …and the SQL-vs-validator drift class to the correctness lens, which is a DIFFERENT question.
+  const dbCorr = pathRoutedChecklists({ paths: ["packages/db/src/fleet.ts"], lens: "correctness" });
+  assert.ok(dbCorr.some((c) => c.id === "sql-zod-divergence"));
+  assert.ok(!dbCorr.some((c) => c.id === "tenant-isolation"), "routing must not dump every checklist onto every lens — that is how a prompt dilutes");
+  // CONTROL: an unrelated diff routes neither.
+  assert.deepEqual(pathRoutedChecklists({ paths: ["README.md"], lens: "security" }), []);
+  // `lens: "*"` reaches every lens.
+  for (const lens of PANEL_LENS_IDS) {
+    assert.ok(pathRoutedChecklists({ paths: ["packages/commands/src/x.ts"], lens }).some((c) => c.id === "command-surface-parity"), `command parity must reach the ${lens} lens`);
+  }
+
+  const prompt = panelLensPrompt({ lens: "security", issueId: "DER-1", diffFile: "/tmp/d", paths: ["packages/db/src/x.ts"] });
+  assert.match(prompt, /Refute the claim that this change is SAFE/);
+  assert.match(prompt, /tenant-isolation/, "the routed checklist must reach the rendered prompt, not just the router");
+  assert.match(prompt, /diff SEEDS your search — it does not BOUND it/i);
+  assert.match(prompt, /"verdict"/, "the output contract must be in the prompt, or the parser has nothing to parse");
+  assert.throws(() => panelLensPrompt({ lens: "vibes" }), /unknown lens/);
+  // The three lenses must be genuinely DIFFERENT prompts — redundant reviewers concur (#1183).
+  const bodies = PANEL_LENS_IDS.map((lens) => panelLensPrompt({ lens, diffFile: "/tmp/d" }));
+  assert.equal(new Set(bodies).size, PANEL_LENS_IDS.length, "identical lens prompts would be one reviewer run three times");
+});
+
+test("DER-2360 parseDiffPaths: routing reads the tree under review, not the working tree", () => {
+  const diff = [
+    "diff --git a/packages/db/src/x.ts b/packages/db/src/x.ts",
+    "index 111..222 100644",
+    "--- a/packages/db/src/x.ts",
+    "+++ b/packages/db/src/x.ts",
+    "@@ -1 +1 @@",
+    "-old",
+    "+new",
+    "diff --git a/old/name.ts b/new/name.ts",
+    "similarity index 90%",
+    "--- a/old/name.ts",
+    "+++ b/new/name.ts",
+    "diff --git a/gone.ts b/gone.ts",
+    "--- a/gone.ts",
+    "+++ /dev/null",
+  ].join("\n");
+  const paths = parseDiffPaths(diff);
+  assert.ok(paths.includes("packages/db/src/x.ts"));
+  assert.ok(paths.includes("new/name.ts"), "a rename is reviewed where the file now lives");
+  assert.ok(!paths.includes("/dev/null"), "a deletion's null sink is not a path");
+  assert.deepEqual(parseDiffPaths(""), [], "an empty diff routes nothing — which is why panel-prompt refuses one");
+});
+
+test("DER-2360 review-panel (CLI): records the gate, and REFUSES a panel that did not really run", async () => {
+  const root = await mkdtemp(join(tmpdir(), "work-panel-"));
+  const SHA = "a".repeat(40);
+  try {
+    const { runId } = await runSubcommand(["init-run", "--project", "p", "--runs-root", root, "--repo-root", root]);
+    const write = async (name, content) => { const p = join(root, name); await writeFile(p, content, "utf8"); return p; };
+    const good = {
+      correctness: await write("c.json", lensEnvelope(CLEAN_LENS)),
+      security: await write("s.json", lensEnvelope(P1_LENS)),
+      repro: await write("r.json", lensEnvelope(CLEAN_LENS)),
+    };
+    const lensArgs = (files) => Object.entries(files).flatMap(([l, f]) => ["--lens-file", `${l}=${f}`]);
+
+    // MUST-FAIL 1 — a lens whose run FAILED. The whole acceptance path exists because a gate that dies
+    // exits 0; if this recorded, the panel would manufacture proof of a clean PR exactly when it is
+    // least true.
+    const dead = await write("dead.json", JSON.stringify({ type: "result", subtype: "error_during_execution", is_error: true }));
+    await assert.rejects(
+      () => runSubcommand(["review-panel", "--run", runId, "--runs-root", root, "--issue", "DER-1", "--sha", SHA, ...lensArgs({ ...good, repro: dead })]),
+      /REFUSING to record/,
+      "a dead lens must not be recordable",
+    );
+    // MUST-FAIL 2 — one lens, i.e. a self-review with extra steps.
+    await assert.rejects(
+      () => runSubcommand(["review-panel", "--run", runId, "--runs-root", root, "--issue", "DER-1", "--sha", SHA, "--lens-file", `correctness=${good.correctness}`]),
+      /at least 2 DISTINCT lenses/,
+    );
+    // MUST-FAIL 3 — the same lens twice. Redundant reviewers concur; on #1183 that would have deleted
+    // live code.
+    await assert.rejects(
+      () => runSubcommand(["review-panel", "--run", runId, "--runs-root", root, "--issue", "DER-1", "--sha", SHA, "--lens-file", `correctness=${good.correctness}`, "--lens-file", `correctness=${good.security}`]),
+      /was given twice/,
+    );
+    // MUST-FAIL 4 — a truncated sha. Measured on #1180: a short sha reads `stale-clean` at every gate
+    // check, so a blocker-carrying gate recorded short would block on FALSE staleness.
+    await assert.rejects(
+      () => runSubcommand(["review-panel", "--run", runId, "--runs-root", root, "--issue", "DER-1", "--sha", "abc123def", ...lensArgs(good)]),
+      /40-char/,
+    );
+    // Nothing above may have left a trace: a refused gate that still appends is worse than no gate.
+    assert.equal((await readEvents(join(root, runId))).filter((e) => e.type === "review_findings").length, 0, "a refused panel must append NOTHING");
+
+    // CONTROL — the real thing records, and the event satisfies every contract a codex gate event does.
+    const out = await runSubcommand(["review-panel", "--run", runId, "--runs-root", root, "--issue", "DER-1", "--sha", SHA, "--pr", "1200", ...lensArgs(good)]);
+    const ev = out.event;
+    assert.equal(ev.type, "review_findings", "the panel writes the SAME event type every reader already understands");
+    assert.equal(ev.gate_kind, "panel");
+    assert.equal(ev.substitute, false, "the panel is the gate of record, not a stand-in for a bot that was down");
+    assert.deepEqual(ev.lenses_returned, ["correctness", "security", "repro"]);
+    assert.equal(ev.blockers, 1, "a P1 from any single lens is a blocker for the panel as a whole");
+    assert.equal(ev.verdict, "blockers");
+    assert.deepEqual(ev.models_observed, ["claude-opus-5"], "the model that actually ran, not the alias requested (DER-2293)");
+    assert.equal(gateBlockerCountVerdict(ev).ok, true, "the count must be derivable from the event's own findings (DER-2837) or `ready` refuses it");
+    assert.match(out.stdout, /models actually used: claude-opus-5/);
+    assert.match(out.stdout, /NO verification pass was recorded/, "an unverified panel must say so — every finding stands");
+
+    // A panel that leaked onto a metered endpoint must say so LOUDLY: the shell-out exists to prevent
+    // exactly that, and a bill is a bad way to find out.
+    const metered = await write("m.json", lensEnvelope(CLEAN_LENS, { model: "deepseek/deepseek-v4-flash", provider: "openrouter" }));
+    const leaked = await runSubcommand(["review-panel", "--run", runId, "--runs-root", root, "--issue", "DER-2", "--sha", SHA, ...lensArgs({ ...good, repro: metered })]);
+    assert.match(leaked.stdout, /did NOT ride the Claude subscription/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("DER-2360 review-panel --verify-file: falsification needs evidence, and clears the blocker when it has it", async () => {
+  const root = await mkdtemp(join(tmpdir(), "work-panelv-"));
+  const SHA = "b".repeat(40);
+  try {
+    const { runId } = await runSubcommand(["init-run", "--project", "p", "--runs-root", root, "--repo-root", root]);
+    const write = async (name, content) => { const p = join(root, name); await writeFile(p, content, "utf8"); return p; };
+    const files = {
+      correctness: await write("c.json", lensEnvelope(CLEAN_LENS)),
+      security: await write("s.json", lensEnvelope(P1_LENS)),
+    };
+    const lensArgs = Object.entries(files).flatMap(([l, f]) => ["--lens-file", `${l}=${f}`]);
+    const verifyEnvelope = (body) => JSON.stringify({
+      type: "result", subtype: "success", is_error: false, result: `falsified: 1 of 1\n\n\`\`\`json\n${JSON.stringify(body)}\n\`\`\``,
+      modelUsage: { "claude-opus-5": { inputTokens: 1, outputTokens: 1, provider: "firstParty" } },
+    });
+
+    // MUST-FAIL — the verification pass claims the blocker is wrong but shows nothing it ran.
+    const thin = await write("v-thin.json", verifyEnvelope({ falsified: [{ ref: "Tenant filter dropped on the read path", evidence: "looks fine" }] }));
+    await assert.rejects(
+      () => runSubcommand(["review-panel", "--run", runId, "--runs-root", root, "--issue", "DER-1", "--sha", SHA, ...lensArgs, "--verify-file", thin]),
+      /Positive falsification/,
+      "a blocker must not die on an assertion",
+    );
+    // MUST-FAIL — an unreadable verification pass clears NOTHING (it must not read as "nothing to clear").
+    const junk = await write("v-junk.json", "the model wandered off");
+    await assert.rejects(
+      () => runSubcommand(["review-panel", "--run", runId, "--runs-root", root, "--issue", "DER-1", "--sha", SHA, ...lensArgs, "--verify-file", junk]),
+      /does NOT clear anything/,
+    );
+
+    // CONTROL — real executed evidence clears it, and the event keeps the proof.
+    const proof = "ran the query under two tenant ids via `pnpm vitest run x.db.test.ts`; the foreign tenant returned 0 rows, so the filter is present";
+    const real = await write("v.json", verifyEnvelope({ falsified: [{ ref: "Tenant filter dropped on the read path", evidence: proof }], confirmed: [], unverified: [] }));
+    const out = await runSubcommand(["review-panel", "--run", runId, "--runs-root", root, "--issue", "DER-1", "--sha", SHA, ...lensArgs, "--verify-file", real]);
+    assert.equal(out.event.blockers, 0);
+    assert.equal(out.event.verdict, "clean");
+    assert.equal(out.event.verified, true);
+    assert.equal(out.event.falsified.length, 1);
+    assert.equal(out.event.falsified[0].evidence, proof);
+    assert.equal(gateBlockerCountVerdict(out.event).ok, true, "removing a falsified finding must keep the count consistent with the list it counts");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("DER-2360 ready: an adversarial receipt AT HEAD satisfies the review hold; one commit behind does NOT", () => {
+  // This is the hold that used to print `hold (codex not on head)` forever. With the bot's auto-review
+  // off, `onHead` is false on essentially every PR and no action anyone takes can make it true — a
+  // condition nothing satisfies is a wedge, not a gate. What replaces it is NARROWER than a waiver: the
+  // panel must have reviewed this exact tree.
+  const HEAD = "c".repeat(40);
+  const BEHIND = "d".repeat(40);
+  const panelAt = (sha) => ({ sha, blockers: 0, findings: [], substitute: false, gate_kind: "panel", engine: "claude", model: "opus", lenses: ["correctness", "security", "repro"] });
+  const base = { draft: false, threads: 0, onHead: false, checks: "pass", shardsPass: 0, shardsTotal: 0 };
+
+  // MUST-FAIL — the receipt is one commit behind head. This is the ordinary "fixed the findings, pushed,
+  // forgot to re-run the panel" sequence, and it must still hold.
+  const stale = readyVerdict({ ...base, gate: gateEvidenceVerdict({ head: HEAD, gate: panelAt(BEHIND) }) });
+  assert.equal(stale.ready, false, "a receipt for a tree that is no longer shipping is not a review of this PR");
+  assert.match(stale.why, /no review covering head/);
+  assert.match(stale.why, /dddddddddd/, "the hold must name the sha the gate actually covered, or nobody can tell what to re-run");
+
+  // MUST-FAIL — no receipt at all. ABSENT and STALE oblige different actions, so they must not collapse.
+  const none = readyVerdict({ ...base, gate: gateEvidenceVerdict({ head: HEAD, gate: null }) });
+  assert.equal(none.ready, false);
+  assert.match(none.why, /review-panel|MISSING/);
+
+  // MUST-FAIL — the receipt covers head but still carries an open blocker. The on-head hold must not
+  // swallow this: the operator needs to hear about the blocker, not about an absent bot.
+  const dirty = readyVerdict({ ...base, gate: gateEvidenceVerdict({ head: HEAD, gate: { ...panelAt(HEAD), blockers: 1, findings: [{ title: "x", priority: 1 }] } }) });
+  assert.equal(dirty.ready, false);
+  assert.match(dirty.why, /OPEN blocker/);
+
+  // CONTROL — the receipt covers head, cleanly. This is the case that was unreachable before, and it is
+  // the whole point of the change: healthy work can now merge with no bot review at all.
+  const ok = readyVerdict({ ...base, gate: gateEvidenceVerdict({ head: HEAD, gate: panelAt(HEAD) }) });
+  assert.equal(ok.ready, true, "a panel receipt on this exact tree IS the review gate now");
+  assert.match(ok.why, /gate=PANEL/, "the line must name WHO gated it — a panel and a codex run are different evidence");
+  assert.match(ok.why, /correctness\/security\/repro/);
+
+  // …and a SUBSTITUTE receipt (posture C, `review-swap`) must still read as a substitute rather than
+  // being relabelled a panel. Both are lens-shaped; only one of them means "the bot was down".
+  const sub = readyVerdict({ ...base, gate: gateEvidenceVerdict({ head: HEAD, gate: { ...panelAt(HEAD), substitute: true, gate_kind: null } }) });
+  assert.equal(sub.ready, true);
+  assert.match(sub.why, /gate=SUBSTITUTE/);
 });

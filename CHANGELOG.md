@@ -15,6 +15,70 @@ run materially different harness code against **one shared ledger** with no way 
 gate itself gained the missing half below — attesting the *acting* process's own version, not only
 versions already recorded in the ledger — in DER-2779.
 
+## [0.4.0] — 2026-08-01
+
+**The pre-PR adversarial panel replaces the mandatory Codex review as the harness's primary review
+gate (DER-2360).** The operator disabled the GitHub Codex bot's per-PR auto-review on 2026-08-01, so a
+PR with zero bot reviews is now the normal case and nothing downstream catches what the local gate
+misses. Mining PRs #1074–#1197 is what settled it: 65.4% of commits on bot-reviewed PRs landed *after*
+the first bot review, size-matched cohorts merged 1.4–2.7x faster without the bot at near-identical
+churn, and head-to-head on #1185 the local panel found 12 of 15 findings while the bot added 2 unique.
+
+### Added
+
+- **`review-panel`** — the acceptance path for a findings-shaped gate with no codex JSONL. It reads each
+  lens's raw `claude -p --output-format json` envelope, so it establishes completion per lens rather
+  than waiving `review-usage`'s refusal (that refusal is correct and stays: a gate that dies exits 0, so
+  bare findings would manufacture 0-finding proof of a clean PR). Writes one `review_findings` event
+  with `gate_kind: "panel"` and `models_observed` — the model that ACTUALLY ran, read from `modelUsage`
+  rather than from the alias requested (DER-2293). Fails closed on a lens that failed, went silent,
+  answered in prose, or was named twice; on fewer than 2 lenses; and on a short `--sha`.
+- **`panel-prompt`** — renders one lens's prompt, path-routed to the repo-specific checklists the diff's
+  files trigger (tenant isolation, authorization precedence, command-surface parity, prompt/schema
+  drift, SQL-vs-Zod divergence, route error handling, docs claims). The prompt is tested code rather
+  than prose pasted into a brief that nothing verifies. Refuses an empty diff, which would route no
+  checklist at all while rendering a prompt that looks complete.
+- **`codex-backstop`** — prints the local `codex exec` second-opinion command for a risk lane or for
+  calibrating the panel with `review-fidelity`. It also gives `codexReviewCommand` a production caller
+  again now that no brief renders the codex gate; an exported helper whose only caller is its own test
+  is a helper that can rot green.
+- **`panelModel`** per lead type in `.claude/work.config.json`. Resolution is `panelModel`, else
+  `reviewerModel` *only* under `reviewerBilling: "subscription"`, else `opus` — the billing guard is
+  load-bearing, because on `kimi`/`gpt` the `reviewerModel` names an in-process proxy model that does
+  not exist on the Claude subscription.
+- The advisory **PR size target (under 1,000 additions)** is surfaced next to `plan_scope` in every
+  brief, including one that already carries an assigned budget.
+
+### Changed
+
+- **Every lead type's brief now renders the 3-lens panel** (`correctness` / `security` / `repro`) as a
+  shell-out on a fresh context. A Claude lead's step-5 "adversarial self-review" is gone: it dispatched
+  an in-process `opus` subagent, which on a Claude lead resolves to the lead's own tier, so the same
+  model graded its own work.
+- **`ready` accepts an adversarial receipt as satisfying the review hold when the receipt's reviewed
+  sha equals the PR head.** This replaces the `hold (codex not on head)` that can no longer clear on its
+  own now that auto-review is off — a condition no action satisfies is a wedge, not a gate. It is
+  strictly narrower than the codex waiver: a receipt one commit behind head still holds, with the
+  covered sha named so the operator knows what to re-run.
+- **Union semantics: majority prioritizes, never erases.** A 1-of-3 finding survives; the blocker class
+  is sticky, so a majority cannot downgrade a P1 out of the blocker count; priority dissent is recorded
+  on the event. A blocker dies only by positive falsification — evidence checked at record time, not
+  trusted — or by a `gate_adjudication`.
+- **Round cap 3 with escalation.** Unresolved blocker-class findings after round 3 stop and re-scope the
+  PR; only non-blocking residue becomes review-debt.
+- Shepherd guidance rewritten for auto-review being off: the reaction watchdog applies only to a review
+  the shepherd explicitly requested (absence of a 👀 is now the expected state, not a missed pickup),
+  `@codex review` is the on-demand backstop for risk lanes and calibration, and the rollback condition
+  is recorded — if the panel misses a blocker the bot catches, `@codex review` becomes mandatory on risk
+  lanes until the panel is fixed.
+
+### Removed
+
+- The two brief gate headings this supersedes: "⚑ Mandatory Codex review (pre-PR gate — every lead
+  type)" (DER-2375) and "⚑ Mandatory external adversarial review (pre-hand-off gate)". The second is
+  retired rather than kept alongside the panel: both are Claude-Opus-on-the-subscription shell-outs, so
+  rendering both would have told a `dsv4` lead to run a fourth Opus review after the three lenses.
+
 ## [0.3.0] — 2026-07-31
 
 The harness-upgrade wave from run `20260730T233426Z-der-2869-der-2864` (23 PRs, 20h08m, 3.84B tokens),

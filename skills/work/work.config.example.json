@@ -75,6 +75,7 @@
   "//shepherdModel": "The shepherd's inline fixes merge with no second reviewer, so default it to your strongest model.",
   "shepherdModel": "opus",
 
+  "//panelModel": "OPTIONAL, per lead type. The Claude CLI alias the DER-2360 adversarial review panel shells out to (`claude -p --model <alias>`), defaulting to `opus`. Set it only to move a whole lead type onto a different reviewer. It is a SEPARATE key from `reviewerModel` on purpose: on a proxy lead type `reviewerModel` names an in-process same-vendor slot (`kimi-k3`, `gpt-5.6-sol`), and passing one of those to the subscription shell-out names a model that does not exist there. `reviewerModel` is used as the panel alias ONLY under `reviewerBilling: \"subscription\"`, where it already is a Claude alias.",
   "//leadTypes": "OPTIONAL. Non-default lead models. `proxy:true` routes through a local gateway (localhost only); `provider` names a direct third-party endpoint. Tokens are NEVER stored here — the harness builds a runtime shell expression that reads them from your gateway config or repo env file at launch, so no key reaches a ledger event or a logged command line.",
   "leadTypes": {
     "claude": { "proxy": false },
@@ -85,6 +86,7 @@
       "subagentModel": "some-cheaper-model",
       "reviewerModel": "opus",
       "reviewerBilling": "subscription",
+      "panelModel": "opus",
       "contextWindow": 270000,
       "hosts": ["local"]
     }

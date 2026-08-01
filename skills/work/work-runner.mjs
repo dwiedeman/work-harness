@@ -39,6 +39,16 @@ export function parseArgs(argv) {
     // the final one would silently record a 3-lens gate as a 1-lens gate. That is the exact 1-of-3-reads-
     // as-a-full-swap failure the command refuses at every other layer.
     else if (a === "--lens") (o.lens ??= []).push(argv[++i]);
+    // `review-panel --lens-file correctness=/tmp/c.json` (DER-2360) — REPEATABLE for exactly the reason
+    // `--lens` is. The `lens=path` form binds each file to the lens that PRODUCED it; positional order
+    // would silently mislabel a panel whose lenses finished out of order, and a mislabelled lens is a
+    // gate that cannot be audited for redundancy.
+    else if (a === "--lens-file") (o.lensFile ??= []).push(argv[++i]);
+    else if (a === "--diff") o.diff = argv[++i];
+    else if (a === "--union") o.union = argv[++i];
+    else if (a === "--verify-file") o.verifyFile = argv[++i];
+    else if (a === "--falsify") o.falsify = argv[++i];
+    else if (a === "--base") o.base = argv[++i];
     // `staleness-check --symbol X --symbol Y` (2.7) — repeatable for the same reason --lens is.
     else if (a === "--symbol") (o.symbol ??= []).push(argv[++i]);
     else if (a === "--verdicts") o.verdicts = argv[++i];
@@ -486,10 +496,11 @@ export function renderBrief({ issueId, title, worktree, branch, runId, runDir, r
   const ltCfg = leadTypeCfg ?? {};
   const externalReviewer = hasExternalReviewer(ltCfg);
   const subscriptionReview = ltCfg.reviewerBilling === "subscription";
-  // In subscription mode the reviewer is launched by the brief's shell-out, so the model here is the
-  // CLI alias (`opus` auto-resolves to the latest Opus the installed CLI knows — harness-wide policy,
-  // spec §3.7), not a provider-qualified id.
-  const reviewerLaunchModel = subscriptionReview ? (ltCfg.reviewerModel ?? "opus") : ltCfg.reviewerModel;
+  // The adversarial panel (DER-2360) is a shell-out on the Claude subscription for EVERY lead type, so
+  // the model here is always a CLI alias (`opus` auto-resolves to the latest Opus the installed CLI
+  // knows — harness-wide policy, spec §3.7), never a provider-qualified id. Read from config rather
+  // than hardcoded; see `panelReviewerModel` for why a proxy `reviewerModel` must not leak into it.
+  const panelModel = panelReviewerModel(ltCfg);
   const reviewerModel = ltCfg.reviewerModel;
   const lines = [
     `# Lead brief — ${issueId}${bundleRest.length ? ` (+${bundleRest.join(", ")})` : ""}${title ? `: ${title}` : ""}`,
@@ -531,14 +542,13 @@ export function renderBrief({ issueId, title, worktree, branch, runId, runDir, r
     `1. Read AGENTS.md + relevant specs + invariants for the area you touch — **including the \`## Code Review Rules\` section of the root AGENTS.md and of every package you touch.** Those are not just review criteria; they are the defect classes this repo actually ships, so write TO them from the first line. The five that cost the most rounds: (a) **fix the class, not the call site** — when you change one member of a family (a table/registry/enum/switch entry, one branch of a guard, one of several parallel implementations), change every sibling or say in the PR body why not; (b) never **silently drop explicit input** — an early return or merge helper that discards a caller's value, where the default that replaces it is more permissive; (c) put the **authority check before** any error whose message reveals data the caller isn't entitled to; (d) make sure time/threshold **predicates compare the operands their names claim**; (e) if you add a doc, spec, comment, or config, make the code in the SAME diff match it, including anything the text says not to do yet. Each of those is a real kickback from this repo's ledger. If the brief doesn't name a **reference-as-map** (analogous existing implementation — file/PR/package), find one before coding, or note "no analog exists" in the PR body.`,
     `2. **Plan if not trivially clear:** run \`/superpowers:writing-plans\` for THIS issue → save under \`docs/superpowers/plans/\`; then declare the plan's file-scope. **This is MANDATORY and it is a BUDGET, not a note — emit it BEFORE your first commit:**`,
     `   \`${ledger(`{"actor":"lead:${issueId}","type":"plan_scope","issue":"${issueId}","fileScope":["path/a.ts","path/b.ts"],"expectedAdditions":600}`)}\``,
-    `   **Scope contract (2026-07-25):** the declared \`fileScope\` bounds this PR. If the real change needs **more than 1.5× the declared file count**, STOP and say so in a \`plan_scope\` re-emission plus a note to the orchestrator — do not silently grow. ${assignedBudget ? `Your **assigned budget is ${assignedBudget.files} files / ~${assignedBudget.additions} additions** (see above) — declare against it, do not raise it.` : "Aim for **≤ ~800 additions / ≤ ~12 files**"}; a PR that outgrows that should be split. Measured 2026-07-25: review rounds scale directly with diff size (<1k additions → 1.25 rounds; >7k → 5.67), and the run whose PRs averaged 3,754 additions took 8 kickbacks per merged PR versus 0.18 when they averaged 541. A PR with NO declared scope is the worst case of all — the one that shipped 98 files and +11,537 lines took 5 rounds and never merged.`,
+    `   **PR size target — under ${PR_ADDITIONS_TARGET.toLocaleString()} additions (advisory, DER-2360).** Round count tracks ADDITIONS, not risk: a small change to frightening code reviews in one round; a large change to boring code does not. ${assignedBudget ? `Your assigned budget above (~${assignedBudget.additions} additions) is the BINDING number; this is the ceiling it sits under.` : `Nothing enforces this — but a unit that will obviously cross it should be SPLIT before it is written, not after it is reviewed.`}`,
+    `   **Scope contract (2026-07-25):** the declared \`fileScope\` bounds this PR. If the real change needs **more than 1.5× the declared file count**, STOP and say so in a \`plan_scope\` re-emission plus a note to the orchestrator — do not silently grow. ${assignedBudget ? `Your **assigned budget is ${assignedBudget.files} files / ~${assignedBudget.additions} additions** (see above) — declare against it, do not raise it.` : `Aim for **≤ ~${PR_ADDITIONS_TARGET.toLocaleString()} additions / ≤ ~12 files**`}; a PR that outgrows that should be split. Measured 2026-07-25: review rounds scale directly with diff size (<1k additions → 1.25 rounds; >7k → 5.67), and the run whose PRs averaged 3,754 additions took 8 kickbacks per merged PR versus 0.18 when they averaged 541. A PR with NO declared scope is the worst case of all — the one that shipped 98 files and +11,537 lines took 5 rounds and never merged.`,
     externalReviewer
       ? `3. **Build by DELEGATING — on this lead type that is an instruction, not a style preference.** (Measured 2026-07-24: a lead on this tier made 220 model calls and ZERO Agent calls, implementing every line itself — and a lead that never dispatches a subagent also never runs step 5's review gate.) Decompose into 2–4 chunks and dispatch each with the **Agent tool**, \`model: "sonnet"\` (routes to ${ltCfg.subagentModel ?? "your subagent tier"}); research/codebase-mapping goes to \`"haiku"\` (${ltCfg.researchModel ?? ltCfg.subagentModel ?? "same"}). You plan, adversarially review each returned diff, and integrate — you do not write the bulk of the implementation yourself. Run subagents in the FOREGROUND. Read-only work fans out freely; parallel EDITS only on disjoint files via Agent \`isolation:"worktree"\`, then integrate onto the issue branch. NEVER dispatch model-less (it inherits YOUR tier); reserve \`opus\` for step 5's single final reviewer.`
       : `3. Build in bite-size chunks with in-process subagents (Sonnet 5 / Haiku). **Model discipline:** dispatch EVERY subagent with an explicit model alias — \`sonnet\` for implementation, \`haiku\` for research; NEVER model-less (a model-less subagent inherits your lead-tier model) and reserve \`opus\` for step 5's single final reviewer. Run subagents in the FOREGROUND (background task handles are unreliable on proxy-backed leads). Read-only work fans out freely; parallel EDITS only on disjoint files via Agent \`isolation:"worktree"\`, then integrate diffs onto the issue branch.`,
     `4. Targeted local verify: typecheck + lint the changed package + touched test files (+ one \`*.db.test.ts\` if you touched DB/RLS). NOT full remote CI. **EXCEPTION — deterministic guards are YOUR gate:** if the diff adds/changes a command, MCP tool, or reference guide, or touches \`packages/commands\`/\`packages/reference\`/\`apps/cli\`, also run \`pnpm check:manifest && pnpm check:cli-version && pnpm check:docs-version && pnpm docs:check\` + the registry tests (ui-surface-parity, command-tools, inventory, agent-how-tos) before handing off — seconds each; every skipped one is a guaranteed kickback round.`,
-    externalReviewer
-      ? `5. **Final adversarial review — MANDATORY GATE, see "${REVIEW_GATE_HEADING}" below.** ${subscriptionReview ? "It is a **shell-out**, NOT an Agent subagent (a subagent would inherit your own cheap tier and silently fake the gate) — the block below is copy-paste-able and self-recording." : `Dispatch ONE review subagent with model \`opus\`; on this lead type that slot resolves to **${reviewerModel}**.`} It is the quality floor for this PR, not a formality. Address its findings BEFORE hand-off.`
-      : `5. Final adversarial self-review (correctness / security / tests): dispatch ONE review subagent with model \`opus\` — the reviewer slot resolves to your OWN tier (Claude lead → Opus; gpt lead → gpt-5.6-sol; kimi lead → kimi-k3), so the reviewer matches the lead's strength. Fix findings before hand-off. (External model council is v2 — off for MVP.)`,
+    `5. **Adversarial review panel — THE gate on every lead type, see "${PANEL_GATE_HEADING}" below.** Three lenses, each a **shell-out on a fresh context**, never an Agent subagent (a subagent inherits your endpoint and aliases and silently reviews on your own tier). The cloud bot's auto-review is OFF, so this panel is the only review this PR gets before merge — run the block VERBATIM, address its findings, and re-run it on the new head BEFORE hand-off.`,
     `6. Open the PR (Linear \`gitBranchName\`, mention ${allIds.join(" + ")}); record it, then move Linear → In Review${bundleRest.length ? " (ALL bundled issues)" : ""} and hand off:`,
     `   \`${ledger(`{"actor":"lead:${issueId}","type":"pr_opened","issue":"${issueId}","pr":123${bundleRest.length ? `,"bundle":${JSON.stringify(allIds)}` : ""}}`)}\``,
     `   **Token telemetry (at hand-off, from the worktree):** \`${runner} append --run ${runId ?? "<run>"} --runs-root ${appendRunsRoot} "$(node scripts/session-token-report.mjs --role lead --issues ${allIds.join(",")}${kickback ? ` --kickback ${kickback}` : ""} --format event)"\` — reads your own session transcripts, reports tokens by model for fleet analysis.`,
@@ -578,114 +588,35 @@ export function renderBrief({ issueId, title, worktree, branch, runId, runDir, r
   );
   lines.push(
     ``,
-    `## ${CODEX_GATE_HEADING}`,
+    `## ${PANEL_GATE_HEADING}`,
     ``,
-    `Run this on EVERY hand-off, on every lead type. It is the same reviewer family that reviews your PR on GitHub minutes later, so anything it catches here is a kickback round you do not pay for. Measured 2026-07-25 on PR #1027: this pass caught **3 of the 4 findings** the GitHub Codex bot went on to post, before the bot ran.`,
+    `**This is THE review gate for this PR, not a warm-up for one.** The GitHub Codex bot's per-PR AUTO-review is OFF (operator decision, 2026-08-01), so nothing downstream catches what this panel misses — a PR with zero bot reviews is normal now. The decision is measured, not stylistic: across PRs #1074–#1197, 65.4% of commits on bot-reviewed PRs landed AFTER the first bot review, size-matched cohorts merged 1.4–2.7× FASTER without the bot at near-identical churn, and head-to-head on #1185 this panel found 12 of the 15 findings while the bot added 2 unique ones.`,
     ``,
-    `**Run it from your worktree** (it needs \`node_modules\` present — on a bare checkout it silently skips the test run and goes blind), after targeted verify is green and BEFORE \`gh pr create\`:`,
+    `**Three lenses, three SEPARATE processes, each prompted to REFUTE your change** — \`${PANEL_LENS_IDS.join("\` / \`")}\`. They are distinct on purpose: redundant reviewers CONCUR, and concurrence is not corroboration. On #1183 the repro lens refuted the security lens and was RIGHT; three copies of one lens would have agreed and deleted live code.`,
+    ``,
+    `> **⚠ Every lens is a SHELL-OUT, never an Agent/Task subagent.** A subagent inherits THIS process's endpoint and model aliases, so an in-process "opus" reviewer silently runs on your own tier — measured 2026-07-24: a lead dispatched \`model: "opus"\` with a perfect review prompt and got 19/19 calls on the flash tier while its PR was about to claim an Opus review. The block below unsets the provider env so each lens is its own process on the **Claude subscription**${subscriptionReview ? `, which does **not** spend your lead budget (your implementation tier is cheap; your reviewer is not — the deal is: you write, it attacks, you fix)` : ""}. This panel runs on **${panelModel}**.`,
+    ``,
+    `**Run it from your worktree** — the lenses need \`node_modules\` present, and on a bare checkout the repro lens cannot execute anything and goes blind (measured: 0 findings against 2 real ones). Run it after targeted verify is green and BEFORE \`gh pr create\`:`,
     ``,
     "```bash",
-    `# 1. write the review prompt. The SEARCH MANDATE is the load-bearing part — a diff-local codex`,
-    `#    pass measured 2 shell commands and 0 findings where this one ran 21 and found 6.`,
-    `cat > /tmp/${issueId}-codex-review.md <<'PROMPT'`,
-    `Review the branch diff: git diff origin/main...HEAD  (run it yourself).`,
-    ``,
-    `Focus on issues that impact correctness, security, tenant isolation, maintainability, or`,
-    `developer experience. Flag only actionable issues INTRODUCED by this diff.`,
-    ``,
-    `EXHAUSTIVE SEARCH IS REQUIRED — do not review the diff in isolation:`,
-    `  - grep every call site, sibling, and consumer of what the diff changes; say whether the`,
-    `    change is complete across all of them;`,
-    `  - when the diff edits ONE member of a family (table/registry/enum/switch entry, one branch`,
-    `    of a guard, one of several parallel implementations), enumerate the family and check each;`,
-    `  - when the diff adds or edits a doc, spec, comment, or config, verify the code in the SAME`,
-    `    diff matches it — including anything the text says NOT to do yet;`,
-    `  - prefer EXECUTING the changed code (node -e, the test runner) over reasoning about it;`,
-    `  - git log / git blame for why the surrounding code looks the way it does.`,
-    ``,
-    `Obey the "## Code Review Rules" sections of the repo's AGENTS.md files, including their`,
-    `"Do not flag" lists. Do not report anything a \`pnpm check:*\` script or guard test already`,
-    `enforces mechanically.`,
-    ``,
-    `Acceptance criteria this change must meet: <paste the AC bullets from the brief>`,
-    `PROMPT`,
-    `# 2. run it read-only with the JSON schema, then record + print the findings in one step.`,
-    codexReviewCommand({
-      promptFile: `/tmp/${issueId}-codex-review.md`,
-      outFile: `/tmp/${issueId}-codex-review.json`,
-      logFile: `/tmp/${issueId}-codex-review.log`,
-    }),
-    `${runner} review-usage --run ${runId ?? "<run>"} --runs-root ${appendRunsRoot} --issue ${issueId} --round 1 --reviewer codex --file /tmp/${issueId}-codex-review.json --log /tmp/${issueId}-codex-review.log`,
+    panelReviewCommands({ issueId, model: panelModel, runner, runId: runId ?? "<run>", runsRoot: appendRunsRoot }),
     "```",
     ``,
-    `That last command appends a \`review_findings\` event (the shepherd's machine-checkable proof the gate ran) AND prints the findings for you to act on. **Fix every P0/P1, then RE-RUN the gate on the new head.** \`ready\` blocks a PR whose latest gate event covers its head and still records \`blockers > 0\` (DER-2782) — an unfixed finding is no longer something a paragraph in the PR body can clear. **The count is not taken on trust: \`blockers\` must EXACTLY equal the number of priority-≤1 entries in that same event's findings list (DER-2837), or the gate reads \`INCONSISTENT\` and blocks at both write and read time.** So hand-writing the event buys nothing — run \`review-usage\`, which derives the count from the findings. If you believe a P0/P1 is WRONG, say so in the PR body **and ask the orchestrator to record a \`gate_adjudication\`**: ${GATE_ADJUDICATION_AUTHORITY} Appending one yourself is the offense, not a shortcut. Put \`Codex review: <verdict>, round N, 0 open blockers\` in the PR body.`,
+    `1. **The diff SEEDS the search; it does not BOUND it.** The prompts are rendered by \`panel-prompt\`, which path-routes this repo's own checklists (tenant isolation, authorization precedence, command-surface parity, prompt/schema drift, SQL-vs-Zod divergence) onto the lenses by what your diff actually touches — and every lens is told to grep call sites, siblings, specs and dependent prose the diff does NOT touch. That instruction is the whole gate: measured 2026-07-25, a diff-local reviewer ran 2 commands and found 0 issues on a PR where a searching reviewer ran 21 and found 6, including two P1s the bot never posted.`,
+    `2. **Union, then verify — and the verification pass cannot erase.** Step 2 unions every unique finding across the lenses (a 1-of-3 finding is the NORMAL shape of what makes a panel worth running, never a weak signal to be voted down) and then attacks each one by EXECUTION on a fresh context. Majority prioritizes; it never erases. A blocker-class finding (P0/P1, auth, tenant isolation, secrets, money) dies only by **positive falsification** — a command that was run and what it returned, which \`review-panel\` checks rather than trusts — or by an explicit \`gate_adjudication\`. Dissent between lenses is recorded in the receipt, not resolved by vote.`,
+    `3. **Address, don't relay.** Fix every blocker and major, then **RE-RUN the panel on the new head**. \`ready\` blocks a PR whose latest gate covers its head and still records \`blockers > 0\`, and the recorded count must EXACTLY equal the number of priority-≤1 entries in that same event's findings list (DER-2837) — so hand-writing the event buys nothing; \`review-panel\` derives the count from the findings. If you believe a blocker is WRONG, either falsify it with an executed counterexample (step 2) or say so in the PR body and ask the orchestrator to record a \`gate_adjudication\`: ${GATE_ADJUDICATION_AUTHORITY} Appending one yourself is the offense, not a shortcut.`,
+    `4. **Round cap — 3, then stop.** Re-run the panel after substantial fixes. If **blocker-class findings are still unresolved after round 3**, the PR is not converging: STOP, say so in a note to the orchestrator, and re-scope or split it rather than grinding a fourth round. Only NON-blocking residue may be deferred — list it in the PR body under "Deferred minors" (finding + file:line) for the shepherd's review-debt pass; do NOT file your own Linear issue.`,
+    `5. **Evidence in the PR body (the shepherd checks this):** a line reading \`Adversarial panel: ${PANEL_LENS_IDS.join("/")}, <model>, round N, 0 open blockers\`. The prose line alone is not evidence — the \`review_findings\` event \`review-panel\` appends is, and a missing event or an unresolved blocker list is an automatic kickback.`,
     ``,
-    `⚠ It takes ~3–8 minutes and rides the **ChatGPT** subscription, not the Anthropic one — it does not spend your lead budget.`,
+    `⚠ It takes ~5–10 minutes wall-clock (the three lenses run in parallel). **Do not ask for \`@codex review\`** — the shepherd decides whether this PR's lane warrants that backstop.`,
   );
-  if (externalReviewer) {
+  if (externalReviewer && !subscriptionReview) {
     lines.push(
       ``,
-      `## ${REVIEW_GATE_HEADING}`,
-      ``,
-      `This runs IN ADDITION to the Codex gate above — different vendor, different blind spot. Measured: on one PR the Codex pass found authority bugs in the TypeScript while the GitHub bot stayed inside the \`.sql\`; on another the reverse. Two reviewers that fail differently beat one that fails twice.`,
-      ``,
-      `Your implementation tier is cheap; your reviewer is not. **Claude ${reviewerLaunchModel === "opus" ? "Opus" : reviewerLaunchModel}, on the operator's subscription**, is the external quality floor on this PR — the deal is: you write, it attacks, you fix. Run it EXACTLY once per hand-off (twice at most, see 4).`,
-      ``,
-      `> **⚠ Do NOT dispatch this as an Agent/Task subagent.** Every subagent you spawn inherits THIS process's`,
-      `> endpoint and model aliases, so an in-process "opus" reviewer silently runs on your own cheap tier —`,
-      `> measured 2026-07-24: a lead dispatched \`model: "opus"\` with a perfect review prompt and got 19/19 calls`,
-      `> on the flash tier, while its PR was about to claim an Opus review. The review is a **shell-out** that`,
-      `> unsets the provider env, so it runs as a separate process on the Claude subscription. Run it VERBATIM:`,
-      ``,
-      "```bash",
-      `# 1. review-sized context — the diff, nothing more`,
-      `git diff origin/main...HEAD > /tmp/${issueId}-review.diff`,
-      `# 2. write the review prompt (acceptance criteria above + the conventions of the packages you touched)`,
-      `cat > /tmp/${issueId}-review-prompt.md <<'PROMPT'`,
-      `You are an adversarial reviewer. This is a GATE, not a suggestion. Start from the diff at`,
-      `/tmp/${issueId}-review.diff and the per-package AGENTS.md of every package it touches —`,
-      `including their "## Code Review Rules" sections, which are binding for this review.`,
-      `Find every defect, vulnerability, silent-failure path, spec deviation, and convention violation.`,
-      ``,
-      `SEARCH THE REPOSITORY. Do not review the diff in isolation — the expensive defects are only`,
-      `visible in code the diff does NOT touch. Before you finalize:`,
-      `  - grep every call site, sibling, and consumer of anything the diff changes, and say whether`,
-      `    the change is complete across all of them;`,
-      `  - when the diff edits ONE member of a family (a table/registry/enum/switch entry, one branch`,
-      `    of a guard, one of several parallel implementations), enumerate the whole family and check`,
-      `    each member — report the class, not the single call site;`,
-      `  - when the diff adds or edits a doc, spec, comment, or config, verify the code in the SAME`,
-      `    diff matches it, including anything the text says NOT to do yet;`,
-      `  - prefer EXECUTING the changed code (node -e, the test runner, a REPL) over reasoning about`,
-      `    it. An executed counterexample is a finding; a hunch is not. You have Bash for this.`,
-      `  - use git log / git blame for why the surrounding code looks the way it does.`,
-      ``,
-      `Posture: comprehensive threat model — correctness, tenant isolation/RLS, secret handling, spec`,
-      `conformance, convention compliance. Rank each finding blocker / major / minor with file:line.`,
-      `Do NOT report anything in the "Do not flag" list of the root AGENTS.md Code Review Rules, and`,
-      `do not report what CI already enforces mechanically — both cost a round without adding signal.`,
-      `Acceptance criteria this change must meet: <paste the AC bullets from the brief>`,
-      `PROMPT`,
-      `# 3. run it on the SUBSCRIPTION (provider env unset) and record it in one step.`,
-      `#    Two traps, both observed live: pass the prompt on STDIN as shown (--allowedTools is VARIADIC`,
-      `#    and swallows a trailing prompt argument, producing an empty review + a zero-byte file), and`,
-      `#    use the BARE alias below — a provider-qualified id (anthropic/claude-opus-5) does NOT exist`,
-      `#    on the subscription and the call errors out.`,
-      reviewShellCommand({ model: reviewerLaunchModel, promptFile: `/tmp/${issueId}-review-prompt.md`, outFile: `/tmp/${issueId}-review.json` }),
-      `${runner} review-usage --run ${runId ?? "<run>"} --runs-root ${appendRunsRoot} --issue ${issueId} --round 1 --file /tmp/${issueId}-review.json`,
-      "```",
-      ``,
-      `That last command PRINTS the review findings for you to act on AND appends the reviewer's own token usage (role \`reviewer\`, with its real model id) to the run ledger — that event is the machine-checkable proof the gate ran, and it lands in \`work-metrics\`' role × model table. It REFUSES to record a failed review run, and warns loudly if the review did not actually ride the subscription.`,
-      ``,
-      `1. **When:** after your own targeted verification (typecheck/lint/touched tests) is green, and BEFORE \`gh pr create\` / hand-off. Not earlier — reviewing a moving diff wastes it. Not later — the shepherd is not a substitute for this gate.`,
-      `2. **What it gets — and what it must go find.** SEED it with the diff, the acceptance criteria, and the touched packages' \`AGENTS.md\` (including their \`## Code Review Rules\` sections). Do NOT paste the rest of the repo in — but the reviewer MUST search it. Dumping context is waste; **agentic searching is the whole point**, and the two are not the same thing. Measured 2026-07-25: a diff-local reviewer ran 2 commands and found 0 issues on a PR where a searching reviewer ran 21 and found 6, including two P1s the GitHub Codex bot never posted. Require it to: grep every call site, sibling, and consumer of what the diff changes; enumerate the WHOLE family when the diff edits one member of a table/registry/enum/switch/guard; \`git log\`/\`git blame\` for why surrounding code looks the way it does; and **prefer EXECUTING the changed code** (\`node -e\`, the test runner, a REPL) over reasoning about it — an executed counterexample is a finding, a hunch is not.`,
-      `3. **Posture:** adversarial, comprehensive threat model — correctness, tenant-isolation/RLS, secret handling, spec conformance, convention compliance, silent-failure paths. Plus the classes the Codex reviewer actually posts (root \`AGENTS.md\` § *Code Review Rules*): incomplete change across a family, silent loss of explicit input, error precedence letting a descriptive error beat an authority check, predicates comparing the wrong operand, and claims the diff does not keep (a doc/config contradicting code in the SAME diff). Findings ranked **blocker / major / minor**.`,
-      `4. **Address, don't relay:** fix every blocker and major, or reject it IN WRITING in the PR body with a reason the shepherd can audit. Re-review ONCE if the fixes were substantial (re-run the block above with \`--round 2\`) — **cap 2 rounds**; a third means you're thrashing, so hand off with the findings attached instead. Minors may be deferred: note them in the PR body under "Deferred minors" (finding + file:line) for the shepherd's review-debt pass — do NOT file your own Linear issue; the shepherd folds it into an existing per-class \`review-debt\` issue or mints one only if no matching class issue exists (2026-07-27 exhaust policy).`,
-      `5. **Evidence in the PR body (the shepherd checks this):** a line reading \`Adversarial review: <the model id the command printed>, round N, 0 open blockers\`. A missing or unresolved blocker list is an automatic kickback — same discipline as an unresolved Codex thread.`,
-      ``,
-      `Every in-process subagent stays \`sonnet\`/\`haiku\`; model-less subagents are banned (they inherit YOUR tier). The TUI cost counter is wrong by design on this lead type — ignore it; the ledger events are the truth.`,
+      `Note for this lead type: your in-process \`opus\` slot resolves to **${reviewerModel}**. That slot is for step 3's integration review of a subagent's diff — it is NOT this gate, and it cannot be: an in-process reviewer inherits your aliases. The panel above is the gate.`,
     );
   }
+
   if (kickback) {
     lines.push(
       ``,
@@ -904,10 +835,12 @@ export function modelFamily(id) {
   return s.includes("/") ? s.split("/")[0] : s.split("-")[0];
 }
 
-const REVIEW_GATE_HEADING = "⚑ Mandatory external adversarial review (pre-hand-off gate)";
-// The codex gate runs on EVERY lead type (DER-2375). It is deliberately first in the brief: it is the
-// cheap one (different subscription), the fast one, and the one whose findings predict the kickbacks.
-const CODEX_GATE_HEADING = "⚑ Mandatory Codex review (pre-PR gate — every lead type)";
+// DER-2360 retired two brief headings that lived here: "⚑ Mandatory Codex review (pre-PR gate — every
+// lead type)" (DER-2375) and "⚑ Mandatory external adversarial review (pre-hand-off gate)". Both are
+// superseded by `PANEL_GATE_HEADING` — the panel is a subscription shell-out on every lead type, so
+// rendering the external-reviewer block alongside it would have told a `dsv4` lead to run a FOURTH
+// Opus review after the three-lens panel had already run on the same subscription. Deleted rather than
+// left dangling: an unused heading is the seed of a second gate nobody maintains.
 
 // A lead type has an external quality floor when the final review is either (a) billed to the Claude
 // subscription via a headless shell-out — a different process, different auth, different model — or
@@ -935,6 +868,685 @@ export function hasExternalReviewer(cfg = {}) {
 // worktree it was already reading.
 export function reviewShellCommand({ model = "opus", promptFile = "<prompt.md>", outFile = "<review.json>" } = {}) {
   return `env -u ANTHROPIC_BASE_URL -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_API_KEY claude -p --output-format json --model ${model} --allowedTools Read,Grep,Glob,Bash < ${promptFile} > ${outFile}`;
+}
+
+// ── DER-2360 — the 3-lens adversarial PANEL, the PRIMARY pre-PR review gate ─────────────────────
+// Supersedes the Codex block as the gate every brief renders. The decision is measured, not stylistic:
+// mining PRs #1074–#1197 (2026-08-01), 65.4% of commits on bot-reviewed PRs landed AFTER the first bot
+// review, size-matched cohorts merged 1.4–2.7× FASTER without the bot at near-identical commit churn,
+// and head-to-head on #1185 the local panel found 12 of 15 findings while the bot added 2 unique.
+// The operator disabled cloud auto-review on 2026-08-01, so a PR with zero bot reviews is now NORMAL —
+// `@codex review` remains as an explicit, on-demand backstop for risk lanes and for calibration.
+//
+// Three properties carried over from the substitute gate (`review-swap`, Phase 1) because each one was
+// bought with a real failure:
+//   * SHELL-OUT, never an in-process Agent subagent. A subagent inherits this process's endpoint and
+//     model aliases — measured 2026-07-24, a lead dispatched `model: "opus"` and got 19/19 calls on the
+//     flash tier while its PR was about to claim an Opus review.
+//   * A SILENT LENS IS INCOMPLETE, NEVER CLEAN. A gate that dies exits 0; recording it would
+//     manufacture 0-finding "proof" of a clean PR.
+//   * DISTINCT lenses. On #1183 the repro lens REFUTED the security lens and was right — three
+//     redundant reviewers would have concurred and deleted live code.
+export const PANEL_GATE_HEADING = "⚑ Mandatory adversarial review panel (pre-PR gate — every lead type)";
+
+// The advisory PR size ceiling, surfaced in every brief next to `plan_scope` (DER-2360 scope 4).
+// ADVISORY on purpose: nothing refuses a PR for crossing it. Round count tracks additions rather than
+// risk — measured across 25 PRs, <1k additions merged in 1.25 rounds, 2.6k–5k in 3.38, >7k in 5.67 —
+// so the number is worth stating at plan time, when splitting is still cheap, and worth nothing as a
+// hard gate at hand-off time, when the only remaining move is to review it anyway.
+export const PR_ADDITIONS_TARGET = 1000;
+
+// The discovery lenses. Each is prompted to REFUTE the change, and each defaults to `refuted: true`
+// under uncertainty — a lens that cannot establish the change is sound has not cleared it.
+export const PANEL_LENSES = [
+  {
+    id: "correctness",
+    title: "correctness",
+    mandate: [
+      "Refute the claim that this change is CORRECT. Assume it is wrong and find where.",
+      "  - logic errors, off-by-one, wrong operand order, unhandled null/empty/error branches;",
+      "  - INCOMPLETE CHANGE ACROSS A FAMILY: when the diff edits ONE member of a set the codebase",
+      "    treats uniformly (a registry/enum/switch/table entry, one branch of a guard, one of several",
+      "    parallel implementations, call sites of a changed helper), ENUMERATE the whole family and",
+      "    check each member. Report the CLASS, not the one call site;",
+      "  - SILENT LOSS OF EXPLICIT INPUT: an early return, merge helper, or default applied after the",
+      "    caller already set the field — worst when the default that replaces it is MORE permissive;",
+      "  - PREDICATES THAT COMPARE THE WRONG OPERAND: a freshness value against a staleness cutoff, a",
+      "    start against a deadline, inclusive where exclusive was meant. Name the concrete input that",
+      "    produces the wrong answer;",
+      "  - CLAIMS THE DIFF DOES NOT KEEP: a doc, spec, comment, or config added in this diff that the",
+      "    code in the SAME diff contradicts — including anything the text says NOT to do yet;",
+      "  - COPY ELSEWHERE THAT THIS DIFF FALSIFIED: if the change alters a command's authorization",
+      "    scope, its transport exposure, a channel/kind guard, a query's ownership scoping, or a gate's",
+      "    decision predicate, grep the repo for help/remediation/disclosure/example prose asserting the",
+      "    OLD behavior — in files this diff does not touch. Stale copy is a finding this diff introduced.",
+    ].join("\n"),
+  },
+  {
+    id: "security",
+    title: "security / trust boundary",
+    mandate: [
+      "Refute the claim that this change is SAFE. Name the principal, the boundary, and the crossing.",
+      "  - who can reach the new code, with what authority, and what stops a caller without it;",
+      "  - TENANT ISOLATION: any new table/query/route reachable without a server-side tenant scope;",
+      "    tenant context must come from the server-side session, never from client input;",
+      "  - ERROR PRECEDENCE: an authorization or ownership failure must be reported BEFORE any check",
+      "    whose message reveals the existence, name, or shape of data the caller is not entitled to;",
+      "  - SECRETS: material (not a reference) reaching logs, model context, error messages, or an",
+      "    argument summary; a credential minted, widened, or logged;",
+      "  - INJECTION AND DESERIALIZATION at every boundary the diff adds or widens;",
+      "  - A GUARD THAT CANNOT FAIL: if the diff adds a check, construct the input that should trip it",
+      "    and confirm it actually does. A check incapable of returning the failing answer is not a check.",
+    ].join("\n"),
+  },
+  {
+    id: "repro",
+    title: "does-it-reproduce",
+    mandate: [
+      "Refute by EXECUTION, not by reading. You have Bash — an executed counterexample is a finding,",
+      "a hunch is not. This lens exists to REFUTE the other two as much as to add findings of its own:",
+      "on #1183 it proved a branch the security lens had called redundant was load-bearing, and was right.",
+      "  - run the touched tests; run the changed function directly (node -e, a REPL, the test runner);",
+      "  - for every behavioral claim the diff or its tests make, construct the input that would falsify",
+      "    it and RUN it. Report which claims survived and which did not;",
+      "  - A TEST THAT BINDS TO A SYMBOL WHILE PRODUCTION BINDS TO A CALL SITE: confirm the production",
+      "    path actually reaches the function the test imports — not merely that a same-named symbol is",
+      "    exported. Follow the runtime path to the call site and say which function it lands on;",
+      "  - a new test must be able to FAIL: revert the fix (or mutate the guard) and confirm the test",
+      "    goes red. A test that passes against the unfixed code is not coverage;",
+      "  - `git log` / `git blame` for why the surrounding code looks the way it does.",
+    ].join("\n"),
+  },
+];
+
+export const PANEL_LENS_IDS = PANEL_LENSES.map((l) => l.id);
+// The panel needs at least two DISTINCT lenses for the same reason `review-swap` does: redundant
+// reviewers concur, and concurrence is not corroboration.
+export const PANEL_MIN_LENSES = 2;
+
+// ── Path-routed repo-specific checklists ────────────────────────────────────────────────────────
+// The three lenses above are generic. These bind them to THIS repo's actual defect classes, routed by
+// the paths the diff touches, so a lens reviewing a migration is asked about RLS and a lens reviewing
+// a command is asked about surface parity — without either question diluting the other's prompt.
+//
+// `lens: "*"` routes to every lens. Routing is on the diff's file list, which SEEDS the review; it
+// never bounds it (the mandate above sends each lens into callers, siblings and specs the diff does
+// not touch).
+export const PANEL_PATH_CHECKLISTS = [
+  {
+    id: "tenant-isolation",
+    lens: "security",
+    match: /(^|\/)packages\/db\/|\.sql$|(^|\/)migrations?\/|(^|\/)supabase\//,
+    bullets: [
+      "Every tenant-scoped table carries `tenant_id` + RLS, and a NEW table ships a cross-tenant penetration test. A table added without both is a blocker.",
+      "The `events` log is append-only: any UPDATE or DELETE against it is a blocker, corrections are new rows.",
+      "A foreign key between two tenant-scoped tables is composite `(tenant_id, id)`, never id-only.",
+    ],
+  },
+  {
+    id: "sql-zod-divergence",
+    lens: "correctness",
+    match: /(^|\/)packages\/db\/|\.sql$/,
+    bullets: [
+      "A SQL predicate that mirrors a Zod/TypeScript validator is DRIFT BY DEFAULT — check it clause by clause against the validator, and name the concrete value the schema rejects and the SQL accepts. The SQL copy is normally the looser one, and each field it forgets is a check it silently does not perform. A comment claiming it is fail-closed is a claim to verify, never evidence.",
+    ],
+  },
+  {
+    id: "command-surface-parity",
+    lens: "*",
+    match: /(^|\/)packages\/commands\/|(^|\/)apps\/cli\/|(^|\/)packages\/reference\//,
+    bullets: [
+      "Tri-surface parity: an operation added as a command exists on every surface the repo expects (command / CLI / UI), and the parity guard covers it.",
+      "If the diff changes a command's `requiredScope`, its `exposeOverMcp`/transport exposure, or a transport guard, grep for help text, CLI examples, remediation and disclosure copy asserting the OLD behavior — including files this diff does not touch.",
+    ],
+  },
+  {
+    id: "prompt-schema-drift",
+    lens: "correctness",
+    match: /(^|\/)packages\/prompts\/|(^|\/)packages\/protocol\//,
+    bullets: [
+      "Prompts are versioned files with frontmatter and eval fixtures — never inlined into app code; a prompt change runs evals.",
+      "Zod validation at every boundary, and one Zod major across the workspace (a major split typechecks fine and throws at `.parse()` across packages).",
+    ],
+  },
+  {
+    id: "authorization-precedence",
+    lens: "security",
+    match: /auth|guard|permission|entitle|manifest|principal|scope/i,
+    bullets: [
+      "Tool selection is never authorization: every agent tool call passes a server-side guard against the seat's permission manifest and writes a `tool_calls` row carrying the guard result.",
+      "Agents recommend; humans decide. A durable change from an agent goes through draft-and-confirm, and `decisions.decided_by` is always a human — including under a standing authorization.",
+    ],
+  },
+  {
+    id: "money-and-metering",
+    lens: "security",
+    match: /billing|stripe|price|pricing|entitlement|metering|quota|spend/i,
+    bullets: [
+      "Any limitable capability is wired to an entitlement + metering hook, even when the limit is 'unlimited' today.",
+      "A spend path, a credential mint, and a cross-tenant action are hard-floor blockers regardless of authorization mode.",
+    ],
+  },
+  {
+    id: "route-errors",
+    lens: "correctness",
+    match: /(^|\/)apps\/web\/src\/app\/api\/|route\.ts$|(^|\/)inngest\//,
+    bullets: [
+      "Errors are never swallowed: the route is wrapped (`withRouteErrors`), the failure reaches `error_logs`, and the tenant id comes from the server-side session.",
+      "Background jobs are idempotent and safe to retry.",
+    ],
+  },
+  {
+    id: "docs-claims",
+    lens: "correctness",
+    match: /\.mdx?$|(^|\/)docs\//,
+    bullets: [
+      "Verify the code in the SAME diff matches every claim this prose makes, including anything it says not to do yet. Two sections of one document contradicting each other is a finding.",
+    ],
+  },
+];
+
+// Which checklists a given lens gets for a given file list. Pure so the routing is unit-testable
+// without a repo. Order is stable (declaration order), and a checklist matches at most once no matter
+// how many paths hit it.
+export function pathRoutedChecklists({ paths = [], lens = null } = {}) {
+  const list = (Array.isArray(paths) ? paths : []).map((p) => String(p ?? "")).filter(Boolean);
+  const out = [];
+  for (const entry of PANEL_PATH_CHECKLISTS) {
+    if (lens && entry.lens !== "*" && entry.lens !== lens) continue;
+    if (!list.some((p) => entry.match.test(p))) continue;
+    out.push({ id: entry.id, bullets: entry.bullets });
+  }
+  return out;
+}
+
+// The file list a unified diff touches, read from the diff ITSELF rather than from `git diff
+// --name-only`. Deliberate: the diff file is exactly what the lens is given, so routing derived from
+// it can never describe a different tree than the one under review — and it needs no git, so a lens
+// prompt renders identically in a test.
+export function parseDiffPaths(diffText) {
+  const paths = new Set();
+  for (const line of String(diffText ?? "").split("\n")) {
+    // `diff --git a/<old> b/<new>`. Take the b-side: a rename's review belongs to where the file now
+    // lives. Quoted paths (spaces, unicode) are emitted by git as `"a/x y.ts"`, hence the optional quote.
+    const m = /^diff --git "?a\/(.+?)"? "?b\/(.+?)"?$/.exec(line);
+    if (m) { paths.add(m[2]); continue; }
+    const p = /^\+\+\+ "?b\/(.+?)"?$/.exec(line);
+    if (p && p[1] !== "dev/null") paths.add(p[1]);
+  }
+  return [...paths];
+}
+
+// The exact JSON a lens must return. Stated as a schema in the prompt AND parsed fail-closed on the
+// way back in: a lens whose verdict cannot be read is INCOMPLETE, never clean.
+const PANEL_OUTPUT_CONTRACT = [
+  "OUTPUT — VERDICT FIRST, then a single fenced JSON block and nothing after it. A truncated reply must",
+  "still carry a usable answer, so the first line is the verdict in plain text:",
+  "",
+  "    refuted: true|false — <one line>",
+  "",
+  "Then, in one ```json fence:",
+  "",
+  '    {"verdict": "findings" | "clean",',
+  '     "summary": "<one or two sentences>",',
+  '     "findings": [',
+  '       {"title": "<what is wrong, not where you looked>",',
+  '        "priority": 0 | 1 | 2 | 3,',
+  '        "confidence": 0.0-1.0,',
+  '        "file": "path/from/repo/root.ts",',
+  '        "line_start": 123, "line_end": 130,',
+  '        "evidence": "<the command you ran and what it returned, or the exact lines that prove it>"}',
+  "     ]}",
+  "",
+  "priority 0 = ship-stopping, 1 = blocker (P0/P1 are the blocker class: correctness-breaking, auth,",
+  "tenant isolation, secrets, money), 2 = major, 3 = minor. DEFAULT TO refuted: true UNDER UNCERTAINTY —",
+  "if you could not establish the change is sound, say so rather than returning clean. An empty",
+  '`findings` array with `"verdict": "clean"` is a positive claim that you searched and found nothing.',
+].join("\n");
+
+// The prompt for one lens. Pure — the brief shells out to `panel-prompt`, so this text is TESTED code
+// rather than prose pasted into a brief that nothing verifies.
+export function panelLensPrompt({ lens, issueId = null, diffFile = "<diff>", paths = [], acceptance = null, base = "origin/main" } = {}) {
+  const def = PANEL_LENSES.find((l) => l.id === lens);
+  if (!def) {
+    throw new Error(`panel-prompt: unknown lens ${JSON.stringify(lens)} — known lenses: ${PANEL_LENS_IDS.join(", ")}`);
+  }
+  const routed = pathRoutedChecklists({ paths, lens });
+  const lines = [
+    `You are the **${def.title}** lens of a 3-lens adversarial review panel${issueId ? ` on ${issueId}` : ""}.`,
+    "This is a GATE, not a suggestion. Two other lenses are reviewing the same change independently;",
+    "your job is to find what they will not.",
+    "",
+    def.mandate,
+    "",
+    "## The diff SEEDS your search — it does not BOUND it",
+    "",
+    `The branch diff is at ${diffFile} (\`git diff ${base}...HEAD\`). The expensive defects are only`,
+    "visible in code the diff does NOT touch, so before you finalize:",
+    "  - grep every call site, sibling, and consumer of anything the diff changes, and say whether the",
+    "    change is complete across all of them;",
+    "  - read the per-package AGENTS.md of every package the diff touches, INCLUDING its",
+    '    "## Code Review Rules" section — those are binding for this review;',
+    "  - prefer EXECUTING the changed code over reasoning about it. You have Bash.",
+    "",
+    "Do NOT report anything in the root AGENTS.md Code Review Rules' \"Do not flag\" list, and do not",
+    "report what a `pnpm check:*` script or guard test already enforces mechanically — both cost a round",
+    "without adding signal.",
+  ];
+  if (routed.length) {
+    lines.push(
+      "",
+      "## Repo-specific checks routed to this lens by the paths this diff touches",
+      "",
+      ...routed.flatMap((c) => [`**${c.id}**`, ...c.bullets.map((b) => `  - ${b}`), ""]),
+    );
+  }
+  if (acceptance && String(acceptance).trim()) {
+    lines.push("", "## Acceptance criteria this change must meet", "", String(acceptance).trim());
+  }
+  lines.push("", PANEL_OUTPUT_CONTRACT, "");
+  return lines.join("\n");
+}
+
+// The VERIFICATION prompt (phase 2). The panel's discovery pass produces a UNION of unique findings;
+// this pass tries to FALSIFY each one by execution. It is a separate context on purpose — a lens
+// grading its own findings is the self-review this whole gate exists to replace.
+export function panelVerifyPrompt({ issueId = null, unionFile = "<union.json>", diffFile = "<diff>" } = {}) {
+  return [
+    `You are the VERIFICATION pass of a 3-lens adversarial review panel${issueId ? ` on ${issueId}` : ""}.`,
+    "",
+    `Three lenses have already searched. Their UNIONED findings are at ${unionFile}; the branch diff is`,
+    `at ${diffFile}. You are NOT here to find new defects and NOT here to re-rank these ones.`,
+    "",
+    "For each finding, attempt to FALSIFY it — construct and RUN the case that would prove it wrong.",
+    "The asymmetry is deliberate and it is the whole contract:",
+    "",
+    "  - A finding is FALSIFIED only by POSITIVE EVIDENCE: a command you ran whose output proves the",
+    "    reported behavior does not occur. Reading the code and disagreeing is not falsification.",
+    "  - A finding you could not falsify STANDS. 'I could not reproduce it' is not falsification either —",
+    "    it is an unverified finding, and it stays in the set.",
+    "  - A BLOCKER-CLASS finding (priority ≤ 1, or anything touching authorization, tenant isolation,",
+    "    secrets, or money) dies ONLY by positive falsification or by an explicit human acceptance",
+    "    recorded elsewhere. You cannot downgrade one. You cannot drop one for being low-confidence.",
+    "  - Where the lenses DISAGREED, say which one the evidence supports and why. A disagreement",
+    "    resolved by execution is the most valuable thing this pass produces — on #1183 the repro lens",
+    "    refuted the security lens and was right; concurring would have deleted live code.",
+    "",
+    "OUTPUT — verdict first, then one ```json fence and nothing after it:",
+    "",
+    "    falsified: <n> of <total> — <one line>",
+    "",
+    '    {"falsified": [',
+    '       {"ref": "<the finding\'s exact title, or #N from the union file>",',
+    '        "evidence": "<the command you ran and its output that proves the finding wrong>"}',
+    "     ],",
+    '     "confirmed": [{"ref": "…", "evidence": "<what you ran that reproduced it>"}],',
+    '     "unverified": [{"ref": "…", "why": "<what you could not run and why>"}]}',
+    "",
+    "An entry in `falsified` with empty or hand-waving evidence will be REFUSED at record time. If you",
+    "have no executed proof, it belongs in `unverified`.",
+    "",
+  ].join("\n");
+}
+
+// Which model the panel shells out to for a given lead type. Read from `.claude/work.config.json`
+// rather than hardcoded (DER-2360 scope 2), with a deliberate ordering:
+//   1. `panelModel` — the explicit per-type override for THIS gate;
+//   2. `reviewerModel`, but ONLY under `reviewerBilling: "subscription"`, where it already names a
+//      Claude CLI alias (dsv4/dsv4-flash carry `"opus"` there and keep working unchanged);
+//   3. `opus`.
+// Step 2's guard is load-bearing. On the `kimi` and `gpt` types `reviewerModel` is a PROXY model id
+// (`kimi-k3`, `gpt-5.6-sol`) naming the in-process same-vendor reviewer slot — passing either to
+// `claude -p --model` names a model that does not exist on the subscription and the call errors out.
+export function panelReviewerModel(cfg = {}) {
+  if (cfg?.panelModel) return String(cfg.panelModel);
+  if (cfg?.reviewerBilling === "subscription" && cfg?.reviewerModel) return String(cfg.reviewerModel);
+  return "opus";
+}
+
+// ── Reading a lens back ─────────────────────────────────────────────────────────────────────────
+// Input is one `claude -p --output-format json` envelope. Every refusal below is a case that has
+// actually been observed, and each one fails CLOSED — a lens that cannot be read is INCOMPLETE.
+//
+// Shared by the discovery lenses and the verification pass, because the ways a shell-out can come back
+// unusable are a property of the shell-out, not of what it was asked to do. Splitting it in two is how
+// one of them ends up with three of the four checks.
+export function readClaudeEnvelope({ raw = null, label = "lens" } = {}) {
+  const bad = (refusal) => ({ ok: false, refusal, result: null, models: [], providers: [] });
+  const text = typeof raw === "string" ? raw.trim() : "";
+  if (!text) {
+    // The zero-byte file. `--allowedTools` is VARIADIC and swallows a trailing positional, so a prompt
+    // passed as an argument instead of on STDIN runs the reviewer with an EMPTY prompt and writes
+    // nothing. Observed end-to-end 2026-07-24.
+    return bad(`panel ${label}: the output file is EMPTY. The reviewer never ran, or the prompt was passed as an argument instead of on STDIN (\`--allowedTools\` is variadic and swallows a trailing positional). Re-run it.`);
+  }
+  let envelope;
+  try { envelope = JSON.parse(text); }
+  catch (err) { return bad(`panel ${label}: output is not the JSON envelope from \`claude -p --output-format json\` (${err instanceof Error ? err.message : String(err)}). A prose reply cannot be recorded as a gate.`); }
+  if (envelope?.is_error || (envelope?.subtype && envelope.subtype !== "success")) {
+    return bad(`panel ${label}: the run FAILED (subtype=${envelope?.subtype ?? "?"}, api_error_status=${envelope?.api_error_status ?? "none"}) — a failed pass is INCOMPLETE, never clean. Re-run it.`);
+  }
+  const result = typeof envelope?.result === "string" ? envelope.result.trim() : "";
+  if (!result) return bad(`panel ${label}: the run succeeded but returned an EMPTY result. Silence is INCOMPLETE, never clean — send it the ultimatum ("findings or INCOMPLETE") and re-run.`);
+
+  const models = [];
+  const providers = [];
+  const mu = envelope?.modelUsage;
+  if (mu && typeof mu === "object") {
+    for (const [model, u] of Object.entries(mu)) {
+      models.push(model);
+      if (u?.provider) providers.push(String(u.provider));
+    }
+  }
+  return { ok: true, refusal: null, result, models, providers };
+}
+
+export function parsePanelLensOutput({ raw = null, lens = null } = {}) {
+  const label = `lens ${lens ?? "?"}`;
+  const env = readClaudeEnvelope({ raw, label });
+  const bad = (refusal) => ({ ok: false, refusal, verdict: null, summary: null, findings: [], models: env.models, providers: env.providers });
+  if (!env.ok) return { ...bad(env.refusal), models: [], providers: [] };
+  const { models, providers, result } = env;
+
+  const parsed = extractJsonObject(result);
+  if (!parsed) {
+    return bad(`panel ${label}: no JSON verdict block in the reply — the lens answered in prose, so its verdict cannot be read. A verdict that cannot be read is INCOMPLETE, never clean.`);
+  }
+  const rawFindings = Array.isArray(parsed.findings) ? parsed.findings : [];
+  const findings = rawFindings.map((f) => ({
+    title: typeof f?.title === "string" ? f.title : null,
+    priority: Number.isFinite(Number(f?.priority)) ? Number(f.priority) : null,
+    confidence: Number.isFinite(Number(f?.confidence)) ? Number(f.confidence) : null,
+    file: typeof f?.file === "string" ? f.file : null,
+    line_start: Number.isFinite(Number(f?.line_start)) ? Number(f.line_start) : null,
+    line_end: Number.isFinite(Number(f?.line_end)) ? Number(f.line_end) : null,
+    evidence: typeof f?.evidence === "string" ? f.evidence : null,
+  }));
+  // A finding with no title cannot be referenced, adjudicated, or falsified — and an untitled entry in
+  // a blocker count is a number nobody can act on.
+  if (findings.some((f) => !f.title)) {
+    return bad(`panel ${label}: a finding has no \`title\`. Every finding must be referenceable by title — that is how it is later falsified or adjudicated.`);
+  }
+  const verdict = typeof parsed.verdict === "string" && parsed.verdict.trim()
+    ? parsed.verdict.trim()
+    : (findings.length ? "findings" : null);
+  if (!verdict) {
+    return bad(`panel ${label}: no \`verdict\` field and no findings to infer one from.`);
+  }
+  return {
+    ok: true,
+    refusal: null,
+    verdict,
+    summary: typeof parsed.summary === "string" ? parsed.summary : null,
+    findings,
+    models,
+    providers,
+  };
+}
+
+// The verification pass reads back through the SAME envelope checks and then a different body: it
+// returns falsifications, not findings. Kept separate from `parsePanelLensOutput` rather than
+// overloaded onto it, because a verify reply carrying a `findings` array is a verify pass that did the
+// wrong job, and silently accepting one would let phase 2 quietly re-open discovery on itself.
+export function parsePanelVerifyOutput({ raw = null } = {}) {
+  const env = readClaudeEnvelope({ raw, label: "verification pass" });
+  const bad = (refusal) => ({ ok: false, refusal, falsified: [], confirmed: [], unverified: [], models: env.models ?? [], providers: env.providers ?? [] });
+  if (!env.ok) return { ...bad(env.refusal), models: [], providers: [] };
+  const parsed = extractJsonObject(env.result);
+  if (!parsed) {
+    return bad("panel verification pass: no JSON block in the reply. A verification pass that cannot be read clears NOTHING — re-run it, or record the gate without it, in which case every discovered finding stands.");
+  }
+  const arr = (v) => (Array.isArray(v) ? v : []);
+  return {
+    ok: true,
+    refusal: null,
+    falsified: arr(parsed.falsified),
+    confirmed: arr(parsed.confirmed),
+    unverified: arr(parsed.unverified),
+    models: env.models,
+    providers: env.providers,
+  };
+}
+
+// Pull the verdict object out of a reply. Tries, in order: the whole reply as JSON, the LAST ```json
+// fence (models often narrate first and answer last), then the last balanced brace run. Returns null
+// rather than guessing — the caller treats null as INCOMPLETE.
+function extractJsonObject(text) {
+  const s = String(text ?? "");
+  const attempt = (candidate) => {
+    try {
+      const v = JSON.parse(candidate);
+      return v && typeof v === "object" && !Array.isArray(v) ? v : null;
+    } catch { return null; }
+  };
+  const whole = attempt(s.trim());
+  if (whole) return whole;
+  const fences = [...s.matchAll(/```(?:json)?\s*\n([\s\S]*?)```/g)].map((m) => m[1]);
+  for (let i = fences.length - 1; i >= 0; i -= 1) {
+    const v = attempt(fences[i].trim());
+    if (v) return v;
+  }
+  // Last resort: scan for a balanced object. Brace-counting rather than a regex, because findings
+  // strings routinely contain braces.
+  for (let start = s.indexOf("{"); start !== -1; start = s.indexOf("{", start + 1)) {
+    let depth = 0;
+    let inStr = false;
+    let esc = false;
+    for (let i = start; i < s.length; i += 1) {
+      const ch = s[i];
+      if (esc) { esc = false; continue; }
+      if (ch === "\\") { esc = true; continue; }
+      if (ch === '"') { inStr = !inStr; continue; }
+      if (inStr) continue;
+      if (ch === "{") depth += 1;
+      else if (ch === "}") {
+        depth -= 1;
+        if (depth === 0) {
+          const v = attempt(s.slice(start, i + 1));
+          if (v) return v;
+          break;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+// ── The union, and why it is a union ────────────────────────────────────────────────────────────
+// MAJORITY PRIORITIZES, NEVER ERASES. A finding raised by ONE lens is still a finding: the panel's
+// value comes from lenses that fail differently, so a 1-of-3 finding is the normal shape of the thing
+// that makes the panel worth running, not a weak signal to be voted down. Concurrence is not
+// corroboration — three reviewers that agree may simply share a blind spot.
+//
+// Priority: the MODE of the priorities the lenses assigned, EXCEPT that the blocker class is sticky —
+// if any lens called it priority ≤ 1, it stays ≤ 1. Otherwise a 2-vs-1 majority could downgrade a P1
+// to a P3 and delete it from the blocker count without ever falsifying it, which is erasure wearing
+// prioritization's clothes.
+export function unionPanelFindings(perLens = {}) {
+  const norm = (s) => String(s ?? "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+  const byKey = new Map();
+  for (const [lens, findings] of Object.entries(perLens)) {
+    for (const f of Array.isArray(findings) ? findings : []) {
+      // Same file + same line + same normalized title = the same defect seen twice. File+line alone
+      // would merge two unrelated defects on one line; the title alone would split one defect two
+      // lenses worded differently. Both is the compromise, and it errs toward SPLITTING — a duplicate
+      // in the set costs a reader a moment, a merged pair loses one lens's evidence.
+      const key = `${norm(f?.file)}::${f?.line_start ?? ""}::${norm(f?.title)}`;
+      const existing = byKey.get(key);
+      if (!existing) {
+        byKey.set(key, {
+          title: f?.title ?? null,
+          priority: f?.priority ?? null,
+          confidence: f?.confidence ?? null,
+          file: f?.file ?? null,
+          line_start: f?.line_start ?? null,
+          line_end: f?.line_end ?? null,
+          evidence: f?.evidence ?? null,
+          lenses: [lens],
+          priorities: { [lens]: f?.priority ?? null },
+        });
+        continue;
+      }
+      existing.lenses.push(lens);
+      existing.priorities[lens] = f?.priority ?? null;
+      if (!existing.evidence && f?.evidence) existing.evidence = f.evidence;
+      if (existing.confidence == null || (f?.confidence != null && f.confidence > existing.confidence)) {
+        existing.confidence = f?.confidence ?? existing.confidence;
+      }
+    }
+  }
+  const findings = [];
+  const dissent = [];
+  for (const entry of byKey.values()) {
+    const votes = Object.values(entry.priorities).filter((p) => Number.isFinite(Number(p))).map(Number);
+    let priority = entry.priority ?? null;
+    if (votes.length) {
+      const counts = new Map();
+      for (const v of votes) counts.set(v, (counts.get(v) ?? 0) + 1);
+      let best = votes[0];
+      for (const [v, n] of counts) {
+        const bn = counts.get(best) ?? 0;
+        // Tie goes to the MORE severe priority (the lower number) — the same fail-closed direction as
+        // the sticky-blocker rule below.
+        if (n > bn || (n === bn && v < best)) best = v;
+      }
+      priority = best;
+      const min = Math.min(...votes);
+      if (min <= 1 && priority > 1) priority = min;
+      if (new Set(votes).size > 1) {
+        dissent.push({ title: entry.title, file: entry.file, line_start: entry.line_start, priorities: { ...entry.priorities }, resolved_to: priority });
+      }
+    }
+    findings.push({
+      title: entry.title,
+      priority,
+      confidence: entry.confidence,
+      file: entry.file,
+      line_start: entry.line_start,
+      line_end: entry.line_end,
+      evidence: entry.evidence,
+      lenses: [...entry.lenses],
+      agreement: entry.lenses.length,
+    });
+  }
+  // Most severe first, so a truncated read still shows the blockers.
+  findings.sort((a, b) => (a.priority ?? 99) - (b.priority ?? 99) || String(a.file ?? "").localeCompare(String(b.file ?? "")));
+  return { findings, dissent };
+}
+
+// ── Falsification (phase 2) ─────────────────────────────────────────────────────────────────────
+// The ONLY way a discovered finding leaves the set without being fixed, other than a `gate_adjudication`
+// recorded by the orchestrator or the human operator. It requires POSITIVE evidence, checked here
+// rather than trusted: an entry whose evidence is empty or trivially short is refused, because
+// "falsified: true" with no proof is exactly the shape of a gate that grades itself clean.
+export const FALSIFY_MIN_EVIDENCE = 40;
+
+export function applyFalsifications({ findings = [], falsify = [] } = {}) {
+  const list = Array.isArray(findings) ? [...findings] : [];
+  const entries = Array.isArray(falsify) ? falsify : [];
+  if (!entries.length) return { ok: true, refusal: null, findings: list, falsified: [] };
+  const kept = [...list];
+  const falsified = [];
+  for (const entry of entries) {
+    const ref = entry?.ref ?? entry?.title ?? null;
+    const evidence = typeof entry?.evidence === "string" ? entry.evidence.trim() : "";
+    if (!evidence) {
+      return { ok: false, refusal: `review-panel --falsify: the entry for ${JSON.stringify(ref)} carries NO evidence. A finding dies only by POSITIVE falsification — a command that was run and what it returned. With no proof it belongs in \`unverified\`, and it stays in the set.`, findings: list, falsified: [] };
+    }
+    if (evidence.length < FALSIFY_MIN_EVIDENCE) {
+      return { ok: false, refusal: `review-panel --falsify: the evidence for ${JSON.stringify(ref)} is ${evidence.length} characters (${JSON.stringify(evidence)}). Positive falsification means naming the command you ran and what it returned; a ${FALSIFY_MIN_EVIDENCE}-character floor is the crudest possible check that something was actually run, and this does not clear it.`, findings: list, falsified: [] };
+    }
+    const idx = resolveGateFindingRef(ref, kept);
+    if (idx === -1) {
+      return { ok: false, refusal: `review-panel --falsify: ${JSON.stringify(ref)} matches no finding in the union. Reference a finding by its exact title or by #N (1-based) from the union file — a falsification that resolves to nothing would silently record as applied.`, findings: list, falsified: [] };
+    }
+    const [removed] = kept.splice(idx, 1);
+    falsified.push({ ...removed, falsified_by: entry?.by ?? null, evidence });
+  }
+  return { ok: true, refusal: null, findings: kept, falsified };
+}
+
+// The panel's `review_findings` event. Deliberately the SAME event type the codex gate writes, so
+// `ready`, `gateEvidenceLookup` and `gateBlockerCountVerdict` all apply unchanged — plus first-class
+// provenance, because "which model actually reviewed this" is the exact question DER-2293 was filed
+// about after an agent reported a review that had happened on the wrong model.
+export function reviewPanelEvent({
+  issueId, pr = null, sha, base = null, files = null, engine = "claude", model = null,
+  modelsObserved = [], providers = [], lensesRequested = [], lensesReturned = [], verdictPerLens = {},
+  findings = [], falsified = [], dissent = [], round = 1, actor = null, verified = false,
+} = {}) {
+  const list = Array.isArray(findings) ? findings : [];
+  const blockers = gateBlockerFindings({ findings: list }).length;
+  const ev = {
+    actor: actor ?? (issueId ? `lead:${issueId}` : "lead"),
+    type: "review_findings",
+    role: "reviewer",
+    reviewer: `panel:${engine}${model ? `/${model}` : ""}`,
+    gate_kind: "panel",
+    engine,
+    model,
+    // The models the runs ACTUALLY used, read from each lens's own `modelUsage`. The requested alias is
+    // a request; this is the measurement, and they have diverged in production.
+    models_observed: [...new Set(modelsObserved.filter(Boolean))],
+    providers: [...new Set(providers.filter(Boolean))],
+    // A panel is the PRIMARY gate now, not a stand-in for a bot that was down. `substitute` stays on the
+    // event as an explicit false so every existing reader (`gateProvenance`, `ready`, the board) keeps
+    // reading one field rather than inferring from the absence of one.
+    substitute: false,
+    lenses: lensesReturned,
+    lenses_requested: lensesRequested,
+    lenses_returned: lensesReturned,
+    verdict_per_lens: verdictPerLens,
+    // Derived, never asserted: clean means every lens returned AND no blocker survived verification.
+    verdict: blockers > 0 ? "blockers" : "clean",
+    confidence: null,
+    findings_total: list.length,
+    blockers,
+    findings: list,
+    falsified,
+    dissent,
+    verified: verified === true,
+    tokens_total: null,
+    sha,
+    base_sha: base ?? null,
+    files_reviewed: Array.isArray(files) ? files.length : null,
+    file_set: Array.isArray(files) ? files : null,
+    pr: pr == null ? null : Number(pr),
+    round,
+    ts: new Date().toISOString(),
+  };
+  if (issueId) ev.issue = issueId;
+  return ev;
+}
+
+// The copy-pasteable panel block for a brief. Kept here rather than inline in `renderBrief` so the
+// shell the lead actually runs is covered by the same tests as the rest of the gate.
+export function panelReviewCommands({ issueId = "<ISSUE>", model = "opus", runner = "node scripts/work-runner.mjs", runId = "<run>", runsRoot = "<runs-root>", base = "origin/main" } = {}) {
+  const t = (name) => `/tmp/${issueId}-panel-${name}`;
+  return [
+    `git diff ${base}...HEAD > ${t("diff")}`,
+    `SHA=$(git rev-parse HEAD)`,
+    ``,
+    `# 1. DISCOVERY — three lenses, three SEPARATE processes on the Claude subscription.`,
+    `#    Each prompt is rendered by the runner (path-routed to what this diff touches), so it is`,
+    `#    tested code rather than prose. Run them in the background together; they are independent.`,
+    `for LENS in ${PANEL_LENS_IDS.join(" ")}; do`,
+    `  ${runner} panel-prompt --issue ${issueId} --lens "$LENS" --diff ${t("diff")} > ${t('"$LENS".md')}`,
+    `  ${reviewShellCommand({ model, promptFile: t('"$LENS".md'), outFile: t('"$LENS".json') })} &`,
+    `done; wait`,
+    ``,
+    `# 2. UNION + VERIFY — record the discovery pass, then falsify by EXECUTION on a fresh context.`,
+    `#    \`--dry-run\` prints the union without writing an event, which is what the verify pass reads.`,
+    `${runner} review-panel --run ${runId} --runs-root ${runsRoot} --issue ${issueId} --sha $SHA --dry-run \\`,
+    `  ${PANEL_LENS_IDS.map((l) => `--lens-file ${l}=${t(`${l}.json`)}`).join(" \\\n  ")} > ${t("union.json")}`,
+    `${runner} panel-prompt --issue ${issueId} --lens verify --union ${t("union.json")} --diff ${t("diff")} > ${t("verify.md")}`,
+    reviewShellCommand({ model, promptFile: t("verify.md"), outFile: t("verify.json") }),
+    ``,
+    `# 3. RECORD the gate. This is the event the shepherd audits; without it \`ready\` blocks.`,
+    `${runner} review-panel --run ${runId} --runs-root ${runsRoot} --issue ${issueId} --sha $SHA --round 1 \\`,
+    `  ${PANEL_LENS_IDS.map((l) => `--lens-file ${l}=${t(`${l}.json`)}`).join(" \\\n  ")} \\`,
+    `  --verify-file ${t("verify.json")}`,
+  ].join("\n");
 }
 
 // ── Codex review gate (DER-2375) ────────────────────────────────────────────────────────────────
@@ -1329,9 +1941,13 @@ export function parseChecksOutput({ exitCode, stdout = "", stderr = "" } = {}) {
 // Wrapped rather than threaded through each of the nine returns below: every branch gets the same
 // provenance by construction, so a future branch cannot forget to carry it.
 export function gateProvenance(gate) {
-  if (!gate) return { substitute: false, engine: null, model: null, lenses: null, lenses_requested: null, sha: null, reviewer: null };
+  if (!gate) return { substitute: false, gate_kind: null, engine: null, model: null, lenses: null, lenses_requested: null, sha: null, reviewer: null };
   return {
     substitute: gate.substitute === true,
+    // DER-2360 — `panel` (the primary gate), `codex`, or whatever a producer stamped. Derived only when
+    // absent, and never guessed from `substitute`: a reader that infers "not a substitute ⇒ codex" would
+    // relabel every panel receipt as a bot review, which is the exact misattribution 1.4 was written for.
+    gate_kind: gate.gate_kind ?? (Array.isArray(gate.lenses) && gate.lenses.length ? (gate.substitute === true ? "substitute" : "panel") : null),
     engine: gate.engine ?? null,
     model: gate.model ?? null,
     lenses: Array.isArray(gate.lenses) ? gate.lenses : null,
@@ -1343,6 +1959,19 @@ export function gateProvenance(gate) {
 
 export function gateEvidenceVerdict(args = {}) {
   return { ...gateEvidenceVerdictCore(args), ...gateProvenance(args.gate) };
+}
+
+// ── DER-2360 — which verdict states mean "the gate looked at THIS tree" ─────────────────────────
+// The three states below are exactly the ones `gateEvidenceVerdictCore` reaches after establishing
+// `sha === head`. Deriving the answer from the STATE rather than re-comparing shas is deliberate:
+// `readyVerdict` is a pure function that never receives `head`, and threading it in just to redo a
+// comparison the verdict already made is how the two copies drift apart (the SQL-mirrors-a-validator
+// defect class, in JavaScript). `unstamped` and `stale-clean` are absent on purpose — an unstamped
+// receipt covers no tree at all, and a stale-clean one covers a tree that is no longer shipping.
+export const GATE_STATES_AT_HEAD = new Set(["current", "current-dirty", "adjudicated"]);
+
+export function gateCoversHead(gate = null) {
+  return GATE_STATES_AT_HEAD.has(gate?.state);
 }
 
 function gateEvidenceVerdictCore({ head, gate, adjudication = null, adjudicationRejected = null, unknown = null } = {}) {
@@ -1853,7 +2482,27 @@ export function readyVerdict({ draft, threads, onHead, checks, shardsPass, shard
   // The waiver converts "must be codex" into "must be some recorded adversarial review": the `gate`
   // check below is untouched and still refuses without a review_findings event covering the head, so a
   // waived run reviews exactly as hard — it just stops requiring that the reviewer be codex.
-  if (!onHead && !codexWaiver?.active) return { ready: false, why: "codex not on head" };
+  //
+  // DER-2360 — a RECEIPT AT HEAD clears it too, and this is now the ordinary path rather than the
+  // exception. The bot's per-PR auto-review was switched off on 2026-08-01, so `onHead` (which asks
+  // whether a codex COMMENT sits on the current head) is false on essentially every PR and stays false
+  // no matter what anyone does. That is the same shape as the codex-is-dead stall this hold already
+  // learned about, arriving through a different door: a condition no action satisfies is not a gate,
+  // it is a wedge, and an operator who meets one learns to route around the instrument that printed it.
+  //
+  // What replaces it is strictly narrower than a waiver, not looser: the local panel must have reviewed
+  // THIS EXACT TREE. A receipt one commit behind head does NOT clear it — `gateCoversHead` is false for
+  // `stale-clean`, so the ordinary "fix findings, push, forget to re-run" sequence still holds here, and
+  // holds with the specific reason rather than this generic one. `current-dirty` is included so the
+  // block below can name the open blockers instead of this line blaming an absent bot for them.
+  if (!onHead && !codexWaiver?.active && !gateCoversHead(gate)) {
+    return {
+      ready: false,
+      why: gate?.sha
+        ? `no review covering head (the recorded gate is at ${String(gate.sha).slice(0, 10)}, not this PR's head — re-run the adversarial panel on the current tree)`
+        : "no review covering head (no codex review on this head, and no adversarial-panel receipt for this tree — run the panel, or record one with `review-panel`)",
+    };
+  }
   const checksWaived = checks === "absent" && allowMergeWithoutChecks === true;
   if (checks !== "pass" && !checksWaived) return { ready: false, why: checksHold(checks, allowMergeWithoutChecks) };
   if (shardsTotal > 0 && shardsPass !== shardsTotal) return { ready: false, why: `db shards ${shardsPass}/${shardsTotal}` };
@@ -1872,11 +2521,17 @@ export function readyVerdict({ draft, threads, onHead, checks, shardsPass, shard
   if (!onHead && codexWaiver?.active) {
     notes.push(`gate=WAIVED (${codexWaiver.reason ?? "no reason recorded"}, expires ${codexWaiver.until})`);
   }
-  if (gate.substitute) {
-    const lensCount = Array.isArray(gate.lenses) ? gate.lenses.length : null;
-    notes.push(`gate=SUBSTITUTE (${gate.engine ?? "?"}${gate.model ? `/${gate.model}` : ""}` +
-      `${lensCount ? `, ${lensCount} lens${lensCount === 1 ? "" : "es"}: ${gate.lenses.join("/")}` : ""}` +
+  // DER-2360 — a PANEL and a SUBSTITUTE are different claims and the line must not conflate them. A
+  // substitute stood in for a codex run that could not happen; a panel IS the gate of record. Both are
+  // lens-shaped, so keying the label on `substitute` rather than on the presence of lenses is what keeps
+  // "the bot was down" from being printed over a run where the bot was simply not the reviewer.
+  if (Array.isArray(gate.lenses) && gate.lenses.length) {
+    const kind = gate.substitute ? "SUBSTITUTE" : "PANEL";
+    notes.push(`gate=${kind} (${gate.engine ?? "?"}${gate.model ? `/${gate.model}` : ""}` +
+      `, ${gate.lenses.length} lens${gate.lenses.length === 1 ? "" : "es"}: ${gate.lenses.join("/")}` +
       `${gate.sha ? `, sha ${String(gate.sha).slice(0, 9)}` : ""})`);
+  } else if (gate.substitute) {
+    notes.push(`gate=SUBSTITUTE (${gate.engine ?? "?"}${gate.model ? `/${gate.model}` : ""}${gate.sha ? `, sha ${String(gate.sha).slice(0, 9)}` : ""})`);
   }
   return { ready: true, why: notes.length ? `all gates pass (${notes.join("; ")})` : "all gates pass" };
 }
@@ -7568,7 +8223,7 @@ export function renderShepherdRotationBrief({ runId, instance, notes = null, ope
     lines.push("");
     lines.push(`Until ${waiver.until} — ${waiver.reason}`);
     lines.push("");
-    lines.push("`ready` will NOT hold on `codex not on head`. It STILL blocks any PR with no review_findings");
+    lines.push("`ready` will NOT hold for want of a codex review. It STILL blocks any PR with no review_findings");
     lines.push("covering its head: record substitute reviews with `review-swap` (3 distinct lenses). See the");
     lines.push("posture-C section of your SKILL.");
     lines.push("");
@@ -8129,7 +8784,16 @@ export async function runSubcommand(argv) {
         const cwdForReview = o.repoRoot ?? process.cwd();
         const review = parseCodexReview(payload, { repoRoot: cwdForReview });
         if (!o.log) {
-          throw new Error("review-usage: REFUSING to record a Codex review without --log <review.jsonl>; terminal producer evidence is mandatory");
+          // DER-2360 — the refusal STAYS (a gate that dies exits 0, so bare findings would manufacture
+          // 0-finding proof of a clean PR), but it now names the acceptance path instead of dead-ending.
+          // The adversarial panel IS findings-shaped with no codex JSONL, and before this it had no
+          // supported command at all: that gap is what made shepherd #4 hand-roll the substitute gate.
+          throw new Error(
+            "review-usage: REFUSING to record a Codex review without --log <review.jsonl>; terminal producer evidence is mandatory. " +
+            "If these findings came from the ADVERSARIAL PANEL rather than codex, record them with `review-panel` " +
+            "(--lens-file <lens>=<file.json>, repeatable) — it has its own completion evidence per lens, so it establishes " +
+            "the same fail-closed property instead of waiving this one. Posture-C substitutes still use `review-swap`.",
+          );
         }
         const logText = await readFile(o.log, "utf8").catch(() => "");
         // Fail closed on a dead gate (see `codexRunCompleted`).
@@ -8180,6 +8844,222 @@ export async function runSubcommand(argv) {
         : "";
       return { stdout: `${payload.result ?? ""}\n${warn}\n— recorded: ${Object.keys(ev.by_model).join(", ")}, ${ev.total_tokens.toLocaleString()} tokens, round ${ev.round} (${ev.billing})`, event: ev };
     }
+    case "panel-prompt": {
+      // DER-2360 — render ONE lens's prompt, path-routed to what this diff touches. The brief shells
+      // out to this rather than carrying the prompt text inline: prose in a brief is verified by
+      // nobody, and the last two review gates to lose their teeth lost them in their prompt (the
+      // anti-search line that neutered codex; the variadic-flag trap that ran a lens on an empty one).
+      const lensArg = (o.lens ?? [])[0] ?? o.lensName ?? null;
+      if (!lensArg) throw new Error(`panel-prompt needs --lens <${[...PANEL_LENS_IDS, "verify"].join("|")}>`);
+      const diffPath = o.diff ?? null;
+      let diffText = "";
+      if (diffPath) {
+        try { diffText = await readFile(resolvePath(diffPath), "utf8"); }
+        catch (err) { throw new Error(`panel-prompt --diff ${diffPath}: ${err instanceof Error ? err.message : String(err)}`); }
+      }
+      if (lensArg === "verify") {
+        return { stdout: panelVerifyPrompt({ issueId: o.issueId ?? null, unionFile: o.union ?? "<union.json>", diffFile: diffPath ?? "<diff>" }) };
+      }
+      // A prompt rendered from an EMPTY diff routes no repo-specific checklist at all, and reads exactly
+      // like one rendered from a diff that touches nothing sensitive. Refuse: the whole value of routing
+      // is that a migration gets asked about RLS, and a silently unrouted lens is the failure this
+      // command exists to prevent.
+      if (diffPath && !diffText.trim()) {
+        throw new Error(`panel-prompt --diff ${diffPath} is EMPTY — nothing to review, and an empty diff routes NO repo-specific checklist while rendering a prompt that looks complete. Write the diff first (\`git diff origin/main...HEAD > ${diffPath}\`) and confirm it is non-empty.`);
+      }
+      const paths = parseDiffPaths(diffText);
+      let acceptance = o.acceptance ?? null;
+      if (!acceptance && o.file) {
+        try { acceptance = await readFile(resolvePath(o.file), "utf8"); } catch { acceptance = null; }
+      }
+      return {
+        stdout: panelLensPrompt({
+          lens: lensArg, issueId: o.issueId ?? null, diffFile: diffPath ?? "<diff>",
+          paths, acceptance, base: o.base ?? "origin/main",
+        }),
+      };
+    }
+    case "codex-backstop": {
+      // DER-2360 — the on-demand codex backstop, as a supported command rather than a remembered recipe.
+      //
+      // The panel is the gate; codex is no longer in any brief. But `@codex review` on the PR and a local
+      // `codex exec` both remain live, and the shepherd runs one deliberately on a risk lane (auth / RLS /
+      // schema / money / migration) or to CALIBRATE the panel — `review-fidelity` scores panel-vs-bot, and
+      // it needs both to exist. Printing the command here keeps `codexReviewCommand`'s shim-avoidance and
+      // `--json` completion contract on a production path: an exported helper whose only caller is its own
+      // test is a helper that can rot green, which is the defect class this harness has already paid for.
+      const issueTag = o.issueId ?? "review";
+      const selfCmd = o.runnerCmd ?? `node ${fileURLToPath(import.meta.url)}`;
+      const bin = resolveCodexBin({ override: process.env.WORK_CODEX_BIN ?? null });
+      if (!bin?.bin) {
+        throw new Error(`codex-backstop: no usable \`codex\` on PATH${bin?.skipped?.length ? ` (skipped shim(s): ${bin.skipped.join(", ")})` : ""}${bin?.why ? ` — ${bin.why}` : ""}. This is UNKNOWN, not "codex is down": set WORK_CODEX_BIN to the real binary, or use the \`@codex review\` PR comment instead. Never invoke a bare \`codex\` — a cmux shim hangs at 0% CPU with output byte-identical to a quota wall.`);
+      }
+      return {
+        stdout: [
+          `# Local codex backstop for ${issueTag} — the panel is the GATE; this is the deliberate second opinion.`,
+          `# Run from the WORKTREE (it needs node_modules, or the test run is skipped and it goes blind).`,
+          `# Write the prompt first; the SEARCH MANDATE is the load-bearing part (2 commands/0 findings`,
+          `# diff-local, vs 21 commands/6 findings with it).`,
+          `${selfCmd} panel-prompt --issue ${issueTag} --lens correctness --diff /tmp/${issueTag}-panel-diff > /tmp/${issueTag}-codex-review.md`,
+          codexReviewCommand({
+            bin: bin.bin,
+            promptFile: `/tmp/${issueTag}-codex-review.md`,
+            outFile: `/tmp/${issueTag}-codex-review.json`,
+            logFile: `/tmp/${issueTag}-codex-review.jsonl`,
+            // Kept separate on purpose: mixing diagnostics into the JSONL destroys its typed evidence
+            // contract, and `codexRunCompleted` reads completion out of that stream.
+            errorFile: `/tmp/${issueTag}-codex-review.stderr.log`,
+          }),
+          `# Record it as an ADDITIONAL review_findings event (reviewer=codex), then score the panel against it:`,
+          `#   ${selfCmd} review-usage --run <r> --runs-root <p> --issue ${issueTag} --round 1 --reviewer codex --file /tmp/${issueTag}-codex-review.json --log /tmp/${issueTag}-codex-review.jsonl`,
+          `#   ${selfCmd} review-fidelity --run <r> --runs-root <p> --issue ${issueTag} --pr <n>`,
+        ].join("\n"),
+      };
+    }
+    case "review-panel": {
+      // DER-2360 — record the 3-lens adversarial panel as THE pre-PR gate.
+      //
+      // This is a sibling of `review-swap`, not a loosening of `review-usage`. `review-usage` refuses a
+      // findings-shaped payload with no codex JSONL carrying `turn.completed`, and that refusal is
+      // CORRECT and stays: a gate that dies exits 0, so accepting bare findings there would let a dead
+      // codex run manufacture 0-finding "proof" of a clean PR. The panel gets its own acceptance path
+      // with its own completion evidence — every lens's `claude -p` envelope must show a successful run
+      // AND a readable verdict — so the same fail-closed property is established rather than waived.
+      if (!runDir) throw new Error("review-panel needs --run <id>");
+      if (!o.issueId) throw new Error("review-panel needs --issue <DER-id> — the gate is recorded against a unit");
+      const shaBad = gateShaRefusal(o.sha, { command: "review-panel", required: true });
+      if (shaBad) throw new Error(shaBad);
+      const specs = o.lensFile ?? [];
+      if (!specs.length) throw new Error(`review-panel needs --lens-file <lens>=<file.json> (repeatable) — the \`claude -p --output-format json\` output of each lens. Suggested panel: ${PANEL_LENS_IDS.join(", ")}.`);
+
+      const requested = [];
+      const perLens = {};
+      const verdictPerLens = {};
+      const modelsObserved = [];
+      const providers = [];
+      const refusals = [];
+      for (const spec of specs) {
+        const eq = String(spec).indexOf("=");
+        if (eq === -1) throw new Error(`review-panel --lens-file ${JSON.stringify(spec)}: expected <lens>=<file.json>. Binding a file to its lens by name is what keeps a panel auditable — positional order mislabels lenses that finish out of order.`);
+        const lens = String(spec).slice(0, eq).trim();
+        const file = String(spec).slice(eq + 1).trim();
+        if (!lens || !file) throw new Error(`review-panel --lens-file ${JSON.stringify(spec)}: expected <lens>=<file.json>`);
+        if (requested.includes(lens)) throw new Error(`review-panel: lens ${JSON.stringify(lens)} was given twice. Redundant reviewers CONCUR — on #1183 the repro lens refuted the security lens and was right; three of the same lens would have agreed and deleted live code.`);
+        requested.push(lens);
+        let raw = null;
+        try { raw = await readFile(resolvePath(file), "utf8"); }
+        catch (err) { refusals.push(`${lens}: cannot read ${file} — ${err instanceof Error ? err.message : String(err)}`); continue; }
+        const parsed = parsePanelLensOutput({ raw, lens });
+        if (!parsed.ok) { refusals.push(parsed.refusal); continue; }
+        perLens[lens] = parsed.findings;
+        verdictPerLens[lens] = { verdict: parsed.verdict, findings: parsed.findings.length, summary: parsed.summary };
+        modelsObserved.push(...parsed.models);
+        providers.push(...parsed.providers);
+      }
+      if (requested.length < PANEL_MIN_LENSES) {
+        throw new Error(`review-panel: ${requested.length} lens given; the panel needs at least ${PANEL_MIN_LENSES} DISTINCT lenses (suggested: ${PANEL_LENS_IDS.join(", ")}). A single reviewer is a self-review with extra steps.`);
+      }
+      // A silent or failed lens is INCOMPLETE, never clean — the same rule `review-swap` enforces, and
+      // for the same reason: recording 2-of-3 as a full panel is precisely the 0-finding-reads-as-CLEAN
+      // failure the codex gate's own refusal exists to prevent.
+      if (refusals.length) {
+        throw new Error([
+          `review-panel: REFUSING to record — ${refusals.length} of ${requested.length} lens(es) did not return a readable verdict.`,
+          ...refusals.map((r) => `  - ${r}`),
+          "",
+          "A silent lens is INCOMPLETE, never clean. Send it the ultimatum (\"send your findings now, or send INCOMPLETE\") and re-run:",
+          "a subagent or shell-out that returned nothing is usually alive and truncating, not dead.",
+        ].join("\n"));
+      }
+      const returned = Object.keys(perLens);
+      const union = unionPanelFindings(perLens);
+
+      // `--dry-run` prints the union WITHOUT writing an event. That is what the verification pass reads,
+      // so the phase-2 prompt sees exactly the set phase 1 produced.
+      if (o.dryRun) {
+        return { stdout: JSON.stringify({ issue: o.issueId, sha: o.sha, lenses: returned, findings: union.findings, dissent: union.dissent }, null, 2) };
+      }
+
+      // Phase 2 — falsification. Entries may arrive from the verify shell-out (`--verify-file`, a
+      // `claude -p` envelope) or as a plain JSON file (`--falsify`).
+      let falsifyEntries = [];
+      let verified = false;
+      if (o.verifyFile) {
+        let vraw = null;
+        try { vraw = await readFile(resolvePath(o.verifyFile), "utf8"); }
+        catch (err) { throw new Error(`review-panel --verify-file ${o.verifyFile}: ${err instanceof Error ? err.message : String(err)}`); }
+        const parsedVerify = parsePanelVerifyOutput({ raw: vraw });
+        if (!parsedVerify.ok) {
+          throw new Error(`${parsedVerify.refusal}\n\nA verification pass that cannot be read does NOT clear anything. Re-run it, or record the gate without --verify-file: every discovered finding then stands, which is the correct fail-closed answer.`);
+        }
+        falsifyEntries = parsedVerify.falsified;
+        verified = true;
+        modelsObserved.push(...parsedVerify.models);
+        providers.push(...parsedVerify.providers);
+      }
+      if (o.falsify) {
+        let fraw = null;
+        try { fraw = JSON.parse(await readFile(resolvePath(o.falsify), "utf8")); }
+        catch (err) { throw new Error(`review-panel --falsify ${o.falsify}: ${err instanceof Error ? err.message : String(err)}`); }
+        falsifyEntries = falsifyEntries.concat(Array.isArray(fraw) ? fraw : (Array.isArray(fraw?.falsified) ? fraw.falsified : []));
+        verified = true;
+      }
+      const applied = applyFalsifications({ findings: union.findings, falsify: falsifyEntries });
+      if (!applied.ok) throw new Error(applied.refusal);
+
+      // The file set the gate covered. Non-fatal: a bare checkout or a non-git cwd leaves it null,
+      // which reads as "not recorded" rather than as "no files".
+      let fileSet = null;
+      if (o.base || o.diff) {
+        if (o.diff) {
+          try { fileSet = parseDiffPaths(await readFile(resolvePath(o.diff), "utf8")); } catch { fileSet = null; }
+        } else {
+          const res = await runCommand({ command: "git", args: ["diff", "--name-only", `${o.base}...HEAD`], cwd: o.repoRoot ?? process.cwd() }).catch(() => null);
+          if (res?.exitCode === 0) fileSet = String(res.stdout ?? "").split("\n").map((l) => l.trim()).filter(Boolean);
+        }
+      }
+
+      const ev = reviewPanelEvent({
+        issueId: o.issueId, pr: o.pr ?? null, sha: o.sha, base: o.base ?? null, files: fileSet,
+        engine: o.engine ?? "claude", model: o.model ?? null,
+        modelsObserved, providers,
+        lensesRequested: requested, lensesReturned: returned, verdictPerLens,
+        findings: applied.findings, falsified: applied.falsified, dissent: union.dissent,
+        round: Number.isFinite(Number(o.round)) ? Number(o.round) : 1,
+        actor: o.actor ?? null, verified,
+      });
+      await appendEvent(runDir, ev);
+
+      const lensLine = returned.map((l) => `${l}=${verdictPerLens[l].verdict}(${verdictPerLens[l].findings})`).join(" ");
+      // The endpoint check is the DER-2293 question asked of the measurement rather than the request:
+      // `provider: "firstParty"` means the lens reached Anthropic directly (the subscription). Anything
+      // else means the panel leaked onto a metered endpoint — which is the exact failure the shell-out
+      // exists to prevent, and it must be loud rather than inferred later from a bill.
+      const offEndpoint = ev.providers.length && !ev.providers.every((p) => p === "firstParty");
+      const lines = [
+        `review-panel recorded for ${o.issueId}${o.pr ? ` (PR #${o.pr})` : ""} — PRIMARY gate, engine=${ev.engine}${ev.model ? `/${ev.model}` : ""}`,
+        `  sha ${o.sha}${ev.files_reviewed == null ? "" : `  ·  ${ev.files_reviewed} file(s)`}`,
+        `  lenses ${returned.length}/${requested.length}: ${lensLine}`,
+        `  models actually used: ${ev.models_observed.length ? ev.models_observed.join(", ") : "UNKNOWN (no modelUsage in the envelope)"}`,
+        `  findings ${ev.findings_total} (blockers ${ev.blockers})${ev.falsified.length ? `, ${ev.falsified.length} falsified with evidence` : ""}${ev.dissent.length ? `, ${ev.dissent.length} priority dissent(s) recorded` : ""} → verdict ${ev.verdict}`,
+      ];
+      if (!verified) {
+        lines.push("  ⚠ NO verification pass was recorded (--verify-file / --falsify). Every discovered finding stands.");
+      }
+      if (offEndpoint) {
+        lines.push(`  ⚠ providers=${ev.providers.join(",")} — this panel did NOT ride the Claude subscription. Unset ANTHROPIC_BASE_URL/AUTH_TOKEN/API_KEY on the lens shell-outs and re-run.`);
+      }
+      lines.push(
+        ev.blockers > 0
+          ? "  `ready` will REFUSE this PR until the blockers are fixed and the panel re-run on the new head, or an orchestrator records a gate_adjudication naming each one."
+          : "  `ready` accepts this receipt as the review gate while the PR head equals this sha; a push moves the head and the receipt goes stale.",
+      );
+      for (const f of ev.findings.slice(0, 20)) {
+        lines.push(`  P${f.priority ?? "?"} [${(f.lenses ?? []).join("+") || "?"}] ${f.file ?? "?"}:${f.line_start ?? "?"}  ${f.title}`);
+      }
+      return { event: ev, stdout: lines.join("\n") };
+    }
+
     case "review-swap": {
       // 1.1 — record a SUBSTITUTE adversarial review (posture C: codex bot down AND `codex exec` down).
       //
@@ -8243,7 +9123,9 @@ export async function runSubcommand(argv) {
         event: ev,
         stdout: [
           `codex gate WAIVED until ${ev.until} — ${ev.reason}`,
-          "  `ready` will stop holding on `codex not on head` and print gate=WAIVED instead.",
+          "  `ready` will stop holding for want of a codex review and print gate=WAIVED instead.",
+          "  (Since DER-2360 an adversarial-panel receipt AT HEAD already clears that hold on its own,",
+          "   so this waiver is only needed where no local gate ran at all.)",
           "  THE WAIVER DOES NOT WAIVE EVIDENCE: `ready` still refuses any PR with no review_findings",
           "  event covering its head. Record substitute reviews with `review-swap` (3 distinct lenses).",
           "  It expires by construction — after that, `ready` holds again until it is re-issued.",
@@ -9339,7 +10221,7 @@ export async function runSubcommand(argv) {
       const waiverLine = readyCodexWaiver.active
         ? `⚠ codex gate WAIVED until ${readyCodexWaiver.until} — ${readyCodexWaiver.reason}. Evidence is NOT waived: a PR with no review_findings covering its head still blocks.`
         : readyCodexWaiver.expired
-          ? `codex waiver EXPIRED (${readyCodexWaiver.until}) — the \`codex not on head\` hold is live again; re-issue with waive-codex-gate or restore the gate.`
+          ? `codex waiver EXPIRED (${readyCodexWaiver.until}) — the review-coverage hold is live again unless a panel receipt covers the head; re-issue with waive-codex-gate or run the panel.`
           : null;
       const header = `merge mode: ${resolvedMode.mode ?? "UNRESOLVED"} (${resolvedMode.source}) — ${resolvedMode.why}${mergePolicy.allowMergeWithoutChecks ? "  [repo.allowMergeWithoutChecks=true: waives checks=ABSENT only (gh answered \"no checks on this branch\"); fail, pending and UNKNOWN all still block]" : ""}`;
       const text = [header, ...(waiverLine ? [waiverLine] : []), ...results.map((r) => readyLine(r))].join("\n");
@@ -10015,9 +10897,9 @@ Subcommands:
   spawn-lead --run <r> <DER-id> --worktree <p> [--bundle DER-x,DER-y] [--kickback n] [--model opus] [--lead-type claude|kimi|gpt|dsv4] [--dry-run]
 
 Lead types: pass the SAME --lead-type to write-brief AND spawn-lead. The brief then names the type's
-concrete per-slot models, and a type whose reviewer slot is a different vendor than its lead model
-(dsv4: deepseek implements, anthropic/claude-opus-5 reviews) renders the mandatory pre-hand-off
-external-review gate. Non-Claude types are host-local only.
+concrete per-slot models. EVERY type renders the mandatory 3-lens adversarial review panel (DER-2360);
+the shell-out model comes from the type's 'panelModel', else a subscription-billed 'reviewerModel',
+else 'opus'. Non-Claude types are host-local only.
 
 Bundling: --bundle names the EXTRA issues one lead ships in the SAME worktree/branch/PR (SKILL.md §2
 "Bundling"). The positional <DER-id> stays the PRIMARY id that keys every ledger event; the brief
@@ -10123,6 +11005,31 @@ Design: the README's context-rotation section.
         [--pull-hosts auto|<csv>]             each ~45s, tail these mini hosts' ledgers into the canonical one
         [--reconcile-merged]                  each ~45s, fold 'gh pr list --state merged' truth in (reap out-of-band merges)
         [--reconcile-pr-events]               each ~45s, fold cloud draft-PR lifecycle in + refresh links.md (cloud runs)
+  panel-prompt --lens <correctness|security|repro|verify> [--issue ID] [--diff <file>] [--union <file>]
+              [--acceptance <text>] [--base <ref>]
+                                              render ONE lens's adversarial-review prompt (DER-2360), path-routed
+                                              to the repo-specific checklists the diff's files trigger. Print it
+                                              to a file and feed it to the lens shell-out on STDIN — never as a
+                                              trailing argument ('--allowedTools' is variadic and swallows it,
+                                              producing an empty review and a zero-byte output file).
+  review-panel --run <r> --issue <ID> [--pr <n>] --sha <40-char> \
+              --lens-file <lens>=<file.json> (x2+) [--verify-file <f>] [--falsify <f>] [--base <ref>]
+              [--diff <file>] [--round n] [--model <id>] [--dry-run]
+                                              THE pre-PR gate. Reads each lens's 'claude -p --output-format json'
+                                              envelope, unions the findings, and writes ONE review_findings event
+                                              with gate_kind=panel + models_observed (the model that ACTUALLY ran,
+                                              read from modelUsage — DER-2293), so 'ready' prints gate=PANEL.
+                                              FAILS CLOSED: refuses a lens that failed, went silent, answered in
+                                              prose, or was named twice; refuses <2 lenses or a short --sha.
+                                              Majority prioritizes but NEVER erases — the blocker class is sticky,
+                                              and a blocker dies only by positive falsification (evidence checked,
+                                              not trusted) or a gate_adjudication. --dry-run prints the union
+                                              without writing, which is what the verification pass reads.
+  codex-backstop [--issue ID]                 print the LOCAL 'codex exec' second-opinion command. The panel is
+                                              the gate; this is the deliberate backstop for a risk lane (auth /
+                                              RLS / schema / money / migration) or for calibrating the panel with
+                                              review-fidelity. Refuses a shim or an unresolvable binary — a bare
+                                              'codex' can hang at 0% CPU indistinguishably from a quota wall.
   review-swap --run <r> --issue <ID> [--pr <n>] --sha <40-char> \
               [--engine claude] [--model <id>] --lens <name> (x2+) --verdicts <file.json>
                                               POSTURE C: record a SUBSTITUTE adversarial review when codex is
@@ -10135,8 +11042,8 @@ Design: the README's context-rotation section.
                                               as 1-of-3 and can never render as a full swap.
                                               NEVER hand-write a review_findings event: the ledger is append-only.
   waive-codex-gate --run <r> --reason <text> --until <iso8601>
-                                              stop 'ready' holding forever on 'codex not on head' when codex is
-                                              dead. Appends codex_gate_waived → state.codex_waiver, surfaced on
+                                              stop 'ready' holding on the review-coverage check when codex is
+                                              dead AND no panel receipt exists. Appends codex_gate_waived → state.codex_waiver, surfaced on
                                               every watch wake. --until is REQUIRED (a waiver must expire by
                                               construction). IT DOES NOT WAIVE EVIDENCE: 'ready' still blocks any
                                               PR with no review_findings covering its head — it converts
