@@ -31,6 +31,9 @@ import {
   parseLensVerdicts, reviewSwapEvent, gateShaRefusal, codexWaiverFrom, gateBlockerCountVerdict,
   parsePanelLensOutput, parsePanelVerifyOutput, unionPanelFindings, applyFalsifications,
   pathRoutedChecklists, panelLensPrompt, panelVerifyPrompt, parseDiffPaths, PANEL_LENS_IDS,
+  panelReviewCommands, panelCrossVendorPrompt, crossVendorPassCommands, crossVendorAttestation,
+  latestCrossVendorAttestation, crossVendorLabel, classifyCodexProbe,
+  CROSS_VENDOR_LENS, CROSS_VENDOR_HEADING, CROSS_VENDOR_ROUND,
   reapRefusal, reapLeakGuidance, actorInstance, parseActorInstance, renderShepherdRotationBrief,
   stalenessCommand, stalenessVerdict, usageFloorNotes, parseSwapUsage, swapVerdict, sleepGapDetected,
   isMdnsHostName, tailscaleSees,
@@ -10211,11 +10214,22 @@ test("DER-2360 review-panel (CLI): records the gate, and REFUSES a panel that di
       () => runSubcommand(["review-panel", "--run", runId, "--runs-root", root, "--issue", "DER-1", "--sha", "abc123def", ...lensArgs(good)]),
       /40-char/,
     );
+    // MUST-FAIL 5 (DER-3011) — a ROUND-1 receipt that is SILENT about the cross-vendor pass. Round 1 is
+    // the only round where a second vendor pays, so a receipt that says neither "codex ran" nor "codex
+    // was walled, here is the probe output" is the one shape nobody can audit after the fact.
+    await assert.rejects(
+      () => runSubcommand(["review-panel", "--run", runId, "--runs-root", root, "--issue", "DER-1", "--sha", SHA, ...lensArgs(good)]),
+      /round 1 is the FIRST complete diff/,
+      "a round-1 receipt must attest the cross-vendor pass, one way or the other",
+    );
     // Nothing above may have left a trace: a refused gate that still appends is worse than no gate.
     assert.equal((await readEvents(join(root, runId))).filter((e) => e.type === "review_findings").length, 0, "a refused panel must append NOTHING");
 
     // CONTROL — the real thing records, and the event satisfies every contract a codex gate event does.
-    const out = await runSubcommand(["review-panel", "--run", runId, "--runs-root", root, "--issue", "DER-1", "--sha", SHA, "--pr", "1200", ...lensArgs(good)]);
+    // The waiver is what makes this a round-1 receipt: it is the DEGRADED path (codex quota-walled) and
+    // it must never block, only be recorded.
+    const WAIVED = "codex quota wall — probe output: You've hit your usage limit until Aug 4th, 2026";
+    const out = await runSubcommand(["review-panel", "--run", runId, "--runs-root", root, "--issue", "DER-1", "--sha", SHA, "--pr", "1200", ...lensArgs(good), "--codex-waived", WAIVED]);
     const ev = out.event;
     assert.equal(ev.type, "review_findings", "the panel writes the SAME event type every reader already understands");
     assert.equal(ev.gate_kind, "panel");
@@ -10227,11 +10241,18 @@ test("DER-2360 review-panel (CLI): records the gate, and REFUSES a panel that di
     assert.equal(gateBlockerCountVerdict(ev).ok, true, "the count must be derivable from the event's own findings (DER-2837) or `ready` refuses it");
     assert.match(out.stdout, /models actually used: claude-opus-5/);
     assert.match(out.stdout, /NO verification pass was recorded/, "an unverified panel must say so — every finding stands");
+    // DER-3011 — the waiver lands ON the receipt with its reason, and `review-panel` says out loud that
+    // this PR got one reviewer rather than two.
+    assert.equal(out.event.cross_vendor.status, "waived");
+    assert.equal(out.event.cross_vendor.round, 1);
+    assert.equal(out.event.cross_vendor.reason, WAIVED);
+    assert.match(out.stdout, /xvendor=CODEX WAIVED at round 1 — codex quota wall/);
+    assert.match(out.stdout, /ONE reviewer, not two/);
 
     // A panel that leaked onto a metered endpoint must say so LOUDLY: the shell-out exists to prevent
     // exactly that, and a bill is a bad way to find out.
     const metered = await write("m.json", lensEnvelope(CLEAN_LENS, { model: "deepseek/deepseek-v4-flash", provider: "openrouter" }));
-    const leaked = await runSubcommand(["review-panel", "--run", runId, "--runs-root", root, "--issue", "DER-2", "--sha", SHA, ...lensArgs({ ...good, repro: metered })]);
+    const leaked = await runSubcommand(["review-panel", "--run", runId, "--runs-root", root, "--issue", "DER-2", "--sha", SHA, ...lensArgs({ ...good, repro: metered }), "--codex-waived", WAIVED]);
     assert.match(leaked.stdout, /did NOT ride the Claude subscription/);
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -10248,7 +10269,10 @@ test("DER-2360 review-panel --verify-file: falsification needs evidence, and cle
       correctness: await write("c.json", lensEnvelope(CLEAN_LENS)),
       security: await write("s.json", lensEnvelope(P1_LENS)),
     };
-    const lensArgs = Object.entries(files).flatMap(([l, f]) => ["--lens-file", `${l}=${f}`]);
+    // DER-3011 — every round-1 receipt must attest the cross-vendor pass; these cases are about
+    // falsification, so they take the waiver (the degraded path) and keep their own subject.
+    const lensArgs = [...Object.entries(files).flatMap(([l, f]) => ["--lens-file", `${l}=${f}`]),
+      "--codex-waived", "codex quota wall — probe output: You've hit your usage limit until Aug 4th"];
     const verifyEnvelope = (body) => JSON.stringify({
       type: "result", subtype: "success", is_error: false, result: `falsified: 1 of 1\n\n\`\`\`json\n${JSON.stringify(body)}\n\`\`\``,
       modelUsage: { "claude-opus-5": { inputTokens: 1, outputTokens: 1, provider: "firstParty" } },
@@ -10323,4 +10347,633 @@ test("DER-2360 ready: an adversarial receipt AT HEAD satisfies the review hold; 
   const sub = readyVerdict({ ...base, gate: gateEvidenceVerdict({ head: HEAD, gate: { ...panelAt(HEAD), substitute: true, gate_kind: null } }) });
   assert.equal(sub.ready, true);
   assert.match(sub.why, /gate=SUBSTITUTE/);
+});
+
+// ---- DER-3011: the round-1 cross-vendor codex pass ----
+
+// A codex `--json` JSONL stream. Built from the shape `codexRunCompleted` actually parses, because the
+// whole point of the provenance rule is that the RUN completed — a fixture that invents its own event
+// names would prove the parser handles a format codex does not emit.
+const codexJsonl = ({ turnCompleted = true, commands = 2 } = {}) => [
+  ...Array.from({ length: commands }, () => JSON.stringify({ type: "item.completed", item: { type: "command_execution", command: "rg -n foo" } })),
+  ...(turnCompleted ? [JSON.stringify({ type: "turn.completed", usage: { input_tokens: 100, output_tokens: 50 } })] : []),
+].join("\n");
+
+// The object `codex exec --output-schema … --output-last-message` writes (see codex-review-schema.json).
+const codexPayload = (findings = []) => ({
+  overall_correctness: findings.some((f) => (f.priority ?? 9) <= 1) ? "patch is incorrect" : "patch is correct",
+  overall_explanation: "cross-vendor pass",
+  overall_confidence_score: 0.8,
+  findings: findings.map((f) => ({
+    title: f.title, body: f.body ?? "the command I ran and what it returned, at length",
+    confidence_score: f.confidence ?? 0.8, priority: f.priority ?? 1,
+    code_location: { absolute_file_path: f.file ?? "packages/db/src/x.ts", line_range: { start: f.line ?? 42, end: (f.line ?? 42) + 2 } },
+  })),
+});
+
+test("DER-3011 classifyCodexProbe: judge the TEXT — and NO OUTPUT is UNKNOWN, never 'codex is down'", () => {
+  // Every row below is a signature this harness has actually met. The pairing matters: without the OK
+  // control at the end, a classifier that returned `walled` unconditionally would pass every must-fail.
+  const cases = [
+    [{ output: "You've hit your usage limit. Try again after Aug 4th, 2026 11:22 PM." }, "walled"],
+    [{ output: "stream error: 401 invalid_refresh_token" }, "unauthenticated"],
+    [{ output: "" }, "unknown"],
+    [{ output: "   \n  " }, "unknown"],
+    [{ output: "error: unexpected argument '--nope' found" }, "failed"],
+  ];
+  for (const [args, expected] of cases) {
+    const v = classifyCodexProbe({ bin: "/usr/local/bin/codex", ...args });
+    assert.equal(v.status, expected, `${JSON.stringify(args.output)} must classify as ${expected}`);
+    assert.equal(v.ok, false);
+    // Every failing verdict must hand over a usable waiver reason — an operator asked to compose one
+    // writes "n/a", which is exactly what the waiver floor refuses.
+    assert.ok(v.waiverReason && v.waiverReason.length >= 12, `a ${expected} verdict must print a paste-ready waiver reason`);
+  }
+  // A 401 body that happens to contain the word OK must still read as 401: the failure signatures are
+  // checked FIRST precisely because `\bOK\b` is loose enough for an error message to satisfy it.
+  assert.equal(classifyCodexProbe({ bin: "/x/codex", output: "OK, but: 401 invalid_refresh_token" }).status, "unauthenticated");
+  // An UNRESOLVABLE binary is not a verdict about codex at all — a shim's hang is byte-identical to a
+  // quota wall, so the probe that could not run must not become the probe that ran and failed.
+  const noBin = classifyCodexProbe({ bin: null, why: "the only codex on PATH is a shim" });
+  assert.equal(noBin.status, "unknown");
+  assert.match(noBin.detail, /UNKNOWN, not "codex is down"/);
+
+  // CONTROLS — the two shapes a healthy run produces. `exitCode: 0` is part of the shape now: the probe
+  // passes `--json`, so `turn.completed` is the primary evidence and a bare "OK" counts only under a
+  // clean exit (the exit-code test below is why).
+  assert.equal(classifyCodexProbe({ bin: "/x/codex", output: '{"type":"turn.completed"}', exitCode: 0 }).ok, true);
+  assert.equal(classifyCodexProbe({ bin: "/x/codex", output: "codex\nOK\n", exitCode: 0 }).ok, true);
+});
+
+test("DER-3011 classifyCodexProbe: a NONZERO EXIT is never healthy, whatever the output says", () => {
+  // Every row here is a shape the pre-remediation probe called HEALTHY. Root cause: it spawned without
+  // `--json`, so `turn.completed` was unreachable and `\bOK\b` decided success ALONE — over a prompt
+  // that literally asks the model to reply "OK". That word appears in error text too.
+  const brokenButHealthyLooking = [
+    ["OK then a 500 stream error", "OK\nstream error: unexpected status 500 Internal Server Error"],
+    ["OK then model-not-found", "OK\nerror: model not found"],
+    ["an error containing the word OK", "error: the OK button not available in this mode"],
+    ["the 120s SIGKILL path, mid-thought", "thinking... OK so far"],
+    ["plain OK, but the process failed", "OK"],
+  ];
+  for (const [why, output] of brokenButHealthyLooking) {
+    const v = classifyCodexProbe({ bin: "/x/codex", output, exitCode: 1 });
+    assert.equal(v.ok, false, `must NOT read as healthy: ${why}`);
+    assert.match(v.detail, /nonzero exit is never a healthy probe/i, "the reason must name the exit, so an operator knows what to look at");
+    assert.ok(v.waiverReason, "a failing verdict still hands over a paste-ready waiver reason");
+  }
+  // 🔴 THE PAIRING THAT MAKES THE ROWS ABOVE MEAN SOMETHING — identical text, different exit. Before
+  // the fix these were the same verdict, which is exactly what made the probe a check that could not fail.
+  assert.equal(classifyCodexProbe({ bin: "/x/codex", output: "OK", exitCode: 0 }).ok, true);
+  assert.equal(classifyCodexProbe({ bin: "/x/codex", output: "OK", exitCode: 1 }).ok, false);
+
+  // A REAL verdict still outranks the exit code: a wall and an expired credential both exit nonzero,
+  // and collapsing them into a generic failure would lose the one detail that names the fix.
+  assert.equal(classifyCodexProbe({ bin: "/x/codex", output: "You've hit your usage limit.", exitCode: 1 }).status, "walled");
+  assert.equal(classifyCodexProbe({ bin: "/x/codex", output: "401 invalid_refresh_token", exitCode: 1 }).status, "unauthenticated");
+
+  // An UNKNOWN exit is not a clean one. `\bOK\b` is the very word this probe's prompt asks for, so with
+  // no exit status to corroborate it there is no positive evidence at all — whereas `turn.completed` is
+  // the PRODUCER's own completion record and stands alone. (A mutation run caught this pair missing:
+  // deleting the `&& exitCode === 0` clause changed nothing observable, i.e. it was unpinned code.)
+  assert.equal(classifyCodexProbe({ bin: "/x/codex", output: "OK" }).ok, false, "an unknown exit plus the word the prompt asked for is not evidence");
+  assert.equal(classifyCodexProbe({ bin: "/x/codex", output: '{"type":"turn.completed"}' }).ok, true, "…but the producer's own completion record is");
+
+  // The verdict must NAME which marker decided it. Reporting one answer for both would hide the case
+  // that matters operationally: `--json` silently not taking effect on a host, which drops the probe
+  // back onto the weak marker this whole test exists to remove.
+  const strong = classifyCodexProbe({ bin: "/x/codex", output: '{"type":"turn.completed"}', exitCode: 0 });
+  const weak = classifyCodexProbe({ bin: "/x/codex", output: "OK", exitCode: 0 });
+  assert.equal(strong.ok, weak.ok, "both are passes…");
+  assert.notEqual(strong.detail, weak.detail, "…but they must not report the SAME evidence");
+  assert.match(strong.detail, /turn\.completed seen/);
+  assert.match(weak.detail, /NO turn\.completed in the stream/);
+  assert.match(weak.detail, /--json/, "and it must name the thing to go check");
+});
+
+test("DER-3011 crossVendorAttestation: findings WITHOUT the JSONL are refused; a round-1 receipt cannot be silent", () => {
+  const live = codexJsonl();
+  const findings = [{ title: "Sibling entry point missed the guard", priority: 1, file: "a.ts", line_start: 1, line_end: 2 }];
+
+  // 🔴 MUST-FAIL — the control this whole attestation exists for. A codex run that dies EXITS 0 and
+  // writes no final message, so findings alone cannot distinguish "reviewed and found nothing" from
+  // "never ran" — and the second reads as a CLEAN second opinion, the one direction nobody audits.
+  const noLog = crossVendorAttestation({ round: 1, findings });
+  assert.equal(noLog.ok, false);
+  assert.match(noLog.refusal, /--codex-review without --codex-log/);
+  assert.equal(noLog.attestation, null, "a refused attestation must produce nothing to record");
+
+  // MUST-FAIL — a JSONL with no producer `turn.completed`. Same predicate `review-usage` gates on.
+  const dead = crossVendorAttestation({ round: 1, logPath: "/tmp/x.jsonl", logText: codexJsonl({ turnCompleted: false }), findings });
+  assert.equal(dead.ok, false);
+  assert.match(dead.refusal, /no exact producer turn\.completed event \(command_execution=2\)/);
+
+  // MUST-FAIL — a completed run whose findings were never handed over attests a review no reader can see.
+  const noReview = crossVendorAttestation({ round: 1, logPath: "/tmp/x.jsonl", logText: live });
+  assert.equal(noReview.ok, false);
+  assert.match(noReview.refusal, /--codex-log without --codex-review/);
+
+  // MUST-FAIL — claiming both. A pass either ran or it did not.
+  const both = crossVendorAttestation({ round: 1, logPath: "/tmp/x.jsonl", logText: live, findings, waivedReason: "codex quota wall, probe said so" });
+  assert.equal(both.ok, false);
+  assert.match(both.refusal, /ALONGSIDE/);
+
+  // MUST-FAIL — a waiver that names nothing is indistinguishable from a forgotten one.
+  for (const reason of ["n/a", "skip", "-", "   "]) {
+    const thin = crossVendorAttestation({ round: 1, waivedReason: reason });
+    assert.equal(thin.ok, false, `${JSON.stringify(reason)} must not pass as a waiver reason`);
+  }
+
+  // MUST-FAIL — round 1 attesting NEITHER. The receipt would be silent about whether a second vendor
+  // ever looked, which is the only outcome that cannot be audited after the fact.
+  const silent = crossVendorAttestation({ round: 1 });
+  assert.equal(silent.ok, false);
+  assert.match(silent.refusal, /round 1 is the FIRST complete diff/);
+  assert.match(silent.refusal, /--codex-waived/, "the refusal must name the escape hatch, or it is a wedge");
+
+  // CONTROL — a real completed run records what it found AND how hard it searched.
+  const ran = crossVendorAttestation({ round: 1, logPath: "/tmp/x.jsonl", logText: live, findings });
+  assert.equal(ran.ok, true, ran.refusal ?? "");
+  assert.deepEqual(ran.attestation.status, "ran");
+  assert.equal(ran.attestation.commands, 2, "repository-search coverage is recorded — a 0-command pass is a blind one");
+  assert.equal(ran.attestation.findings_total, 1);
+  assert.equal(ran.attestation.blockers, 1);
+
+  // CONTROL — the waiver is the DEGRADED path and it must always be available, because codex
+  // availability swings. It records the reason verbatim.
+  const waived = crossVendorAttestation({ round: 1, waivedReason: "codex quota wall — probe output: You've hit your usage limit" });
+  assert.equal(waived.ok, true);
+  assert.equal(waived.attestation.status, "waived");
+  assert.match(waived.attestation.reason, /usage limit/);
+});
+
+test("DER-3011 crossVendorAttestation: a revision round is panel-only, and carries round 1's answer forward", () => {
+  const round1 = {
+    type: "review_findings", issue: "DER-1",
+    cross_vendor: { reviewer: "codex", status: "waived", round: 1, reason: "codex quota wall — probe output: usage limit until Aug 4" },
+  };
+
+  // A revision round attests nothing of its own — that is the POLICY (P1 yield decays to 0 by round 5),
+  // not an oversight — so it must NOT be refused the way round 1 is.
+  const r2 = crossVendorAttestation({ round: 2, priorEvents: [round1], issueId: "DER-1" });
+  assert.equal(r2.ok, true, r2.refusal ?? "");
+  assert.equal(r2.attestation.status, "inherited");
+  assert.equal(r2.attestation.from_round, 1);
+  assert.equal(r2.attestation.inherited_status, "waived");
+  assert.match(r2.attestation.reason, /usage limit/, "the WAIVER REASON must survive to the last receipt — `ready` reads only the latest gate event");
+
+  // Another unit's round-1 attestation is not this unit's. Without the issue filter every unit in a run
+  // would inherit whichever one happened to be recorded last.
+  //
+  // 🔴 And with nothing to inherit, a revision round is REFUSED rather than passed as `status: "none"`.
+  // Silently recording "none" made "the codex gate was skipped for this whole unit" indistinguishable
+  // from "the harness had nothing to say" — and it was reachable by simply recording round 2 first,
+  // which is a one-flag bypass of the round-1 rule. Refusing converts a silent skip into a recorded
+  // choice; it still never blocks, because the waiver is one flag away (asserted below).
+  const other = crossVendorAttestation({ round: 2, priorEvents: [round1], issueId: "DER-2" });
+  assert.equal(other.ok, false, "a revision round with nothing to carry forward must not pass silently");
+  assert.match(other.refusal, /NOTHING has ever attested the codex gate for DER-2/);
+  assert.match(other.refusal, /--codex-waived/, "and it must name the one-flag way through, or it is a wedge");
+  // CONTROL — that refusal is escapable, which is what keeps it from being a block.
+  const otherWaived = crossVendorAttestation({ round: 2, priorEvents: [round1], issueId: "DER-2", waivedReason: "codex not run on this unit — picked up mid-flight from another lead" });
+  assert.equal(otherWaived.ok, true);
+  assert.equal(otherWaived.attestation.status, "waived");
+
+  // An inheritance is never re-inherited: chaining would let the original round number and reason decay
+  // to null one round at a time, and the point of carrying it forward is that they stay legible.
+  const inheritedEv = { type: "review_findings", issue: "DER-1", cross_vendor: r2.attestation };
+  assert.equal(latestCrossVendorAttestation([round1, inheritedEv], "DER-1").status, "waived");
+  const r3 = crossVendorAttestation({ round: 3, priorEvents: [round1, inheritedEv], issueId: "DER-1" });
+  assert.equal(r3.attestation.from_round, 1, "round 3 must still name round 1, not the round-2 carry");
+
+  // A revision round MAY still record a real pass — the shepherd can ask for one on a risk lane.
+  const asked = crossVendorAttestation({ round: 3, logPath: "/tmp/x.jsonl", logText: codexJsonl(), findings: [] });
+  assert.equal(asked.attestation.status, "ran");
+  assert.equal(asked.attestation.round, 3);
+});
+
+test("DER-3011 review-panel (CLI): a codex P1 is a PANEL blocker, and agreement across vendors is recorded", async () => {
+  const root = await mkdtemp(join(tmpdir(), "work-xvendor-"));
+  const SHA = "e".repeat(40);
+  try {
+    const { runId } = await runSubcommand(["init-run", "--project", "p", "--runs-root", root, "--repo-root", root]);
+    const write = async (name, content) => { const p = join(root, name); await writeFile(p, content, "utf8"); return p; };
+    const lensArgs = [
+      "--lens-file", `correctness=${await write("c.json", lensEnvelope(CLEAN_LENS))}`,
+      "--lens-file", `security=${await write("s.json", lensEnvelope(P1_LENS))}`,
+      "--lens-file", `repro=${await write("r.json", lensEnvelope(CLEAN_LENS))}`,
+    ];
+    // One finding the security lens ALSO raised (same file/line/title) and one only codex saw — the
+    // ~33% overlap this pass exists for, in fixture form.
+    const review = await write("codex.json", JSON.stringify(codexPayload([
+      { title: "Tenant filter dropped on the read path", priority: 1, file: "packages/db/src/x.ts", line: 42 },
+      { title: "Sibling loader in fleet.ts never got the same filter", priority: 1, file: "packages/db/src/fleet.ts", line: 900 },
+    ])));
+    const log = await write("codex.jsonl", codexJsonl({ commands: 21 }));
+
+    // 🔴 MUST-FAIL — findings with no JSONL provenance, at the CLI. The unit test above proves the
+    // predicate; this proves the command is WIRED to it and that a refused receipt appends NOTHING.
+    await assert.rejects(
+      () => runSubcommand(["review-panel", "--run", runId, "--runs-root", root, "--issue", "DER-1", "--sha", SHA, ...lensArgs, "--codex-review", review]),
+      /--codex-review without --codex-log/,
+    );
+    assert.equal((await readEvents(join(root, runId))).filter((e) => e.type === "review_findings").length, 0, "a refused cross-vendor claim must append NOTHING");
+
+    // 🔴 MUST-FAIL — a dead codex run. It exits 0, so this is the shape that would otherwise attest a
+    // pass that never happened.
+    const deadLog = await write("dead.jsonl", codexJsonl({ turnCompleted: false, commands: 5 }));
+    await assert.rejects(
+      () => runSubcommand(["review-panel", "--run", runId, "--runs-root", root, "--issue", "DER-1", "--sha", SHA, ...lensArgs, "--codex-review", review, "--codex-log", deadLog]),
+      /turn\.completed/,
+    );
+
+    // CONTROL — the real thing. Codex's findings are IN the panel's union, so its P1s are panel blockers
+    // and `ready` holds on them; there is no second event whose count could disagree with this one.
+    const out = await runSubcommand(["review-panel", "--run", runId, "--runs-root", root, "--issue", "DER-1", "--sha", SHA, "--pr", "1201", ...lensArgs, "--codex-review", review, "--codex-log", log]);
+    const ev = out.event;
+    assert.equal(ev.cross_vendor.status, "ran");
+    assert.equal(ev.cross_vendor.commands, 21);
+    assert.ok(ev.lenses_returned.includes(CROSS_VENDOR_LENS), "the receipt's lens list must name every reviewer whose findings are in it");
+    assert.deepEqual(ev.lenses_requested, ev.lenses_returned, "requested vs returned must MATCH, or a short panel reads as a full one");
+    assert.equal(ev.blockers, 2, "the shared P1 dedupes; codex's unique P1 is a NEW panel blocker");
+    assert.equal(gateBlockerCountVerdict(ev).ok, true, "the count must stay derivable from the event's own findings (DER-2837)");
+    const shared = ev.findings.find((f) => f.title === "Tenant filter dropped on the read path");
+    assert.deepEqual(shared.lenses.sort(), ["codex", "security"], "cross-vendor agreement is recorded, not collapsed");
+    const unique = ev.findings.find((f) => f.file === "packages/db/src/fleet.ts");
+    assert.deepEqual(unique.lenses, [CROSS_VENDOR_LENS]);
+    assert.ok(unique.evidence, "the schema's `body` is this reviewer's evidence — the falsification pass needs it");
+    // codex must NOT be counted as a Claude-subscription lens: `models_observed` answers "which Opus
+    // actually ran" and `providers` answers "did it ride the subscription". A codex entry in either
+    // would fire the metered-endpoint warning on every healthy run.
+    assert.deepEqual(ev.models_observed, ["claude-opus-5"]);
+    assert.ok(!ev.providers.includes("codex"));
+    assert.doesNotMatch(out.stdout, /did NOT ride the Claude subscription/);
+    assert.match(out.stdout, /xvendor=CODEX RAN \(round 1, 2 finding\(s\), 2 blocker\(s\), 21 repo command\(s\)\)/);
+
+    // A second reviewer cannot be supplied twice under one name — that would double its findings and
+    // make its own agreement count read as corroboration.
+    const dupe = await write("c2.json", lensEnvelope(CLEAN_LENS));
+    await assert.rejects(
+      () => runSubcommand(["review-panel", "--run", runId, "--runs-root", root, "--issue", "DER-3", "--sha", SHA,
+        ...lensArgs, "--lens-file", `${CROSS_VENDOR_LENS}=${dupe}`, "--codex-review", review, "--codex-log", log]),
+      /supplied BOTH as --lens-file and as --codex-review/,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("DER-3011 ready: the cross-vendor answer is REPORTED on the ready line and never gates on it", () => {
+  const HEAD = "f".repeat(40);
+  const base = { draft: false, threads: 0, onHead: false, checks: "pass", shardsPass: 0, shardsTotal: 0 };
+  const panel = (crossVendor) => ({
+    sha: HEAD, blockers: 0, findings: [], substitute: false, gate_kind: "panel",
+    engine: "claude", model: "opus", lenses: ["correctness", "security", "repro"], cross_vendor: crossVendor,
+  });
+  const verdictFor = (crossVendor) => readyVerdict({ ...base, gate: gateEvidenceVerdict({ head: HEAD, gate: panel(crossVendor) }) });
+
+  // The WAIVED receipt is accepted — this is the whole degradation rule. codex was quota-walled for
+  // days in the week this shipped; a hold on its availability would be a condition no action satisfies.
+  const waived = verdictFor({ reviewer: "codex", status: "waived", round: 1, reason: "codex quota wall until Aug 4" });
+  assert.equal(waived.ready, true, "a quota wall must NEVER block a PR whose panel is clean");
+  assert.match(waived.why, /xvendor=CODEX WAIVED at round 1 — codex quota wall until Aug 4/, "the REASON is the audit surface — a bare 'waived' tells a shepherd nothing");
+
+  const ran = verdictFor({ reviewer: "codex", status: "ran", round: 1, findings_total: 3, blockers: 0, commands: 18 });
+  assert.equal(ran.ready, true);
+  assert.match(ran.why, /xvendor=CODEX RAN \(round 1, 3 finding\(s\)/);
+
+  // A revision round still says what round 1 answered, because `ready` reads only the LATEST event.
+  const inherited = verdictFor({ reviewer: "codex", status: "inherited", round: 3, from_round: 1, inherited_status: "ran" });
+  assert.match(inherited.why, /xvendor=CODEX RAN at round 1 \(carried forward\)/);
+
+  // A receipt that recorded NEITHER, and a receipt from before this existed, must be VISIBLE rather
+  // than silently reading as "fine" — that absence is the exact failure the attestation closes.
+  assert.match(verdictFor({ reviewer: "codex", status: "none", round: 2 }).why, /xvendor=NONE/);
+  assert.match(verdictFor(undefined).why, /xvendor=UNRECORDED/);
+
+  // …and none of it gates: every case above is `ready: true`, so the only thing that can hold a PR here
+  // is still the panel's own blocker count.
+  for (const xv of [undefined, { status: "none" }, { status: "waived", reason: "codex quota wall until Aug 4" }]) {
+    assert.equal(verdictFor(xv).ready, true, "the cross-vendor attestation REPORTS; it must never veto");
+  }
+});
+
+test("DER-3011 the brief renders the codex gate on ROUND 1 ONLY, with the exact measured command form", () => {
+  const round1 = renderBrief({ issueId: "DER-9", worktree: "/wt", runId: "R", runsRoot: "/rr", runnerCmd: "node /abs/work-runner.mjs" });
+
+  assert.ok(round1.includes(CROSS_VENDOR_HEADING), "round 1 must carry the codex-gate block");
+  // The DIVISION OF LABOUR must be stated, not implied: on round 1 codex is the default reviewer and
+  // the panel runs beside it as the backup. A brief that renders both blocks without saying which is
+  // which invites a lead to treat either as optional.
+  assert.match(round1, /codex is the DEFAULT reviewer/i, "round 1 must name codex as the default gate");
+  assert.match(round1, /BACKUP|backup/, "…and the panel as the backup that also covers revisions and codex-down");
+  // (a) The exact command form. Every flag here is load-bearing and was measured: plain `codex exec`
+  // (never `codex exec review --base`, which is diff-local and refuses a custom prompt), `--json` for
+  // the completion evidence, the prompt on STDIN, stdout PURE JSONL, stderr SEPARATE.
+  assert.match(round1, /exec --json --sandbox read-only --output-schema \S+ --output-last-message \S+ - < \S+ > \S+ 2> \S+/, "the exact codex exec form");
+  assert.match(round1, /NEVER `codex exec review --base`/, "the diff-local form refuses a custom prompt and finds nothing — the brief must say so");
+  assert.match(round1, /--lens codex --diff/, "the prompt is RENDERED by the runner, never pasted as prose into a brief");
+  // No RUNNABLE line may invoke a bare `codex` — a cmux shim ahead of it on PATH hangs at 0% CPU
+  // byte-identically to a quota wall. Checked per line, so the prose that TEACHES the rule (which
+  // necessarily quotes the wrong forms) cannot make this assertion vacuous.
+  const runnable = round1.split("\n").filter((l) => /^\s*[$"A-Za-z_/]/.test(l) && !l.startsWith("#"));
+  assert.deepEqual(runnable.filter((l) => /(^|[;&|]\s*)codex\s+exec/.test(l)), [], "a runnable line must resolve the binary first, never shell a bare `codex`");
+  // (b) The stdin-CLOSED probe, and the two things that must not be used as discriminators.
+  assert.match(round1, /codex-probe/, "the probe is the gate on whether the pass runs at all");
+  assert.match(round1, /Reading additional input from stdin/, "WITHOUT closed stdin codex hangs forever at 0% CPU");
+  assert.match(round1, /never by CPU% and never by `codex login status`/i);
+  // (c) The degradation rule: the waiver is printed as the path, in the brief, next to the command —
+  // and it must say to drop the flags from BOTH commands. The step-2 dry run also names the codex
+  // files, so a note that corrected only step 3 would leave a walled lead dead on an ENOENT.
+  assert.match(round1, /--codex-waived/);
+  assert.match(round1, /DELETE the\n#\s+--codex-review\/--codex-log line from BOTH commands below/);
+  assert.match(round1, /never block|never a reason to skip the panel/i);
+  // The recording flags ride the SAME review-panel call — one gate, one receipt.
+  assert.match(round1, /review-panel .*--round 1[\s\S]*--codex-review \S+ --codex-log \S+/);
+
+  // A KICKBACK brief is panel-only: the codex gate is spent on the first complete diff (P1 yield
+  // 53% → 0%), and a lead handed the block would run it again.
+  const round2 = renderBrief({ issueId: "DER-9", worktree: "/wt", runId: "R", runsRoot: "/rr", kickback: 1, findings: "F" });
+  assert.ok(!round2.includes(CROSS_VENDOR_HEADING), "a revision round must NOT carry the codex-gate block");
+  assert.doesNotMatch(round2, /--codex-review/);
+  assert.match(round2, /review-panel .*--round 2/, "and its receipt must record the round it actually is — `--round 1` on every brief would make 'round 1 only' mean 'every round'");
+  assert.match(round2, /PANEL ALONE/i, "on a revision the panel is the whole gate — the brief must say so, not leave it inferred");
+  assert.match(round2, /Do NOT re-run the round-1 `codex exec` gate/i);
+
+  // Neither brief may claim which way codex is pointing TODAY. Availability swings; a hardcoded
+  // "walled until <date>" is stale the day after it is written, and a lead reading it would skip a
+  // probe that now succeeds. Only the ASSERTION is banned — "IF codex is walled, waive it" is exactly
+  // the conditional the degradation rule is made of, so the pattern must not catch that (an earlier
+  // draft did, which is how this comment exists).
+  // Keyed on an availability WORD sitting near a DATE-OR-DURATION token, rather than on the handful of
+  // exact phrases that were removed. A reviewer showed the phrase list evading trivially — "walled
+  // through Aug 4" and "dead for 2 days" both slipped a pattern built from the strings I happened to
+  // have written. What makes a claim stale is that it pins availability to a MOMENT, so that is what
+  // this matches; the bare conditional ("IF codex is walled, waive it") carries no moment and stays legal.
+  // \b-anchored, and "out" is deliberately absent: unanchored `down` matched "downstream" next to the
+  // ISO date in an unrelated sentence, and "out" is common enough that it would keep doing that.
+  const AVAIL = "\\b(walled|wall|down|dead|unavailable|offline)\\b";
+  const WHEN = "(\\d+ ?(h|hr|hrs|hours?|d|days?|weeks?)|(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\\.? ?\\d{1,2}|\\d{4}-\\d{2}-\\d{2}|again|still|currently|right now)";
+  const CURRENCY_CLAIM = new RegExp(`${AVAIL}[^.\\n]{0,40}${WHEN}|${WHEN}[^.\\n]{0,40}${AVAIL}`, "i");
+  // CONTROLS — the pattern must return the failing answer for every evasion the reviewer demonstrated,
+  // and must NOT fire on the conditional the whole degradation rule is written in. Without both halves
+  // it could be tightened into something that matches nothing and still "pass" on any brief at all.
+  for (const claim of [
+    "codex was dead 36h this week and is quota-walled until Aug 4",
+    "codex is walled through Aug 4",
+    "codex has been dead for 2 days",
+    "codex is down again",
+    "codex is currently unavailable",
+    "walled until 2026-08-04",
+  ]) {
+    assert.match(claim, CURRENCY_CLAIM, `the currency-claim pattern must detect: ${claim}`);
+  }
+  for (const legal of [
+    "IF CODEX IS WALLED / 401'd / UNRESOLVABLE: waive it",
+    "codex-probe prints the waiver line whenever codex is walled, 401'd or unresolvable",
+    "the panel is the backup for exactly this",
+  ]) {
+    assert.doesNotMatch(legal, CURRENCY_CLAIM, `…and must NOT flag the timeless conditional: ${legal}`);
+  }
+  for (const [name, brief] of [["round1", round1], ["round2", round2]]) {
+    assert.doesNotMatch(brief, CURRENCY_CLAIM,
+      `${name}: the brief must not assert codex's CURRENT availability — the probe answers that at the moment of use`);
+  }
+});
+
+test("DER-3011 panelCrossVendorPrompt: one process against three lenses gets the WHOLE mandate", () => {
+  const paths = ["packages/db/src/x.ts", "packages/commands/src/y.ts"];
+  const prompt = panelCrossVendorPrompt({ issueId: "DER-1", diffFile: "/tmp/d", paths });
+  // It carries all three mandates: splitting them would hand a single-process reviewer a third of the
+  // review, and the two thirds it dropped are the ones no other lens is looking for either.
+  assert.match(prompt, /Refute the claim that this change is CORRECT/);
+  assert.match(prompt, /Refute the claim that this change is SAFE/);
+  assert.match(prompt, /Refute by EXECUTION, not by reading/);
+  // Path routing reaches it, across lenses — a security checklist and a correctness one in one prompt.
+  assert.match(prompt, /tenant-isolation/);
+  assert.match(prompt, /sql-zod-divergence/);
+  assert.match(prompt, /command-surface-parity/);
+  // The search mandate is the load-bearing instruction (2 commands/0 findings vs 21/6 without it).
+  assert.match(prompt, /diff SEEDS your search — it does not BOUND it/i);
+  assert.match(prompt, /Code Review Rules/, "the repo's own defect corpus steers it for free");
+  // It answers in the CODEX schema shape, not the panel's — and the schema constrains fields, never
+  // what `priority` MEANS, so the prompt must supply the semantics or every finding lands at P3.
+  assert.match(prompt, /output schema/i);
+  assert.match(prompt, /1 = blocker/);
+  assert.doesNotMatch(prompt, /"verdict": "findings" \| "clean"/, "that is the Claude lens contract; codex is schema-constrained");
+
+  // An unrouted diff still renders a usable prompt — routing SEEDS, it never bounds.
+  assert.match(panelCrossVendorPrompt({ diffFile: "/tmp/d", paths: ["README.md"] }), /Refute the claim that this change is SAFE/);
+});
+
+test("DER-3011 crossVendorPassCommands: resolves the binary ON THE HOST that runs it", () => {
+  const block = crossVendorPassCommands({ issueId: "DER-9", runner: "node /abs/work-runner.mjs" });
+  // A brief is rendered by the orchestrator and frequently RUN on another host, so a path resolved at
+  // render time is a "command not found" the lead has no reason to read as "wrong host".
+  assert.match(block, /CODEX="\$\(node \/abs\/work-runner\.mjs codex-probe --print-bin\)"/);
+  assert.match(block, /"\$CODEX" exec --json/);
+  assert.match(block, /from the WORKTREE/, "without node_modules it cannot execute anything and goes blind");
+});
+
+test("DER-3011 review-panel (CLI): a revision round inherits round 1's answer FROM THE LEDGER", async () => {
+  const root = await mkdtemp(join(tmpdir(), "work-xvinherit-"));
+  const SHA1 = "1".repeat(40);
+  const SHA2 = "2".repeat(40);
+  try {
+    const { runId } = await runSubcommand(["init-run", "--project", "p", "--runs-root", root, "--repo-root", root]);
+    const write = async (name, content) => { const p = join(root, name); await writeFile(p, content, "utf8"); return p; };
+    const lensArgs = [
+      "--lens-file", `correctness=${await write("c.json", lensEnvelope(CLEAN_LENS))}`,
+      "--lens-file", `security=${await write("s.json", lensEnvelope(CLEAN_LENS))}`,
+    ];
+    const REASON = "codex quota wall — probe output: You've hit your usage limit until Aug 4th";
+
+    await runSubcommand(["review-panel", "--run", runId, "--runs-root", root, "--issue", "DER-1", "--sha", SHA1, "--round", "1", ...lensArgs, "--codex-waived", REASON]);
+
+    // Round 2 attests nothing of its own — the POLICY, not an oversight — and must not be refused the
+    // way round 1 is. It reads round 1's answer out of the ledger, because `ready` looks only at the
+    // LATEST gate event and would otherwise lose the waiver reason the moment a lead pushed a fix.
+    const r2 = await runSubcommand(["review-panel", "--run", runId, "--runs-root", root, "--issue", "DER-1", "--sha", SHA2, "--round", "2", ...lensArgs]);
+    assert.equal(r2.event.cross_vendor.status, "inherited");
+    assert.equal(r2.event.cross_vendor.from_round, 1);
+    assert.equal(r2.event.cross_vendor.inherited_status, "waived");
+    assert.equal(r2.event.cross_vendor.reason, REASON, "the reason must survive to the receipt `ready` actually reads");
+    assert.match(r2.stdout, /xvendor=CODEX WAIVED at round 1 \(carried forward/);
+
+    // A DIFFERENT unit in the same run inherits nothing — and rather than borrowing a sibling's
+    // attestation or passing silently, its round-2 receipt is REFUSED until someone records a choice.
+    // Recording round 2 first was otherwise a one-flag bypass of the entire round-1 rule.
+    await assert.rejects(
+      () => runSubcommand(["review-panel", "--run", runId, "--runs-root", root, "--issue", "DER-2", "--sha", SHA2, "--round", "2", ...lensArgs]),
+      /NOTHING has ever attested the codex gate for DER-2/,
+    );
+    const otherWaived = await runSubcommand(["review-panel", "--run", runId, "--runs-root", root, "--issue", "DER-2", "--sha", SHA2, "--round", "2", ...lensArgs, "--codex-waived", "codex never ran on this unit — inherited mid-flight"]);
+    assert.equal(otherWaived.event.cross_vendor.status, "waived");
+
+    // And the state fold carries it, so the board and the shepherd read the same fact `ready` prints.
+    const st = materializeState(await readEvents(join(root, runId)));
+    assert.equal(st.issues["DER-1"].gate.cross_vendor.status, "inherited");
+    assert.equal(st.issues["DER-2"].gate.cross_vendor.status, "waived", "the fold must read THIS event, never carry a prior one over");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("DER-3011 review-swap: a posture-C substitute IS a codex waiver, and says so on its own receipt", () => {
+  // The substitute gate exists precisely because codex could not review, so a null attestation there
+  // would print `xvendor=UNRECORDED` — "nobody recorded whether a second vendor looked" — over the one
+  // posture where the answer is known.
+  const lenses = parseLensVerdicts({
+    raw: { correctness: { verdict: "clean", findings: [] }, security: { verdict: "clean", findings: [] } },
+    lensesRequested: ["correctness", "security"],
+  });
+  const ev = reviewSwapEvent({ issueId: "DER-1", sha: "a".repeat(40), lenses, substituteReason: "codex unavailable — probe printed a usage wall" });
+  assert.equal(ev.cross_vendor.status, "waived");
+  assert.equal(ev.cross_vendor.reason, "codex unavailable — probe printed a usage wall");
+  assert.match(crossVendorLabel(ev.cross_vendor), /xvendor=CODEX WAIVED/);
+
+  // 🔴 With NO reason given, the receipt records NOTHING rather than synthesizing one. The first
+  // version defaulted to the sentence "codex was unavailable as both a bot and a local `codex exec`" —
+  // a factual claim about the world that no step here measured, propagated onto the final receipt and
+  // rendered as though someone had established it. Manufactured evidence is worse than absent evidence:
+  // absent evidence prompts a question, manufactured evidence answers it wrongly.
+  const bare = reviewSwapEvent({ issueId: "DER-1", sha: "a".repeat(40), lenses });
+  assert.equal(bare.cross_vendor.reason, null, "no reason given must record no reason — never a plausible-sounding default");
+  assert.doesNotMatch(JSON.stringify(bare.cross_vendor), /posture C|unavailable as both/, "and no synthesized claim may reach the event at all");
+  assert.match(crossVendorLabel(bare.cross_vendor), /no reason recorded/, "the label states the absence, which is the true sentence");
+});
+
+test("DER-3011 remediation: the attestation is bound to a TREE and a UNIT, not to a filename", () => {
+  const live = codexJsonl();
+  const findings = [{ title: "Tenant filter dropped", priority: 1, file: "a.ts", line_start: 1, line_end: 2 }];
+  const SHA1 = "1".repeat(40);
+  const SHA2 = "2".repeat(40);
+  const at = (over = {}) => crossVendorAttestation({ round: 1, logPath: "/tmp/one.jsonl", logText: live, findings, ...over });
+
+  // The run that really happened, against the tree it really looked at.
+  const first = at({ sha: SHA1, issueId: "DER-1" });
+  assert.equal(first.attestation.status, "ran");
+  assert.equal(first.attestation.covered_sha, SHA1, "the receipt must name the tree the artifacts covered");
+  assert.match(first.attestation.log_sha256, /^[0-9a-f]{64}$/, "…and the CONTENT of the JSONL that proved it — a path is whatever was last written there");
+  const ledger = [{ type: "review_findings", issue: "DER-1", cross_vendor: first.attestation }];
+
+  // 🔴 REPLAY, THE WAY IT WAS ACTUALLY DONE — one codex run's artifacts, re-submitted against a
+  // different tree and under a different unit. Both were accepted as "CODEX RAN" before this.
+  const movedTree = at({ sha: SHA2, issueId: "DER-1", priorEvents: ledger });
+  assert.equal(movedTree.attestation.status, "stale", "the same run cannot be RAN against a tree it never saw");
+  assert.equal(movedTree.attestation.covered_sha, SHA1, "STALE names the tree codex REALLY looked at…");
+  assert.equal(movedTree.attestation.receipt_sha, SHA2, "…and the tree this receipt is about");
+  assert.match(crossVendorLabel(movedTree.attestation), /STALE — this run covered 1111111111.*NOT this tree \(2222222222\)/);
+
+  const movedUnit = at({ sha: SHA1, issueId: "DER-2", priorEvents: ledger });
+  assert.equal(movedUnit.attestation.status, "stale", "…and it cannot be RAN for a unit it never reviewed");
+  assert.equal(movedUnit.attestation.first_attested_issue, "DER-1");
+
+  // A replay CHAIN cannot walk the covered sha forward one receipt at a time.
+  const chained = at({ sha: "3".repeat(40), issueId: "DER-1", priorEvents: [...ledger, { type: "review_findings", issue: "DER-1", cross_vendor: movedTree.attestation }] });
+  assert.equal(chained.attestation.covered_sha, SHA1, "the tree codex really looked at is fixed at the first attestation");
+
+  // CONTROLS — the fix must not refuse legitimate shapes, or it just moves the failure.
+  // (a) Re-recording the SAME artifacts at the SAME sha and unit is idempotent (e.g. adding --verify-file).
+  assert.equal(at({ sha: SHA1, issueId: "DER-1", priorEvents: ledger }).attestation.status, "ran");
+  // (b) A genuinely NEW codex run at the new head is a real RAN — a different digest, so no replay.
+  const rerun = crossVendorAttestation({ round: 1, sha: SHA2, issueId: "DER-1", priorEvents: ledger, logPath: "/tmp/two.jsonl", logText: codexJsonl({ commands: 9 }), findings });
+  assert.equal(rerun.attestation.status, "ran");
+  assert.equal(rerun.attestation.covered_sha, SHA2);
+});
+
+test("DER-3011 remediation: a round-1 pre-PR fix loop INHERITS, it does not re-attest or refuse", () => {
+  // The trap the brief used to walk a lead into: fix findings → head moves → re-run the panel, still on
+  // round 1. With flags required, the only options were re-submitting stale artifacts (a false RAN) or
+  // waiving a gate that actually ran. Inheritance is the third answer, and it is the correct one.
+  const SHA1 = "a".repeat(40);
+  const SHA2 = "b".repeat(40);
+  const first = crossVendorAttestation({ round: 1, sha: SHA1, issueId: "DER-1", logPath: "/tmp/x.jsonl", logText: codexJsonl(), findings: [] });
+  const ledger = [{ type: "review_findings", issue: "DER-1", cross_vendor: first.attestation }];
+
+  const loop = crossVendorAttestation({ round: 1, sha: SHA2, issueId: "DER-1", priorEvents: ledger });
+  assert.equal(loop.ok, true, "round 1 must NOT refuse when this unit already attested — that is the fix loop");
+  assert.equal(loop.attestation.status, "inherited");
+  assert.equal(loop.attestation.inherited_status, "stale", "a RAN carried onto a DIFFERENT tree is stale, never a second RAN");
+  assert.match(crossVendorLabel(loop.attestation), /STALE \(carried forward from round 1; that run covered aaaaaaaaaa/);
+
+  // CONTROL — inheriting at the SAME head keeps the original claim intact.
+  const sameHead = crossVendorAttestation({ round: 1, sha: SHA1, issueId: "DER-1", priorEvents: ledger });
+  assert.equal(sameHead.attestation.inherited_status, "ran");
+  // CONTROL — a waiver carried forward stays a waiver with its reason, whatever the head does.
+  const waivedLedger = [{ type: "review_findings", issue: "DER-1", cross_vendor: crossVendorAttestation({ round: 1, sha: SHA1, issueId: "DER-1", waivedReason: "codex probe returned a usage wall" }).attestation }];
+  assert.equal(crossVendorAttestation({ round: 1, sha: SHA2, issueId: "DER-1", priorEvents: waivedLedger }).attestation.inherited_status, "waived");
+});
+
+test("DER-3011 remediation: --round is an ORDINAL, and a blind RAN warns louder than a waiver", async () => {
+  const root = await mkdtemp(join(tmpdir(), "work-xvfix-"));
+  const SHA = "c".repeat(40);
+  try {
+    const { runId } = await runSubcommand(["init-run", "--project", "p", "--runs-root", root, "--repo-root", root]);
+    const write = async (name, content) => { const p = join(root, name); await writeFile(p, content, "utf8"); return p; };
+    const lensArgs = [
+      "--lens-file", `correctness=${await write("c.json", lensEnvelope(CLEAN_LENS))}`,
+      "--lens-file", `security=${await write("s.json", lensEnvelope(CLEAN_LENS))}`,
+    ];
+    const base = ["review-panel", "--run", runId, "--runs-root", root, "--issue", "DER-1", "--sha", SHA];
+
+    // A fractional or zero round defeats the `<= CROSS_VENDOR_ROUND` comparison the whole round-1 rule
+    // turns on: 1.5 is neither round 1 nor a revision round, and 0 reads as round 1 while recording
+    // something no reader can order.
+    for (const bad of ["1.5", "0", "-1", "abc"]) {
+      await assert.rejects(
+        () => runSubcommand([...base, "--round", bad, ...lensArgs, "--codex-waived", "codex probe returned a usage wall"]),
+        /is not a positive integer/,
+        `--round ${bad} must be refused`,
+      );
+    }
+    // CONTROL — real ordinals still work, on both sides of the round-1 boundary.
+    const r1 = await runSubcommand([...base, "--round", "1", ...lensArgs, "--codex-waived", "codex probe returned a usage wall"]);
+    assert.equal(r1.event.round, 1);
+
+    // A BLIND run — turn.completed, but zero repository commands — is the one that reads as coverage
+    // while having reviewed nothing but the diff text (DER-2504: a 0-command run returned wholly
+    // fabricated findings). It was the only state getting NO warning while the waiver got one.
+    const blind = await runSubcommand(["review-panel", "--run", runId, "--runs-root", root, "--issue", "DER-2", "--sha", SHA, ...lensArgs,
+      "--codex-review", await write("cr.json", JSON.stringify(codexPayload([]))),
+      "--codex-log", await write("cl.jsonl", codexJsonl({ commands: 0 }))]);
+    assert.equal(blind.event.cross_vendor.status, "ran");
+    assert.equal(blind.event.cross_vendor.commands, 0);
+    assert.match(blind.stdout, /ran ZERO repository commands — it reviewed the diff BLIND/);
+    assert.match(blind.stdout, /Treat this as UNREVIEWED/);
+    // CONTROL — a searching run must NOT carry that warning, or it is noise nobody reads.
+    const searched = await runSubcommand(["review-panel", "--run", runId, "--runs-root", root, "--issue", "DER-3", "--sha", SHA, ...lensArgs,
+      "--codex-review", await write("cr2.json", JSON.stringify(codexPayload([]))),
+      "--codex-log", await write("cl2.jsonl", codexJsonl({ commands: 17 }))]);
+    assert.doesNotMatch(searched.stdout, /reviewed the diff BLIND/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("DER-3011 remediation: both review parsers coerce a finding's priority the SAME way", () => {
+  // The codex side used a bare `Number.isFinite(f.priority)`, so the schema-legal string "1" became
+  // null — a P1 that vanished from the blocker count. The Claude side coerced. One input, two answers,
+  // and the disagreement fell in the under-counting direction, which is the one that ships a blocker.
+  const codexOne = parseCodexReview({
+    overall_correctness: "patch is incorrect", overall_explanation: "", overall_confidence_score: 1,
+    findings: [{ title: "t", body: "b", priority: "1", confidence_score: "0.9", code_location: { absolute_file_path: "a.ts", line_range: { start: 1, end: 2 } } }],
+  });
+  assert.equal(codexOne.findings[0].priority, 1, 'codex "1" must coerce to 1');
+  assert.equal(WR.gateBlockerFindings({ findings: codexOne.findings }).length, 1, "…and therefore COUNT as a blocker");
+  const claudeOne = parsePanelLensOutput({ raw: lensEnvelope({ verdict: "findings", findings: [{ title: "t", priority: "1", file: "a.ts" }] }), lens: "security" });
+  assert.equal(claudeOne.findings[0].priority, codexOne.findings[0].priority, "the two parsers must agree about one input");
+
+  // …and neither may invent a P0 out of an ABSENT priority. `Number(null)` and `Number("")` are both 0,
+  // so the obvious coercion promotes a missing field to ship-stopping — over-counting is safer than
+  // under-counting, but a fabricated P0 is still a fabricated finding.
+  const missing = parseCodexReview({
+    overall_correctness: "patch is correct", overall_explanation: "", overall_confidence_score: 1,
+    findings: [{ title: "t", body: "b", code_location: { absolute_file_path: "a.ts", line_range: { start: 1, end: 2 } } }],
+  });
+  assert.equal(missing.findings[0].priority, null, "an absent priority is UNKNOWN, never 0");
+  assert.equal(WR.gateBlockerFindings({ findings: missing.findings }).length, 0);
+  assert.equal(parsePanelLensOutput({ raw: lensEnvelope({ verdict: "findings", findings: [{ title: "t", file: "a.ts" }] }), lens: "security" }).findings[0].priority, null);
+  // Direct controls on the shared helper, so its contract is pinned independently of both callers.
+  assert.deepEqual([WR.findingNumber(2), WR.findingNumber("2"), WR.findingNumber(null), WR.findingNumber(""), WR.findingNumber("x"), WR.findingNumber(NaN)], [2, 2, null, null, null, null]);
 });
