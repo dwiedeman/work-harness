@@ -14,10 +14,25 @@
 // Out of scope (needs the T2.1 provenance/decision events that don't exist in ledgers yet): review
 // false-positive rate, and splitting kickbacks into mechanical vs. substantive.
 //
+// PHASE 5 (2026-07-31 close-out, DER harness-upgrades plan): `kickbacks/merged-PR` was measuring
+// REVIEWER AVAILABILITY, not review quality — the source run's Codex bot died 3h47m in, and the
+// blended rate over the whole run (1.17) read as a 44% improvement over baseline while the
+// bot-reviewed slice alone (2.50/PR) was actually WORSE than both baselines. `computeMetricsFromEvents`
+// stays pure/no-I/O per the contract above: the CLI wrapper (`main`) fetches per-PR bot-review
+// coverage over `gh api …/pulls/<n>/reviews` and hands it in via the `coverageByPr` option, and the
+// fold refuses to blend kickback rate / tokens-per-PR across a partial-coverage run — see
+// `classifyGateCoverage` and the "Gate coverage" section of `renderRunMarkdown`. Separately,
+// `review_findings` (the PRE-PR gate) is now folded and reported distinct from kickbacks (POST-PR):
+// during that same run the pre-PR gate never went dark, only the post-PR bot did, and a report that
+// says "the gate was down" without that split is wrong about which gate.
+//
 // Usage:
 //   node work-metrics.mjs --run <run-dir> [--json] [--out <file>]
+//                          [--repo <owner/repo>] [--bot-login <login>] [--no-coverage]
 //   node work-metrics.mjs --all --runs-root <dir> [--json] [--out <file>]
+//                          [--repo <owner/repo>] [--bot-login <login>] [--no-coverage]
 
+import { spawn } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -35,6 +50,9 @@ export function parseArgs(argv) {
     else if (a === "--runs-root") o.runsRoot = argv[++i];
     else if (a === "--json") o.json = true;
     else if (a === "--out") o.out = argv[++i];
+    else if (a === "--repo") o.repo = argv[++i];
+    else if (a === "--bot-login") o.botLogin = argv[++i];
+    else if (a === "--no-coverage") o.noCoverage = true;
     else if (a === "--help" || a === "-h") o.help = true;
   }
   return o;
@@ -283,6 +301,53 @@ function byRoleModelToPlain(byRoleModel) {
 }
 
 // ---------------------------------------------------------------------------
+// Gate coverage (5.1) — classifies each merged PR's bot-review status and decides whether the run's
+// kickback rate / tokens-per-PR can be reported as ONE blended number. Pure: takes the coverage map
+// the CLI wrapper measured (`{12: true, 13: false}`, see `fetchBotReviewCoverage` below) and never
+// touches the network itself, so this half of the fix is unit-testable without `gh` or a live repo.
+//
+// The defect this exists to kill, measured on the 2026-07-31 source run: splitting kickbacks on the
+// exact minute the Codex bot died (03:21:46Z, #1169) gave 2.50 kickbacks/PR on the 8 PRs it still
+// reviewed vs 0.78/PR on the 9 after — a 3.2x gap, with 19 of the 20 reviewed-slice kickbacks citing a
+// Codex finding by name. Blended over all 17, that reads as 1.17/PR — a 44% *improvement* over the
+// 07-26 (2.09) and 07-27 (1.50) baselines, when the reviewed slice alone was actually WORSE than both.
+// The orchestrator reported the blended "improvement" before the operator caught it. A coverage-aware
+// fold cannot make that mistake, because it refuses to produce the single number that made it.
+// ---------------------------------------------------------------------------
+
+const DEFAULT_REVIEW_BOT_LOGIN = "chatgpt-codex-connector[bot]"; // same login `ready` gates on in work-runner.mjs
+
+function coverageFor(coverageByPr, pr) {
+  if (!coverageByPr) return undefined;
+  if (coverageByPr instanceof Map) return coverageByPr.get(pr);
+  return coverageByPr[pr];
+}
+
+// A PR absent from `coverageByPr` is UNKNOWN, not "not covered" — a gh lookup that failed (rate
+// limit, PAT scope, PR force-deleted) must never collapse into the same bucket as a PR the bot
+// genuinely never reviewed. Collapsing "unknown" into "no" is exactly the UNKNOWN-vs-ABSENT confusion
+// this repo already refuses elsewhere (`review-fidelity`'s UNMEASURABLE, `readEvents`'s ledgerSkipped).
+export function classifyGateCoverage(prRecords, coverageByPr) {
+  if (!prRecords.length) return { status: "no_merged_prs", coveredRecords: [], uncoveredRecords: [], unmeasuredPrs: [] };
+  const coveredRecords = [];
+  const uncoveredRecords = [];
+  const unmeasuredPrs = [];
+  for (const r of prRecords) {
+    const v = coverageFor(coverageByPr, r.pr);
+    if (v === true) coveredRecords.push(r);
+    else if (v === false) uncoveredRecords.push(r);
+    else unmeasuredPrs.push(r.pr);
+  }
+  let status;
+  if (!coveredRecords.length && !uncoveredRecords.length) status = "unmeasured";
+  else if (!uncoveredRecords.length && !unmeasuredPrs.length) status = "uniform_covered";
+  else if (!coveredRecords.length && !unmeasuredPrs.length) status = "uniform_uncovered";
+  else status = "partial"; // mixed covered/uncovered, or a known slice mixed with unmeasured PRs — either
+  // way NOT provably one population, so it gets the same refusal as a clean covered/uncovered split.
+  return { status, coveredRecords, uncoveredRecords, unmeasuredPrs };
+}
+
+// ---------------------------------------------------------------------------
 // Core fold: one run's events -> the full metrics object. Pure (no I/O) so
 // tests can exercise it against small synthetic ledgers directly.
 // ---------------------------------------------------------------------------
@@ -325,7 +390,18 @@ export function computeLeadTypeBreakdown(events) {
     .sort((a, b) => (a.leadType === "claude" ? -1 : b.leadType === "claude" ? 1 : a.leadType.localeCompare(b.leadType)));
 }
 
-export function computeMetricsFromEvents(events, { run, runDir = null, usageJson = null, ledgerSkipped = 0 } = {}) {
+export function computeMetricsFromEvents(
+  events,
+  {
+    run,
+    runDir = null,
+    usageJson = null,
+    ledgerSkipped = 0,
+    coverageByPr = null,
+    coverageUnmeasuredReason = null,
+    coverageBotLogin = null,
+  } = {},
+) {
   let runStartedTs = null;
   // Spec mode (2026-07-29): recorded so a spec-mode run and an issue-mode run can be compared on the
   // SAME metrics. Without it the two modes are indistinguishable in the trend table and the A/B this
@@ -343,6 +419,15 @@ export function computeMetricsFromEvents(events, { run, runDir = null, usageJson
   let leadSpawnedCount = 0;
   let handedOffCount = 0;
   let kickbackCount = 0;
+  // 5.2: `review_findings` is the PRE-PR gate (codex or a `review-swap` substitute); a kickback is
+  // POST-hand-off (every kickback event carries a `pr` — see the `kickback` case below, which never
+  // does for review_findings). Folded separately because during the 2026-07-31 source run the pre-PR
+  // gate ran the whole 20h with zero gaps (40+ review_findings, substituted with Claude whenever the
+  // bot itself was unreachable) while only the POST-PR bot died 3h47m in — a report that collapses the
+  // two into one "review gate" figure would have called the pre-PR gate down when it never was.
+  let reviewFindingsCount = 0;
+  let reviewFindingsSubstituteCount = 0;
+  const reviewFindingsByIssue = new Map(); // issue -> {total, substitute}
 
   for (const e of events) {
     const ts = parseTs(e.ts);
@@ -373,6 +458,20 @@ export function computeMetricsFromEvents(events, { run, runDir = null, usageJson
         if (pr !== null) {
           if (!kickbacksByPr.has(pr)) kickbacksByPr.set(pr, []);
           kickbacksByPr.get(pr).push({ ts: Number.isNaN(ts) ? null : ts, round: typeof e.round === "number" ? e.round : null });
+        }
+        break;
+      case "review_findings":
+        // Pre-PR gate event (codex or `review-swap`'s recorded substitute). `substitute: true` marks a
+        // round where codex itself was unreachable and a Claude panel stood in — see PHASE 1 of the
+        // 2026-07-31 plan. Counted per-issue too so a report can show which issues actually got a
+        // substituted (non-codex) pre-PR review, not just a run-wide total.
+        reviewFindingsCount += 1;
+        if (e.substitute === true) reviewFindingsSubstituteCount += 1;
+        if (e.issue) {
+          const cur = reviewFindingsByIssue.get(e.issue) || { total: 0, substitute: 0 };
+          cur.total += 1;
+          if (e.substitute === true) cur.substitute += 1;
+          reviewFindingsByIssue.set(e.issue, cur);
         }
         break;
       case "pr_opened":
@@ -488,6 +587,36 @@ export function computeMetricsFromEvents(events, { run, runDir = null, usageJson
 
   const leadsSpawnedDistinctIssues = leadSpawnedTsByIssue.size;
 
+  // 5.1 — bot-review coverage slices. `sliceStats` reproduces the SAME 2.50-vs-0.78 split measured on
+  // the 2026-07-31 source run: per-slice kickback rate AND per-slice tokens/PR, because tokens/PR
+  // carries identical contamination (fewer review rounds a bot never triggered ⇒ fewer tokens spent
+  // fixing them) — a slice split that only covered kickbacks would leave tokens/PR free to keep lying.
+  // token_usage events carry `pr` (see the `kickback`-style identity note above `annotateShaAncestry`
+  // in work-runner.mjs), so the same fold `foldTokenUsage` already uses is reused per-slice rather than
+  // re-derived.
+  const gc = classifyGateCoverage(prRecords, coverageByPr);
+  const sliceStats = (recs) => {
+    const prs = recs.length;
+    const kickbacks = recs.reduce((s, r) => s + r.rounds, 0);
+    const prSet = new Set(recs.map((r) => r.pr));
+    const sliceTok = foldTokenUsage(events.filter((e) => e && e.type === "token_usage" && prSet.has(normalizePr(e.pr))));
+    return {
+      prs,
+      kickbacks,
+      ratePerPr: prs ? round2(kickbacks / prs) : null,
+      tokensTotal: sliceTok.totalTokens,
+      tokensPerPr: prs ? Math.round(sliceTok.totalTokens / prs) : null,
+    };
+  };
+  const gateCoverage = {
+    status: gc.status, // no_merged_prs | unmeasured | uniform_covered | uniform_uncovered | partial
+    botLogin: coverageBotLogin, // set by the CLI wrapper when it actually measured coverage — see fetchBotReviewCoverage
+    reason: gc.status === "unmeasured" ? (coverageUnmeasuredReason || "bot-review coverage not measured for this run") : null,
+    covered: sliceStats(gc.coveredRecords),
+    uncovered: sliceStats(gc.uncoveredRecords),
+    unmeasuredPrs: gc.unmeasuredPrs,
+  };
+
   return {
     run: run ?? (runDir ? basename(runDir) : "run"),
     runDir,
@@ -507,6 +636,18 @@ export function computeMetricsFromEvents(events, { run, runDir = null, usageJson
     leadsSpawnedDistinctIssues,
     handoffs: handedOffCount,
     kickbacks: { total: kickbackCount, ratePerMergedPr: kickbackRate, deepTail },
+    // 5.1: `ratePerMergedPr` above is the blended figure — kept for callers that already read it, but
+    // `renderRunMarkdown` refuses to PRINT it standalone except at uniform coverage (see gateCoverage).
+    gateCoverage,
+    // 5.2: pre-PR gate (`review_findings`), reported distinct from kickbacks (post-PR, above) — see the
+    // comment at the `review_findings` case in the fold loop for why the two must never be one number.
+    reviewFindings: {
+      total: reviewFindingsCount,
+      substitute: reviewFindingsSubstituteCount,
+      byIssue: [...reviewFindingsByIssue.entries()]
+        .map(([issue, v]) => ({ issue, total: v.total, substitute: v.substitute }))
+        .sort((a, b) => a.issue.localeCompare(b.issue)),
+    },
     timing: { timeToFirstHandoffHours: timeToFirstHandoff, timeToMergeHours: timeToMerge },
     tokens: {
       reports: tokenFold.reports,
@@ -557,6 +698,48 @@ function mdTable(headers, rows) {
 
 const fmtN = (n) => (typeof n === "number" ? n.toLocaleString("en-US") : "n/a");
 const fmtH = (v) => (v === null || v === undefined ? "n/a" : `${v.toFixed(1)}h`);
+const fmtRate = (v) => (v === null || v === undefined ? "n/a" : String(v));
+
+// 5.1: the Summary table's Kickback-rate / Tokens-per-PR cells route through this instead of printing
+// the blended number directly. `no_merged_prs` and `unmeasured` both fall through to plain formatting
+// only for the FIRST (blended value itself already "n/a"/reason-carrying); the whole point is that
+// "partial" NEVER reaches a bare number here — see classifyGateCoverage for why a mixed or
+// partly-unmeasured slice can't be assumed to be one population.
+function gatedSummaryValue(gateCoverage, blended, fmt) {
+  if (blended === null || blended === undefined) return "n/a";
+  if (!gateCoverage || gateCoverage.status === "no_merged_prs") return fmt(blended);
+  switch (gateCoverage.status) {
+    case "unmeasured":
+      return `UNMEASURED (${gateCoverage.reason})`;
+    case "partial":
+      return "SPLIT — see 'Gate coverage' below (blended figure refused, DER-2007 5.1)";
+    case "uniform_covered":
+      return `${fmt(blended)} (uniform: bot reviewed all ${gateCoverage.covered.prs} merged PR${gateCoverage.covered.prs === 1 ? "" : "s"})`;
+    case "uniform_uncovered":
+      return `${fmt(blended)} (uniform: bot reviewed none of ${gateCoverage.uncovered.prs} merged PR${gateCoverage.uncovered.prs === 1 ? "" : "s"})`;
+    default:
+      return fmt(blended);
+  }
+}
+
+// Cross-run trend table label (5.1) — terse by necessity (one cell in a multi-run table), but enough
+// to stop a reader from comparing a partial-coverage run's blended rate against a uniform one's: "Runs
+// are only comparable at equal coverage" (2026-07-31 plan, PHASE 5.1).
+function gateCoverageLabel(gc) {
+  if (!gc || gc.status === "no_merged_prs") return "n/a";
+  switch (gc.status) {
+    case "unmeasured":
+      return "UNMEASURED";
+    case "uniform_covered":
+      return `uniform (${gc.covered.prs} covered)`;
+    case "uniform_uncovered":
+      return `uniform (${gc.uncovered.prs} uncovered)`;
+    case "partial":
+      return `${gc.covered.prs} covered / ${gc.uncovered.prs} uncovered`;
+    default:
+      return "n/a";
+  }
+}
 
 export function renderRunMarkdown(m) {
   const lines = [];
@@ -574,9 +757,93 @@ export function renderRunMarkdown(m) {
         ["Leads spawned (lead_spawned events)", `${m.leadsSpawned} (${m.leadsSpawnedDistinctIssues} distinct issues)`],
         ["Hand-offs (handed_off events)", String(m.handoffs)],
         ["Kickbacks total", String(m.kickbacks.total)],
-        ["Kickback rate (per merged PR)", m.kickbacks.ratePerMergedPr === null ? "n/a" : String(m.kickbacks.ratePerMergedPr)],
+        ["Kickback rate (per merged PR)", gatedSummaryValue(m.gateCoverage, m.kickbacks.ratePerMergedPr, fmtRate)],
         ["Total tokens (ledger fold)", fmtN(m.tokens.total)],
-        ["Tokens / merged PR", m.tokens.perMergedPr === null ? "n/a" : fmtN(m.tokens.perMergedPr)],
+        // tokens/PR carries the SAME reviewer-availability contamination as kickback rate (fewer bot
+        // review rounds a PR never got ⇒ fewer tokens spent responding to them) — annotated identically,
+        // not just kickback rate, or this row would keep lying after the one above stopped (5.1).
+        ["Tokens / merged PR", gatedSummaryValue(m.gateCoverage, m.tokens.perMergedPr, fmtN)],
+        ["Pre-PR gate events (review_findings)", `${m.reviewFindings.total} (${m.reviewFindings.substitute} substitute)`],
+      ],
+    ),
+  );
+  lines.push("");
+  lines.push("## Gate coverage (bot-review availability)");
+  lines.push("");
+  lines.push(
+    "Whether the kickback rate and tokens/PR above mean anything at all depends on whether the review " +
+      "bot was actually reviewing: a PR it never touched has structurally fewer kickback rounds " +
+      "(nothing to kick back on) and fewer review-fix tokens — that is reviewer ABSENCE, not review " +
+      "QUALITY. Measured on the 2026-07-31 source run: 2.50 kickbacks/PR on the 8 PRs the bot reviewed " +
+      "vs 0.78/PR on the 9 after it died — blended, that read as 1.17/PR, a 44% *improvement* the " +
+      "orchestrator reported before being corrected. Runs are only comparable at equal coverage.",
+  );
+  lines.push("");
+  if (m.gateCoverage.status === "no_merged_prs") {
+    lines.push("No merged PRs this run.");
+  } else if (m.gateCoverage.status === "unmeasured") {
+    lines.push(
+      `UNMEASURED — ${m.gateCoverage.reason}. Reported as UNMEASURED, never as 0 and never blended: an ` +
+        "unmeasured run could be hiding the exact same gap the source run had.",
+    );
+  } else {
+    lines.push(
+      mdTable(
+        ["Slice", "PRs", "Kickbacks", "Kickback rate", "Tokens", "Tokens/PR"],
+        [
+          [
+            "Bot-reviewed",
+            String(m.gateCoverage.covered.prs),
+            String(m.gateCoverage.covered.kickbacks),
+            fmtRate(m.gateCoverage.covered.ratePerPr),
+            fmtN(m.gateCoverage.covered.tokensTotal),
+            m.gateCoverage.covered.tokensPerPr === null ? "n/a" : fmtN(m.gateCoverage.covered.tokensPerPr),
+          ],
+          [
+            "No bot review",
+            String(m.gateCoverage.uncovered.prs),
+            String(m.gateCoverage.uncovered.kickbacks),
+            fmtRate(m.gateCoverage.uncovered.ratePerPr),
+            fmtN(m.gateCoverage.uncovered.tokensTotal),
+            m.gateCoverage.uncovered.tokensPerPr === null ? "n/a" : fmtN(m.gateCoverage.uncovered.tokensPerPr),
+          ],
+        ],
+      ),
+    );
+    lines.push("");
+    if (m.gateCoverage.status === "uniform_covered") {
+      lines.push("Uniform coverage: every merged PR had at least one bot review — the blended Summary figures above are one population and safe to read as-is.");
+    } else if (m.gateCoverage.status === "uniform_uncovered") {
+      lines.push("Uniform coverage: no merged PR had a bot review — the blended Summary figures above are one population, but are NOT comparable to a bot-reviewed run's numbers.");
+    } else {
+      lines.push("PARTIAL coverage: the blended Summary figures are refused above on purpose — compare the two slices, never the blend.");
+    }
+    if (m.gateCoverage.unmeasuredPrs.length) {
+      lines.push("");
+      lines.push(
+        `${m.gateCoverage.unmeasuredPrs.length} merged PR(s) with UNKNOWN coverage (gh lookup failed or was ` +
+          `skipped), excluded from both slices above: ${m.gateCoverage.unmeasuredPrs.join(", ")}.`,
+      );
+    }
+  }
+  lines.push("");
+  lines.push("## Pre-PR vs post-PR review");
+  lines.push("");
+  lines.push(
+    "Kickbacks are POST-hand-off — every kickback event carries a `pr`. The pre-PR gate emits " +
+      "`review_findings` instead (codex, or a recorded `review-swap` substitute) and is counted " +
+      "separately here: a report that folds the two into one 'review gate' number reads as \"the gate " +
+      "was down\" whenever POST-PR bot review dies, even on a run where the PRE-PR gate never went dark " +
+      "(the 2026-07-31 source run: 40+ review_findings with real blockers, substituted with Claude when " +
+      "needed, while only the post-PR Codex bot went dark 3h47m into a 20h run).",
+  );
+  lines.push("");
+  lines.push(
+    mdTable(
+      ["Stage", "Events", "Distinct issues", "Substitute (non-bot engine)"],
+      [
+        ["Pre-PR gate (review_findings)", String(m.reviewFindings.total), String(m.reviewFindings.byIssue.length), String(m.reviewFindings.substitute)],
+        ["Post-PR (kickback rounds)", String(m.kickbacks.total), String(new Set(m.prRecords.filter((r) => r.rounds > 0).map((r) => r.issue).filter(Boolean)).size), "n/a"],
       ],
     ),
   );
@@ -594,6 +861,12 @@ export function renderRunMarkdown(m) {
     lines.push("> Token/cost per model is in the 'Tokens by role x model' table below (kimi-*/gpt-*/claude-* rows).");
     lines.push("");
   }
+  // 5.1 (do-not-change note): median and p90 are reported SEPARATELY here on purpose — do not collapse
+  // this back to one number. On the 2026-07-31 source run the hand-off->merge median (1.6h) beat both
+  // prior baselines while the SAME run's p90 (13.2h) was the worst in the whole trend table; the p90
+  // was an 8.5h orchestrator blackout (availability), not a review-quality regression. One number would
+  // have hidden whichever of the two it wasn't — the same blending mistake gate coverage exists to stop
+  // one section up, just on the timing axis instead of the review-rate axis.
   lines.push("## Timing (hours, wall-clock)");
   lines.push("");
   lines.push(
@@ -694,6 +967,11 @@ export function buildTrendRow(m) {
     String(m.prsMerged),
     String(m.kickbacks.total),
     m.kickbacks.ratePerMergedPr === null ? "n/a" : String(m.kickbacks.ratePerMergedPr),
+    // 5.1: the blended kickback rate two columns back stays as-is here (a dense multi-run table can't
+    // show the full covered/uncovered split per row) — this column is what makes it SAFE to read: two
+    // runs are only comparable side by side when this cell reads the same for both. "Runs are only
+    // comparable at equal coverage" (2026-07-31 plan, PHASE 5.1).
+    gateCoverageLabel(m.gateCoverage),
     fmtH(m.timing.timeToMergeHours.median),
     fmtN(m.tokens.total),
     m.tokens.perMergedPr === null ? "n/a" : fmtN(m.tokens.perMergedPr),
@@ -734,7 +1012,7 @@ export function renderAllMarkdown(allMetrics) {
   lines.push("");
   lines.push(
     mdTable(
-      ["Date", "Run", "Merged PRs", "Kickbacks", "Kickback rate", "Median time-to-merge", "Total tokens", "Tokens/PR"],
+      ["Date", "Run", "Merged PRs", "Kickbacks", "Kickback rate", "Gate coverage", "Median time-to-merge", "Total tokens", "Tokens/PR"],
       sorted.map(buildTrendRow),
     ),
   );
@@ -742,18 +1020,102 @@ export function renderAllMarkdown(allMetrics) {
 }
 
 // ---------------------------------------------------------------------------
-// CLI
+// CLI — gh I/O lives ONLY here (5.1). `computeMetricsFromEvents` stays pure per the module contract;
+// everything below just measures a `coverageByPr` map and hands it in through the options bag, exactly
+// the shape classifyGateCoverage already expects. Mirrors work-runner.mjs's `runCommand` (never throws,
+// a missing/erroring binary resolves as an exit code rather than an exception) and its
+// `{ run = runCommand }` injection pattern (`deliveredVsAssigned`, `shaDescendsFrom`), so both the fetch
+// itself and the two things that can go wrong with it (no slug, gh failing) are testable without a live
+// `gh` or network.
 // ---------------------------------------------------------------------------
+
+function runCommand({ command, args, cwd, timeoutMs = 30000 }) {
+  return new Promise((resolvePromise) => {
+    const child = spawn(command, args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    const timer = setTimeout(() => child.kill("SIGKILL"), timeoutMs).unref?.();
+    child.stdout.on("data", (c) => (stdout += c.toString("utf8")));
+    child.stderr.on("data", (c) => (stderr += c.toString("utf8")));
+    child.on("error", (e) => {
+      if (timer) clearTimeout(timer);
+      resolvePromise({ exitCode: 127, stdout, stderr: stderr + e.message });
+    });
+    child.on("close", (code) => {
+      if (timer) clearTimeout(timer);
+      resolvePromise({ exitCode: code ?? 1, stdout, stderr });
+    });
+  });
+}
+
+export async function resolveRepoSlug({ cwd = process.cwd(), run = runCommand } = {}) {
+  const res = await run({ command: "gh", args: ["repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"], cwd });
+  if (res.exitCode !== 0) return null;
+  const slug = String(res.stdout || "").trim();
+  return slug || null;
+}
+
+// The actual measurement behind 5.1. One `gh api` call per merged PR, filtered to `botLogin` server-side
+// (jq in `-q`, same pattern `ready`'s codex-on-head check uses in work-runner.mjs) so this is a length
+// check, not a body parse. A PR whose call fails is left OUT of `coverageByPr` entirely — never written
+// as `false` — because classifyGateCoverage treats "absent" as UNKNOWN and "false" as a measured "the
+// bot reviewed nothing here", and those are different facts (2.1's shim-fake-hang lesson, one level up:
+// a probe that can't tell "no" from "couldn't ask" will eventually report the wrong one with confidence).
+export async function fetchBotReviewCoverage({ prNumbers, repoSlug, botLogin = DEFAULT_REVIEW_BOT_LOGIN, cwd = process.cwd(), run = runCommand }) {
+  if (!prNumbers.length) return { coverageByPr: {}, reason: null };
+  if (!repoSlug) return { coverageByPr: null, reason: "no repo slug (gh repo view failed, and --repo was not given)" };
+  const coverageByPr = {};
+  let anyOk = false;
+  for (const n of prNumbers) {
+    const res = await run({
+      command: "gh",
+      args: ["api", `repos/${repoSlug}/pulls/${n}/reviews`, "--paginate", "-q", `[.[]|select(.user.login=="${botLogin}")]|length`],
+      cwd,
+    });
+    if (res.exitCode !== 0) continue; // this PR's coverage is UNKNOWN — see the note above; not "uncovered"
+    const v = String(res.stdout || "").trim();
+    if (!/^\d+$/.test(v)) continue;
+    coverageByPr[n] = Number(v) > 0;
+    anyOk = true;
+  }
+  if (!anyOk) return { coverageByPr: null, reason: "gh api failed for every merged PR (no gh on PATH, auth, or rate-limit)" };
+  return { coverageByPr, reason: null };
+}
+
+async function resolveCoverageForRun({ prNumbers, repo, botLogin, noCoverage }) {
+  const login = botLogin || DEFAULT_REVIEW_BOT_LOGIN;
+  if (noCoverage) return { coverageByPr: null, reason: "coverage fetch skipped (--no-coverage)", botLogin: login };
+  if (!prNumbers.length) return { coverageByPr: {}, reason: null, botLogin: login };
+  const slug = repo || (await resolveRepoSlug());
+  const fetched = await fetchBotReviewCoverage({ prNumbers, repoSlug: slug, botLogin: login });
+  return { ...fetched, botLogin: login };
+}
+
+async function computeRunMetricsCli(runDir, opts) {
+  const events = readEvents(runDir);
+  const usageJson = loadUsageJson(runDir);
+  const base = { run: basename(runDir), runDir, usageJson, ledgerSkipped: lastReadSkipped(runDir) };
+  const prelim = computeMetricsFromEvents(events, base);
+  const coverage = await resolveCoverageForRun({ prNumbers: prelim.prRecords.map((r) => r.pr), ...opts });
+  return computeMetricsFromEvents(events, {
+    ...base,
+    coverageByPr: coverage.coverageByPr,
+    coverageUnmeasuredReason: coverage.reason,
+    coverageBotLogin: coverage.botLogin,
+  });
+}
 
 function usage() {
   return [
     "Usage:",
     "  node work-metrics.mjs --run <run-dir> [--json] [--out <file>]",
+    "                         [--repo <owner/repo>] [--bot-login <login>] [--no-coverage]",
     "  node work-metrics.mjs --all --runs-root <dir> [--json] [--out <file>]",
+    "                         [--repo <owner/repo>] [--bot-login <login>] [--no-coverage]",
   ].join("\n");
 }
 
-export function main(argv) {
+export async function main(argv) {
   const args = parseArgs(argv);
   if (args.help || (!args.run && !args.all)) {
     process.stderr.write(`${usage()}\n`);
@@ -763,6 +1125,7 @@ export function main(argv) {
 
   let markdown;
   let jsonOut;
+  const coverageOpts = { repo: args.repo, botLogin: args.botLogin, noCoverage: args.noCoverage };
 
   if (args.run) {
     if (!existsSync(join(args.run, "events.jsonl"))) {
@@ -770,7 +1133,7 @@ export function main(argv) {
       process.exitCode = 1;
       return;
     }
-    const metrics = computeRunMetrics(args.run);
+    const metrics = await computeRunMetricsCli(args.run, coverageOpts);
     markdown = renderRunMarkdown(metrics);
     jsonOut = metrics;
   } else {
@@ -781,7 +1144,9 @@ export function main(argv) {
       return;
     }
     const dirs = findRunDirs(root);
-    const allMetrics = dirs.map((d) => computeRunMetrics(d)).sort((a, b) => runSortKey(a) - runSortKey(b));
+    const allMetrics = [];
+    for (const d of dirs) allMetrics.push(await computeRunMetricsCli(d, coverageOpts));
+    allMetrics.sort((a, b) => runSortKey(a) - runSortKey(b));
     markdown = renderAllMarkdown(allMetrics);
     jsonOut = { runs: allMetrics };
   }
@@ -798,5 +1163,8 @@ export function main(argv) {
 
 const isMainModule = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
 if (isMainModule) {
-  main(process.argv.slice(2));
+  main(process.argv.slice(2)).catch((err) => {
+    process.stderr.write(`${err?.stack || err?.message || err}\n`);
+    process.exitCode = 1;
+  });
 }

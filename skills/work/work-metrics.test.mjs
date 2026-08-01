@@ -8,14 +8,18 @@ import { test } from "node:test";
 import {
   buildSummaryRow,
   buildTrendRow,
+  classifyGateCoverage,
   computeLeadTypeBreakdown,
   computeMetricsFromEvents,
   computeRunMetrics,
+  fetchBotReviewCoverage,
   findRunDirs,
   foldTokenUsage,
   percentile,
   readEvents,
+  renderAllMarkdown,
   renderRunMarkdown,
+  resolveRepoSlug,
   runSortKey,
   statsFor,
 } from "./work-metrics.mjs";
@@ -208,6 +212,212 @@ test("computeMetricsFromEvents: issues closed unions issue + issues[] + bundle[]
 });
 
 // ---------------------------------------------------------------------------
+// PHASE 5.1 — gate coverage: kickbacks/merged-PR (and tokens/PR) must not be blended across a
+// partial-coverage run. Fixture shapes the 2026-07-31 close-out's headline finding at a smaller scale:
+// a bot-reviewed slice with a materially HIGHER kickback rate than the unreviewed slice, so a blended
+// figure reads as an improvement that isn't there.
+// ---------------------------------------------------------------------------
+
+// Builds N merged PRs (one per entry in `rounds`), each with that many kickback events, sequential PR
+// numbers starting at 1. Returns { events, nextPr } so covered/uncovered fixtures can be concatenated
+// without colliding PR numbers.
+function buildMergedPrs(rounds, { startPr = 1, ts0 = "2026-01-01T00:00:00.000Z" } = {}) {
+  const events = [];
+  let pr = startPr;
+  for (const roundCount of rounds) {
+    const issue = `DER-${pr}`;
+    events.push(ev({ type: "lead_spawned", issue, ts: ts0 }));
+    events.push(ev({ type: "handed_off", pr, issue, ts: "2026-01-01T01:00:00.000Z" }));
+    for (let i = 0; i < roundCount; i += 1) {
+      events.push(ev({ type: "kickback", pr, issue, ts: `2026-01-01T01:${String(10 + i).padStart(2, "0")}:00.000Z` }));
+    }
+    events.push(ev({ type: "pr_merged", pr, issue, ts: "2026-01-01T02:00:00.000Z" }));
+    pr += 1;
+  }
+  return { events, nextPr: pr };
+}
+
+test("5.1: PARTIAL bot-review coverage REFUSES a blended kickback rate (headline-finding control)", () => {
+  // 4 covered PRs / 10 kickbacks -> 2.5/PR; 9 uncovered PRs / 7 kickbacks -> 0.78/PR — same shape as the
+  // measured 8-PR/20-kickback vs 9-PR/7-kickback split on the source run.
+  const covered = buildMergedPrs([3, 3, 2, 2]);
+  const uncovered = buildMergedPrs([1, 1, 1, 1, 1, 1, 1, 0, 0], { startPr: covered.nextPr });
+  const events = [...covered.events, ...uncovered.events];
+  const coverageByPr = {};
+  for (let n = 1; n < covered.nextPr; n += 1) coverageByPr[n] = true;
+  for (let n = covered.nextPr; n < uncovered.nextPr; n += 1) coverageByPr[n] = false;
+
+  const m = computeMetricsFromEvents(events, { run: "synthetic", coverageByPr });
+  assert.equal(m.gateCoverage.status, "partial");
+  assert.deepEqual(m.gateCoverage.covered, { prs: 4, kickbacks: 10, ratePerPr: 2.5, tokensTotal: 0, tokensPerPr: 0 });
+  assert.deepEqual(m.gateCoverage.uncovered, { prs: 9, kickbacks: 7, ratePerPr: 0.78, tokensTotal: 0, tokensPerPr: 0 });
+  // The blended figure is still COMPUTED (kept for existing callers)...
+  assert.equal(m.kickbacks.ratePerMergedPr, 1.31); // 17 kickbacks / 13 merged PRs
+
+  const md = renderRunMarkdown(m);
+  // ...but the FAILING ANSWER this replaces — a report that prints 1.31/PR standalone — must not appear.
+  // 1.31 reads as roughly "one kickback per PR, nothing alarming"; it hides that the reviewed slice was
+  // running at 2.5, more than 3x the unreviewed slice.
+  assert.ok(!md.includes("| Kickback rate (per merged PR) | 1.31 |"), "blended rate must not appear standalone in the Summary table");
+  assert.match(md, /\| Kickback rate \(per merged PR\) \| SPLIT — see 'Gate coverage' below/);
+  assert.match(md, /\| Tokens \/ merged PR \| SPLIT — see 'Gate coverage' below/, "tokens/PR gets the SAME refusal — it carries the same contamination (5.1 item 5)");
+  assert.match(md, /\| Bot-reviewed \| 4 \| 10 \| 2\.5 \|/);
+  assert.match(md, /\| No bot review \| 9 \| 7 \| 0\.78 \|/);
+});
+
+test("5.1 CONTROL: UNIFORM coverage (all merged PRs reviewed) still prints ONE blended rate", () => {
+  const { events, nextPr } = buildMergedPrs([3, 3, 2, 2]); // same per-PR shape as the covered slice above
+  const coverageByPr = {};
+  for (let n = 1; n < nextPr; n += 1) coverageByPr[n] = true;
+
+  const m = computeMetricsFromEvents(events, { run: "synthetic", coverageByPr });
+  assert.equal(m.gateCoverage.status, "uniform_covered");
+  assert.equal(m.kickbacks.ratePerMergedPr, 2.5);
+
+  const md = renderRunMarkdown(m);
+  assert.match(md, /\| Kickback rate \(per merged PR\) \| 2\.5 \(uniform: bot reviewed all 4 merged PRs\) \|/);
+  assert.ok(!md.includes("SPLIT"), "a uniform run must not refuse the blend — only a partial one does");
+});
+
+test("5.1 CONTROL: UNIFORM coverage (no merged PR reviewed) also prints ONE blended rate, distinctly labeled", () => {
+  const { events, nextPr } = buildMergedPrs([1, 0]);
+  const coverageByPr = {};
+  for (let n = 1; n < nextPr; n += 1) coverageByPr[n] = false;
+
+  const m = computeMetricsFromEvents(events, { run: "synthetic", coverageByPr });
+  assert.equal(m.gateCoverage.status, "uniform_uncovered");
+  const md = renderRunMarkdown(m);
+  assert.match(md, /\| Kickback rate \(per merged PR\) \| 0\.5 \(uniform: bot reviewed none of 2 merged PRs\) \|/);
+});
+
+test("5.1: coverage UNMEASURED reports UNMEASURED, never 0 — no coverageByPr supplied at all", () => {
+  // Three merged PRs, genuinely zero kickbacks — the blended figure really IS 0 here, which is exactly
+  // why this case matters: an unmeasured run with a real 0 must still refuse to print a bare "0", or it
+  // is indistinguishable from "we checked and it's fine."
+  const { events } = buildMergedPrs([0, 0, 0]);
+  const m = computeMetricsFromEvents(events, { run: "synthetic" }); // coverageByPr omitted entirely
+  assert.equal(m.gateCoverage.status, "unmeasured");
+  assert.equal(m.kickbacks.total, 0);
+  assert.equal(m.kickbacks.ratePerMergedPr, 0);
+
+  const md = renderRunMarkdown(m);
+  assert.ok(!md.includes("| Kickback rate (per merged PR) | 0 |"), "an unmeasured run must never print a bare 0");
+  assert.match(md, /\| Kickback rate \(per merged PR\) \| UNMEASURED \(bot-review coverage not measured for this run\) \|/);
+});
+
+test("5.1: a PR whose coverage lookup FAILED is UNKNOWN, not folded into either slice — mixed known+unknown still refuses the blend", () => {
+  const { events, nextPr } = buildMergedPrs([3, 1, 0]); // PR 1, 2, 3
+  const coverageByPr = { 1: true, 2: true }; // PR 3 deliberately absent — simulates a failed gh lookup
+  const m = computeMetricsFromEvents(events, { run: "synthetic", coverageByPr });
+  assert.equal(m.gateCoverage.status, "partial");
+  assert.deepEqual(m.gateCoverage.unmeasuredPrs, [3]);
+  assert.equal(nextPr, 4);
+  const md = renderRunMarkdown(m);
+  assert.match(md, /1 merged PR\(s\) with UNKNOWN coverage/);
+});
+
+test("5.1: cross-run trend table's Gate coverage column lets two runs be compared only at equal coverage", () => {
+  const partial = buildMergedPrs([3, 1]);
+  const partialM = computeMetricsFromEvents(partial.events, { run: "run-partial", coverageByPr: { 1: true, 2: false } });
+  const uniform = buildMergedPrs([2, 2]);
+  const uniformM = computeMetricsFromEvents(uniform.events, { run: "run-uniform", coverageByPr: { 1: true, 2: true } });
+  const unmeasuredM = computeMetricsFromEvents(buildMergedPrs([1]).events, { run: "run-unmeasured" });
+
+  const partialRow = buildTrendRow(partialM);
+  const uniformRow = buildTrendRow(uniformM);
+  const unmeasuredRow = buildTrendRow(unmeasuredM);
+  assert.equal(partialRow[5], "1 covered / 1 uncovered");
+  assert.equal(uniformRow[5], "uniform (2 covered)");
+  assert.equal(unmeasuredRow[5], "UNMEASURED");
+
+  const md = renderAllMarkdown([partialM, uniformM, unmeasuredM]);
+  assert.match(md, /1 covered \/ 1 uncovered/);
+  assert.match(md, /uniform \(2 covered\)/);
+});
+
+// ---------------------------------------------------------------------------
+// PHASE 5.2 — pre-PR gate (`review_findings`) folded distinct from post-PR kickbacks. During the
+// 2026-07-31 source run the pre-PR gate never went dark (40+ review_findings, substituted with Claude
+// when needed); only the post-PR bot died. A report that folds the two into one "review gate" figure
+// gets that wrong.
+// ---------------------------------------------------------------------------
+
+test("5.2: review_findings folds pre-PR gate events distinct from kickbacks, with substitute counted per issue", () => {
+  const events = [
+    ev({ type: "review_findings", issue: "DER-1", engine: "codex", substitute: false, ts: "2026-01-01T00:10:00.000Z" }),
+    ev({ type: "review_findings", issue: "DER-1", engine: "claude", substitute: true, ts: "2026-01-01T00:20:00.000Z" }),
+    ev({ type: "review_findings", issue: "DER-2", engine: "claude", substitute: true, ts: "2026-01-01T00:30:00.000Z" }),
+  ];
+  const m = computeMetricsFromEvents(events, { run: "synthetic" });
+  assert.equal(m.reviewFindings.total, 3);
+  assert.equal(m.reviewFindings.substitute, 2);
+  assert.deepEqual(m.reviewFindings.byIssue, [
+    { issue: "DER-1", total: 2, substitute: 1 },
+    { issue: "DER-2", total: 1, substitute: 1 },
+  ]);
+});
+
+test("5.2 CONTROL: post-PR bot death (zero kickbacks) does NOT read as the pre-PR gate being down", () => {
+  const events = [
+    ev({ type: "lead_spawned", issue: "DER-1", ts: "2026-01-01T00:00:00.000Z" }),
+    ev({ type: "review_findings", issue: "DER-1", engine: "claude", substitute: true, ts: "2026-01-01T00:30:00.000Z" }),
+    ev({ type: "handed_off", pr: 1, issue: "DER-1", ts: "2026-01-01T01:00:00.000Z" }),
+    // no kickback events: the POST-PR bot never reviewed this PR (dead) — but the PRE-PR gate DID run.
+    ev({ type: "pr_merged", pr: 1, issue: "DER-1", ts: "2026-01-01T02:00:00.000Z" }),
+  ];
+  const m = computeMetricsFromEvents(events, { run: "synthetic" });
+  // FAILING ANSWER this replaces: a report that only reads `kickbacks.total` (0) and calls that "the
+  // review gate was down" is wrong — the pre-PR gate ran fine on this exact issue.
+  assert.equal(m.kickbacks.total, 0, "post-PR kickbacks genuinely zero — the bot was dead");
+  assert.equal(m.reviewFindings.total, 1, "the pre-PR gate DID run; a blended 'gate down' report would hide this");
+  const md = renderRunMarkdown(m);
+  assert.match(md, /Pre-PR gate \(review_findings\) \| 1 \| 1 \| 1 \|/);
+  assert.match(md, /Post-PR \(kickback rounds\) \| 0 \|/);
+});
+
+// ---------------------------------------------------------------------------
+// PHASE 5.1 — gh I/O layer (fetchBotReviewCoverage / resolveRepoSlug). Both take an injected `run`,
+// mirroring work-runner.mjs's `{ run = runCommand }` pattern, so the "no gh" / "gh api failed" paths
+// are testable without a live `gh` binary or network — the same UNKNOWN-vs-ABSENT discipline as the
+// pure fold above, just exercised at the I/O boundary instead.
+// ---------------------------------------------------------------------------
+
+test("fetchBotReviewCoverage: no repo slug resolved -> null coverageByPr with a reason, not an empty map", async () => {
+  const res = await fetchBotReviewCoverage({ prNumbers: [1, 2], repoSlug: null });
+  assert.equal(res.coverageByPr, null);
+  assert.match(res.reason, /no repo slug/);
+});
+
+test("fetchBotReviewCoverage: per-PR coverage from an injected `run` — a failed lookup is left OUT of the map, not written as false", async () => {
+  const fakeRun = async ({ args }) => {
+    const pr = Number(String(args[1]).match(/pulls\/(\d+)\//)[1]);
+    if (pr === 1) return { exitCode: 0, stdout: "2\n", stderr: "" }; // 2 bot reviews -> covered
+    if (pr === 2) return { exitCode: 0, stdout: "0\n", stderr: "" }; // 0 bot reviews -> not covered
+    return { exitCode: 1, stdout: "", stderr: "rate limited" }; // pr 3: API call itself failed
+  };
+  const res = await fetchBotReviewCoverage({ prNumbers: [1, 2, 3], repoSlug: "owner/repo", run: fakeRun });
+  assert.deepEqual(res.coverageByPr, { 1: true, 2: false });
+  assert.equal(3 in res.coverageByPr, false, "a failed lookup must be ABSENT from the map, not `false`");
+  assert.equal(res.reason, null);
+});
+
+test("fetchBotReviewCoverage: gh failing for EVERY PR reports UNMEASURED, not a map of all-false", () => {
+  const fakeRun = async () => ({ exitCode: 127, stdout: "", stderr: "command not found: gh" });
+  return fetchBotReviewCoverage({ prNumbers: [1, 2], repoSlug: "owner/repo", run: fakeRun }).then((res) => {
+    // FAILING ANSWER this replaces: if a total gh outage folded to `{1: false, 2: false}`, this run
+    // would render as UNIFORM (no bot review) — a confident, wrong answer indistinguishable from a real
+    // codex outage that the gate actually observed.
+    assert.equal(res.coverageByPr, null, "must never silently report zero coverage for every PR as measured");
+    assert.match(res.reason, /gh api failed for every merged PR/);
+  });
+});
+
+test("resolveRepoSlug: injected `run` failure resolves to null, never throws", async () => {
+  const fakeRun = async () => ({ exitCode: 1, stdout: "", stderr: "not a git repository" });
+  assert.equal(await resolveRepoSlug({ run: fakeRun }), null);
+});
+
+// ---------------------------------------------------------------------------
 // token folding — by_model dedup by report_id
 // ---------------------------------------------------------------------------
 
@@ -392,7 +602,10 @@ test("buildTrendRow: fixed column count, order, and content matches the spec'd t
     { run: "run-b" },
   );
   const row = buildTrendRow(m);
-  assert.deepEqual(row, ["2026-01-02", "run-b", "1", "1", "1", "2.0h", "0", "0"]);
+  // Column 5 (index) is the new Gate coverage column (5.1) — "UNMEASURED" here because this fixture
+  // passes no `coverageByPr`, which is the correct default: absence of coverage data must never read as
+  // a real measurement (see the gate-coverage test block below for the full defect this stops).
+  assert.deepEqual(row, ["2026-01-02", "run-b", "1", "1", "1", "UNMEASURED", "2.0h", "0", "0"]);
 });
 
 test("runSortKey: falls back to the run-dir timestamp prefix when run_started is absent", () => {

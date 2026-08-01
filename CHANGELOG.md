@@ -103,6 +103,56 @@ undocumented tribal knowledge.
   stale-but-**untampered**, so per-file digests report CLEAN — correctly — while the install lags by ~12
   commits. Reports `unknown` when no checkout is in reach, never "current".
 
+### Fixed — run lifecycle and coordination (Phases 3–4)
+
+- **The `complete-run` / `reap` deadlock (4.3).** `complete-run` counted never-dispatched `state.queue`
+  ids as non-terminal and prescribed `reap <id>`; `reap` refused exactly those, because `state.issues`
+  entries are only created when an event *names* the id — so the `!unit` branch returned before
+  `--abandon` was consulted, and there is deliberately no `--force`. **A non-empty queue at run end was
+  an unconditional deadlock**, with the harness prescribing the one command that refuses. `reap` now
+  accepts a `state.queue` id, tears nothing down, and appends `reaped` with `never_started: true` — the
+  plan's preferred fix. A typo'd id is still refused, so the phantom-terminal-event guard is intact.
+- **A retraction shape for an append-only ledger (4.4).** `state.reap_failures` listed DER-2868 forever
+  after both leaks were verified resolved. `reap_failure_retracted` references the original `event_id`
+  **with evidence** and renders the entry `RETRACTED`: the original stays (append-only intact), the
+  banner stops lying. Both fields are required — this is the one shape that can clear a safety banner.
+- **`failed` vs `unverifiable` in reap's surfaced guidance (4.5).** The probe already drew the
+  distinction in `reason`; the always-shown `act` text said *"still ALIVE and burning tokens"* either
+  way. DER-2868's leak was: no process ever existed and ssh was down. "Go kill something" and "go find
+  out whether there is anything to kill" are different instructions.
+- **`rotate-shepherd` (4.1).** Leads had `rotate-lead`; the shepherd had nothing, and `spawn-shepherd`
+  has no handoff step — so a successor re-derived state and **silently lost in-flight reasoning**. At the
+  19:48Z rotation shepherd #4 lost partially-written #1183 gate-swap findings and an unrecorded
+  review-debt fold decision. Checkpoints notes → renders `briefs/shepherd.rot<n>.md` → spawns (keeping
+  the unproven-spawn refusal) → **verifies** the event landed. With no checkpoint it says so loudly:
+  *treat every in-flight belief as LOST*, because an empty section reads as "nothing was in flight".
+- **Actor instance ids (4.2).** Events carried a role, so every shepherd in a run collapsed into one
+  bucket. `shepherd#4` is now stamped and `usage` folds `by_instance`. A role-only actor parses to
+  instance `null` — never `#1`, since crediting an unidentifiable shepherd to the first one is exactly
+  the misattribution that put #1183 in a run report and a learnings entry under the wrong name.
+- **`cmux-say` refuses an actionable message with no `--ledger-ref` (3.1).** `cmux send` lands in a
+  session's *input queue*; a mid-turn session reads it only when the turn ends, and a ruling once sat
+  ~4 minutes. **DELIVERED ≠ READ.** The pane text becomes "read ledger `<id>`", recipients append
+  `msg_ack {ref}`, and `state.unacked_messages` surfaces anything unacked on every wake — generalising
+  the kickback relay's proven ~10-minute rule. `--fyi` is a deliberate, explicit escape.
+- **Recent per-issue notes in the wake payload (3.2).** Shepherd #4's 19:06:03Z memo and the
+  orchestrator's 19:12Z ruling crossed in flight and independently re-derived the identical #1185 re-pin
+  recipe — correct outcome, wasted effort, and it could as easily have produced two *different* recipes.
+- **A verdict-first contract on every dispatched subagent (3.3),** terminating in `COMPLETE` /
+  `INCOMPLETE` / `REFUSED` — never silence. **And a correction to standing guidance:** SILENT is not
+  WEDGED. Two of three reviewers went silent twice, then delivered in full on an explicit *"findings or
+  INCOMPLETE"* ultimatum, having burned 136k and 158k tokens. Re-pinging did nothing. Send the ultimatum
+  to a silent agent; reserve respawn for a provably wedged one.
+- **`staleness-check` (2.7).** DER-2594 sat `Todo` ~21h having been fixed weeks earlier — and its parked
+  branch was *behind* main, so merging it would have removed a `credentials` join and reopened the drift
+  it was filed to close. The naive check is blind too: DER-2814 matched `preflight` **8×**, every hit an
+  unrelated body-size budget, so `grep -c` read ALREADY DONE. Uses `git log -S` and prints **where a
+  symbol landed** — commit, subject, date — never a count, and never asserts "already done".
+- **Token totals declare their floors (5.3).** `usage` already flagged unpriced *cost*; it now flags
+  structural gaps that move the *token* total — reports refused at ingestion (the `trustedCommentAuthors`
+  deny-list silently dropped cloud reports before ~18:15Z) and undrained hosts — as
+  `TOTAL (FLOOR — n report source(s) known missing)`.
+
 ### Notes
 
 - The plan prescribed hardcoding `~/bin/codex` for 2.1. Re-verification found that path **does not exist

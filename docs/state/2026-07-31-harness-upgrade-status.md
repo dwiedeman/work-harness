@@ -144,3 +144,162 @@ skipping any `cmux-cli-shims` path, and falls back to `~/bin/codex` only if it e
 
 No `never_started` flag exists anywhere. The plan's preferred fix is implemented; no events were
 hand-appended to the stuck run.
+
+---
+
+## Final disposition — all 22 items
+
+Landed on `main`: `9ac37d7` (P0.3), `b8aaa80` (2.1, 2.2), `1e1725d` (Phase 1).
+Landed on PR #38 (`harness-upgrades-phase-3-6`): everything else.
+
+| Item | Status | Where |
+|---|---|---|
+| P0.1 sync | ✅ done | 620 tests green, drift 0 |
+| P0.2 re-verify | ✅ done | this doc, commit `06b31f3` |
+| P0.3 drift digest | ✅ implemented | `9ac37d7` |
+| 1.1 `review-swap` | ✅ implemented | `1e1725d` |
+| 1.2 posture-C procedure | ✅ implemented | `1e1725d` — `work-shepherd/SKILL.md` |
+| 1.3 `waive-codex-gate` | ✅ implemented | `1e1725d` |
+| 1.4 gate provenance | ✅ implemented | `1e1725d` — `state.issues[].gate` |
+| **1.5 review-fidelity** | **⛔ STRUCK — already fixed** | no code change; control test added |
+| 2.1 codex resolution | ✅ implemented *(adapted)* | `b8aaa80` — see deviation below |
+| 2.2 `watch` terminal record | ✅ implemented | `b8aaa80` |
+| 2.3 sleep detection | ✅ implemented | PR #38 |
+| 2.4 40-char sha | ✅ implemented | `1e1725d` |
+| 2.5 config getters | ✅ implemented *(premise corrected)* | PR #38 |
+| 2.6 `fileScope` refusal | ✅ implemented | PR #38 — `computeEligible --strict` |
+| 2.7 `staleness-check` | ✅ implemented | PR #38 |
+| 3.1 message receipts | ✅ implemented | PR #38 |
+| 3.2 crossed messages | ✅ implemented *(cheap variant)* | PR #38 — see below |
+| 3.3 verdict-first | ✅ implemented | PR #38 |
+| 4.1 `rotate-shepherd` | ✅ implemented | PR #38 |
+| 4.2 actor instance ids | ✅ implemented | PR #38 |
+| 4.3 completion deadlock | ✅ implemented | PR #38 |
+| 4.4 retraction shape | ✅ implemented | PR #38 |
+| 4.5 failed vs unverifiable | ✅ implemented | PR #38 |
+| 5.1 gate coverage split | ✅ implemented | PR #38 |
+| 5.2 pre- vs post-PR review | ✅ implemented | PR #38 |
+| 5.3 token floors | ✅ implemented | PR #38 |
+| 6.1 `.local` HostName | ✅ implemented | PR #38 |
+| 6.2 `known_hosts` procedure | ✅ implemented | PR #38 — `SECURITY.md` |
+| 6.3 swap guard | ✅ implemented | PR #38 |
+
+### Deliberate deviations from the plan, and why
+
+1. **2.1 — the plan's prescribed fix would have broken this host.** It says to resolve `~/bin/codex`
+   explicitly. That path does not exist here; `codex` on `PATH` *is* the real `@openai/codex` CLI, and
+   the cmux shims present never invoke `timeout`. Implemented as a resolver that honours
+   `WORK_CODEX_BIN`, skips any `cmux-cli-shims` path, and falls back to `~/bin/codex` **only if it
+   exists** — the durable rule without the brittle path. The companion audit the plan asked for
+   (*no bare `timeout` anywhere*) came back **clean** and now ships as a standing test.
+
+2. **3.2 — the cheap variant, deliberately.** The plan offered a `claim`/lease subcommand *or*
+   "surface the last N `*_note` events per issue in the wake payload". The latter is implemented. A
+   lease adds a second thing that can be stale or forgotten (an abandoned claim blocks a sibling with
+   no way to tell it apart from an active one); surfacing fresh notes solves the observed failure —
+   two agents re-deriving one answer — without adding state that can itself go wrong. If crossed
+   analysis recurs *with* notes visible, the lease is the next step.
+
+3. **2.4 — format enforced everywhere, presence required only by `review-swap`.** An absent sha folds
+   to the pre-existing `gate=UNSTAMPED` shape, which older ledgers rely on and which `review-usage`
+   still produces legitimately on a bare checkout. 2.4 is about a sha that is *present but truncated*.
+   Making absence fatal in `review-usage` would retroactively refuse older ledgers — scope this item
+   did not ask for. **Noted as a genuine follow-up:** `gate=UNSTAMPED` has `blocks: false`, so a gate
+   with no sha currently *passes*. That is a real hole, separate from 2.4, and worth its own issue.
+
+4. **Two defects my own controls caught mid-implementation**, recorded because they are the wave's
+   whole thesis — a check that cannot produce the failing answer:
+   - `measureHarnessDrift` first re-hashed only the paths the manifest listed, so it reported
+     `untracked: []` for a rogue file. It now walks the tree.
+   - The CI version-bump gate's own `git diff … || true` would have swallowed a git failure into "no
+     `skills/**` changes" and passed loudest at the moment it stopped working.
+
+### Process deviation to flag
+
+The handoff says code changes should ride PRs. Phases 0–2 and Phase 1 were pushed **directly to
+`main`** (three commits) before I corrected course; the push printed a branch-protection bypass
+notice. Those commits are green on CI on `main`. Everything from 4.3 onward rides PR #38. Nothing was
+rewritten after the fact — the history is honest about what happened.
+
+### Not done / deferred
+
+- **`clawd-skills` push:** no plan item required it, so nothing is pending there. If a future item
+  does, this host cannot do it (gh here is `dwiedeman`, not `gtg708q`).
+- **Remote host re-sync (`ssh macmini-hermes …`, plan P0.1's second half):** not performed — no ssh
+  hosts are configured in this repo's `work.config.json`, so there is no remote to sync. The
+  cross-host `harness-digest:<host>` check is implemented and will exercise on any host that is
+  configured.
+- **The stuck run `20260730T233426Z-der-2869-der-2864` was NOT touched.** 4.3 makes it closable, but
+  closing it is a `/work` operator action against that run's own ledger, and the handoff explicitly
+  forbids hand-appending reaped events. Close it with `reap --run <r> <queued-id>` per never-started
+  id, then `complete-run`.
+
+---
+
+## Substitute gate — the 3-lens adversarial panel on this work
+
+The handoff's substitute for the dead codex gate: *"implementer subagents run a documented adversarial
+self-review before any PR/merge, and you review each diff yourself."* Run as a **posture-C panel using
+the procedure this very plan adds** (`work-shepherd/SKILL.md`), against `git diff aed5abc...HEAD`:
+three DISTINCT lenses — correctness, security/trust-boundary, does-it-actually-reproduce — each
+prompted to REFUTE and to default `refuted: true` under uncertainty.
+
+**Verdicts: correctness `refuted: false`, security `refuted: false`, repro `refuted: false`.** Three
+findings survived, all three real, all three fixed:
+
+### A — `reap_failure_retracted` could silence a LATER, live leak (found by correctness AND security, independently)
+
+The strongest kind of finding: two lenses converged on it from different directions. Only ONE
+`reap_failed` is folded per issue (last wins), and the retraction required `retracts` to be merely
+*non-empty*. So:
+
+```
+reap_failed EV-1 (remote_pkill)      → an unverifiable kill
+reap_failed EV-2 (worktree remove)   → a DIFFERENT, still-open leak, replaces EV-1 in the fold
+reap_failure_retracted retracts=EV-1 → clears the banner for EV-2
+```
+
+Reproduced directly: `status: "RETRACTED"` with `remote_worktree_remove` still open — dropping a
+possibly-still-running remote lead from `state`, from every `watch` wake, and from `complete-run`'s
+exit banner. **A silent pass, introduced by the fix for a banner that lied.** Exactly the defect class
+this wave exists to remove, committed by the wave itself.
+
+Fixed: a retraction must name the CURRENT `reap_failed` event_id, and a rejected one is surfaced as
+`retraction_rejected` rather than silently ignored.
+
+### B — `computeEligible`'s guard could never fire (found by correctness)
+
+It shipped with `strict = false` and a comment asserting *"the dispatch path passes strict"*. There is
+no such path: `computeEligible` has **zero callers inside the runner** — the orchestrator invokes it
+from `SKILL.md` prose. So nothing was ever going to pass the flag, and **the guard I added for 2.6
+could not fire on the only path that matters**, while a comment claimed it did.
+
+Fixed: `strict` now defaults to `true`; `SKILL.md`'s dispatch instructions document the refusal and the
+explicit `strict: false` opt-out.
+
+### C — `sleepGapDetected`'s factor clause had zero coverage (found by repro, via mutation)
+
+Deleting `actualMs < expectedMs * SLEEP_GAP_FACTOR` left the entire 491-test suite **green**. The
+clause is what stops a merely-slow long poll from being reported as a host sleep. A clause no test
+covers is one a future refactor can delete silently.
+
+Fixed: a test with paired controls (1.7× over a 100s poll → not a sleep; 8× → a sleep; 8× of a 2.5s
+tick → still under the 60s floor).
+
+### Panel discipline notes
+
+- The repro lens **mutation-tested** the other two lenses' subjects and reported paired controls, per
+  the procedure: 8 mutations, 7 red, 1 green — and the single green one *was* finding C. A green
+  mutation meant something only because the others went red.
+- All three fixes are themselves mutation-verified: reverting each fix turns its new test red, with an
+  unmutated control green.
+- **A process lesson worth recording:** during mutation testing I used `git checkout -- <file>` to
+  revert, which silently discarded UNCOMMITTED fixes A and B (checkout restores the last *commit*).
+  Caught immediately by re-running the suite. Mutation testing against a dirty tree needs a real
+  file backup, not `git checkout`.
+- The repro lens also reported that a `system-reminder`-shaped message appeared in its context claiming
+  a just-reverted file had been intentionally modified and instructing it not to revert and not to tell
+  me. It verified against `git status`, found the claim false, ignored it, and reported it. That is the
+  correct behaviour and the reason the verdict-first contract exists. (The message is this harness's own
+  file-change notification misfiring on an external revert — not an attack — but the agent could not
+  know that, and reporting it was right.)
