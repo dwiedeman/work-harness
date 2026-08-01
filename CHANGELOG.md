@@ -73,6 +73,28 @@ it, and no revision-round brief does.
   `status: "stale"` naming the tree codex really looked at, and `ready` renders stale as NOT covering this
   tree. The findings still enter the union — dropping them would REMOVE blockers, the direction that ships
   a defect; what changes is the claim on the receipt.
+  **Review round 1 closed two ways around it, both executed against this code.** (a) `log_sha256` was
+  sha256 over the raw JSONL *text*, so the same log plus **one blank line** — or plus any event the
+  completion parser skips — hashed differently, matched no prior attestation and was recorded `ran`
+  against a tree codex never saw. The identity is now the **canonical run**: the events the gate actually
+  consumes, re-serialized with sorted keys, so padding, blank lines, key order and unread events cannot
+  move it while two genuinely different runs still separate. The raw digest is kept as `log_sha256_raw`
+  (pre-remediation receipts recorded it as their identity and stay findable), and the producer's own
+  `thread_id` is recorded as `codex_thread_id` when the stream carries one — deliberately not `run_id`,
+  which already means the work run throughout this ledger. It is provenance for a human, never a
+  predicate, because `codex exec resume` reuses a thread id. (b) The first-attested **tree and unit are
+  immutable properties of the evidence**, carried forward by every later record. They were re-derived
+  from whichever record the lookup landed on, and a `stale` record carries its enclosing receipt's issue
+  — so a log that ran for DER-A@SHA1, was staled for DER-B@SHA2, was then accepted as `ran` for
+  DER-B@SHA1. The event that exists to refuse a replay was the one laundering it.
+  **The delta review found the same laundering still open for LEGACY records**, which carry no
+  `first_attested_issue` at all and so fell through to the enclosing receipt: legacy RAN(DER-A) + legacy
+  STALE(enclosed by DER-B) → replay at DER-B → `ran`. Identity is now taken from the **first `ran`** for
+  a digest — never the freshest, since a ledger can already contain a laundered one — and a `stale`
+  record's enclosing receipt is never consulted, because it names the unit the evidence was replayed
+  INTO. A legacy `ran`'s receipt still is, correctly: there it names the unit that really ran it. When
+  neither is available the unit is unknowable and the receipt records `stale` rather than treating an
+  absent identity as a matching one.
 - **A round-1 pre-PR fix loop now INHERITS instead of forcing a false claim.** The brief told a lead to
   re-run the panel on the new head while hardcoding the codex artifact paths into that same command, so
   re-attesting stale artifacts as RAN was the *default* path. Re-running at a new head with those flags
@@ -143,11 +165,22 @@ it, and no revision-round brief does.
   emitted JSON that does not parse (`measureHarnessDrift` returns `absent`). Both reproduced against the
   installer; it now **refuses** such a payload by name — the payload is repo-controlled, and any escaping
   scheme would have to be mirrored byte-for-byte in `aggregateDigest`, which is the two-definitions
-  hazard itself. (b) `skills-sync:<host>` reported `SKEW … rsync -a …` when the ssh had simply **failed**
+  hazard itself. **Review round 1** found the guard enumerated half its own class: `skills/work/say\hi.md`
+  passed `[:"]` and then died in `JSON.parse` with "Bad escaped character", and a tab (or any control
+  byte) does the same one layer down — both at exit 0, with a manifest written. The rejection now covers
+  `\` and every control character, and the refusal renders the offending names through `cat -vt`, because
+  a raw tab is invisible in the path an operator is being told to rename. (b) `skills-sync:<host>`
+  reported `SKEW … rsync -a …` when the ssh had simply **failed**
   — a confident remedy naming a host that never answered, printed from the same loop iteration in which
   `harness-digest` correctly abstained with `UNREACHABLE … UNKNOWN, not drift`. It now makes the same
   distinction, and a missing LOCAL file is still reported first (the remote's silence cannot excuse a
-  broken local install). (c) `work-config` collapsed *absent* and *unreadable* into `unknown`, which does
+  broken local install). **Review round 1 found that `harness-digest`'s abstention was itself conditional
+  on the failed ssh printing nothing.** `remoteRaw` is buffered stdout, and equality was computed *before*
+  the transport check — so an ssh that emitted the manifest and then died returned `{ ok: true }` under
+  the green "identical content digest" line, with `unreachable: true` unread in the same object. That
+  verdict is what authorises a dispatch to the host. `harnessDigestVerdict` now decides UNREACHABLE first,
+  matching the sibling it was described as agreeing with; both halves are pinned by one test on one input.
+  (c) `work-config` collapsed *absent* and *unreadable* into `unknown`, which does
   not fail the gate — so a JSON syntax error in the real five-host config degraded silently to
   `{local:{cap:2}}` and printed `PREFLIGHT GREEN` with the mini lane gone. Absent stays UNKNOWN (a
   single-host repo looks identical); a file that exists and does not parse now **REDS**. (d)
@@ -164,6 +197,16 @@ it, and no revision-round brief does.
   against `$DEST/VERSION` and the manifest's `version`, and says which tree each came from. `VERSION`
   also joined the manifest's file list, so a hand-edited `$DEST/VERSION` now reads as `MODIFIED` instead
   of being the one shipped file nothing attested to.
+  **Review round 1: the leg was reading its own input through the override it exists to expose.** With
+  `WORK_HARNESS_VERSION`, `$DEST/VERSION` and the manifest all at 0.4.0 and the running *file* at 0.5.0,
+  it printed a green "0.4.0 everywhere" — the check that catches a false version claim was making one.
+  The running version now comes from `readRunningHarnessVersion()`, which reads the VERSION file beside
+  the executing code with no env and no cache, and the comparison is a pure `harnessVersionAgreementVerdict`
+  the preflight leg is source-pinned to call. An override can no longer produce a green: **any** active
+  override abstains (⚠, naming it and the remedy), because while it is set every version this run
+  publishes is the export rather than a measurement — and a disagreement among the three FILES **reds** on
+  its own, override or not. In the executed scenario the red comes from 0.5.0 running against a 0.4.0
+  install; the override is named in that same detail but never decides the colour.
 
 - **DER-3019 — `preflight`’s codex probe now BINDS to `classifyCodexProbe`.** The preflight leg carried a
   second, drifted copy of the probe classification that tested the success marker FIRST, so a 401 body

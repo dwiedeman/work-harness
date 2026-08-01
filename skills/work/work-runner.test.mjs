@@ -35,7 +35,8 @@ import {
   parsePanelLensOutput, parsePanelVerifyOutput, unionPanelFindings, applyFalsifications,
   pathRoutedChecklists, panelLensPrompt, panelVerifyPrompt, parseDiffPaths, PANEL_LENS_IDS,
   panelReviewCommands, panelCrossVendorPrompt, crossVendorPassCommands, crossVendorAttestation,
-  latestCrossVendorAttestation, crossVendorLabel, classifyCodexProbe,
+  latestCrossVendorAttestation, crossVendorLabel, classifyCodexProbe, parseCodexRun,
+  priorAttestationByDigest, harnessVersionAgreementVerdict, readRunningHarnessVersion,
   CROSS_VENDOR_LENS, CROSS_VENDOR_HEADING, CROSS_VENDOR_ROUND,
   reapRefusal, reapLeakGuidance, actorInstance, parseActorInstance, renderShepherdRotationBrief,
   stalenessCommand, stalenessVerdict, usageFloorNotes, parseSwapUsage, swapVerdict, sleepGapDetected,
@@ -9718,6 +9719,48 @@ test("DER-3008: an UNREACHABLE host is UNKNOWN, not 'the host has no manifest'",
   }
 });
 
+test("DER-3008 remediation round 1: a FAILED ssh whose stdout happens to parse is still UNREACHABLE", () => {
+  // The test above passes an EMPTY `remoteRaw`, which is what a dead ssh usually leaves — and that is
+  // exactly why the defect survived it. `remoteRaw` is BUFFERED STDOUT: an ssh that printed the manifest
+  // and then died (or whose stdout carried anything parseable) hands this function a remote digest,
+  // and equality was computed BEFORE the transport check. Identical manifests + exit 255 returned
+  // `{ ok: true }` under the green "identical content digest" line, with `unreachable: true` sitting
+  // unread in the same object. `ok: true` here is what authorises a dispatch to that host.
+  const local = { content_digest: "abc123def456789", manifest_schema: 2, version: "0.5.0" };
+  const raw = JSON.stringify({ manifest_schema: 2, version: "0.5.0", content_digest: "abc123def456789" });
+
+  const down = harnessDigestVerdict({ hostName: "mini", sshAlias: "macmini-hermes", local, remoteRaw: raw, remoteExitCode: 255 });
+  assert.equal(down.ok, "unknown", "a probe that could not run is never a verdict — least of all a green one");
+  assert.match(down.detail, /UNREACHABLE/);
+  assert.doesNotMatch(down.detail, /identical content digest/,
+    "the green line must be unreachable when the transport failed, not merely outranked in the object");
+  assert.equal(down.unreachable, true);
+
+  // …and the same input with a DRIFTED remote must not read as drift either: an unreachable host tells
+  // us nothing about its bytes, and "re-install on mini" is the wrong action for a box that is offline.
+  const drifted = harnessDigestVerdict({
+    hostName: "mini", sshAlias: "macmini-hermes", local,
+    remoteRaw: JSON.stringify({ manifest_schema: 2, version: "0.5.0", content_digest: "999999999999" }), remoteExitCode: 255,
+  });
+  assert.equal(drifted.ok, "unknown");
+  assert.doesNotMatch(drifted.detail, /CONTENT DRIFT/);
+
+  // CONTROL — the identical pair over a LIVE transport is still the green answer. Without this the fix
+  // could be "always unknown", which is a check that cannot pass rather than one that cannot fail.
+  const up = harnessDigestVerdict({ hostName: "mini", sshAlias: "macmini-hermes", local, remoteRaw: raw, remoteExitCode: 0 });
+  assert.equal(up.ok, true);
+  assert.match(up.detail, /identical content digest/);
+
+  // THE SIBLING, pinned in the same test because these two lines are printed from ONE loop iteration
+  // against ONE box: `skills-sync` already ordered the transport check first, and a self-contradicting
+  // pair (a confident rsync remedy beside a correct abstention) is what made the defect visible at all.
+  const sync = skillsSyncVerdict({ hostName: "mini", sshAlias: "macmini-hermes", localHash: "h", remoteHash: "h", remoteExitCode: 255, files: ["work-runner.mjs"] });
+  assert.equal(sync.ok, "unknown", "both halves of the cross-host check must abstain on the same input");
+  assert.doesNotMatch(sync.detail, /in sync/);
+  assert.equal(skillsSyncVerdict({ hostName: "mini", sshAlias: "macmini-hermes", localHash: "h", remoteHash: "h", remoteExitCode: 0, files: ["work-runner.mjs"] }).ok, true,
+    "control: over a live transport the identical pair is still green on this side too");
+});
+
 test("DER-3008: crossHostTargets never skips a host silently — every skip carries a reason", () => {
   // The second defect: the three cross-host loops inlined `if (kind === "cloud" || !ssh) continue;`, so
   // "no host was checked" printed ZERO lines and was indistinguishable from three passing checks. On
@@ -9894,6 +9937,96 @@ test("DER-3008: preflight's cross-host loops BIND to crossHostTargets — no loo
   for (const name of ["ssh-hostname:", "skills-sync:", "harness-digest:", "claude-probe:"]) {
     assert.ok(preflight.includes(`add(\`${name}`), `${name}<host> must still be emitted from a bound loop`);
   }
+});
+
+test("DER-3008 remediation round 1: harness-version-agreement reads the FILE, and an override can never green it", () => {
+  // The leg exists to catch a version claim that disagrees with the bytes on disk. It read the running
+  // version through `getHarnessVersion()`, which prefers `WORK_HARNESS_VERSION` and then a process
+  // cache — so the one instrument for version skew answered with the override. Executed by a reviewer:
+  // export 0.4.0, install 0.4.0, manifest 0.4.0, running FILE 0.5.0 → "✅ 0.4.0 everywhere".
+  const args = { installedPath: "/dest/VERSION", manifestFile: "INSTALL-MANIFEST.json", runningFrom: "/checkout/VERSION" };
+
+  const reviewer = harnessVersionAgreementVerdict({
+    ...args, runningFile: "0.5.0", reported: "0.4.0", installed: "0.4.0", recorded: "0.4.0", envOverride: "0.4.0",
+  });
+  assert.equal(reviewer.ok, false, "the reviewer's exact scenario must RED — this printed green before the fix");
+  assert.match(reviewer.detail, /VERSION DISAGREEMENT/);
+  assert.match(reviewer.detail, /0\.5\.0/, "and must name the version the running tree actually is");
+  assert.match(reviewer.detail, /WORK_HARNESS_VERSION=0\.4\.0 is set/, "…and name the override that hid it");
+
+  // An override that AGREES with every file still cannot green: while it is set, every version-bearing
+  // event stamp and status line in the run publishes the override rather than a measurement.
+  const benign = harnessVersionAgreementVerdict({
+    ...args, runningFile: "0.5.0", reported: "0.5.0", installed: "0.5.0", recorded: "0.5.0", envOverride: "0.5.0",
+  });
+  assert.equal(benign.ok, "unknown", "an overridden reading abstains — it is not a measurement");
+  assert.match(benign.detail, /WORK_HARNESS_VERSION=0\.5\.0 is set/);
+
+  // An override that CONTRADICTS the running file while the three files agree is still ⚠, not 🔴 — the
+  // colour is decided by the files, and the override only ever downgrades a green to an abstention.
+  // (The comment above this function once claimed this case reds; it never did. Pinned so the sentence
+  // and the branch cannot drift apart again.)
+  const contradicting = harnessVersionAgreementVerdict({
+    ...args, runningFile: "0.5.0", reported: "0.4.0", installed: "0.5.0", recorded: "0.5.0", envOverride: "0.4.0",
+  });
+  assert.equal(contradicting.ok, "unknown");
+  assert.match(contradicting.detail, /WORK_HARNESS_VERSION=0\.4\.0 is set/);
+
+  // THE CONTROL — without the override, three agreeing files are green. A leg that can only abstain is
+  // as useless as one that can only pass.
+  const green = harnessVersionAgreementVerdict({
+    ...args, runningFile: "0.5.0", reported: "0.5.0", installed: "0.5.0", recorded: "0.5.0", envOverride: null,
+  });
+  assert.equal(green.ok, true);
+  assert.match(green.detail, /0\.5\.0 everywhere/);
+
+  // A checkout runner against an older install is the ordinary red, and it says so without blaming an
+  // override that is not set.
+  const checkout = harnessVersionAgreementVerdict({
+    ...args, runningFile: "0.5.0", reported: "0.5.0", installed: "0.4.0", recorded: "0.4.0", envOverride: null,
+  });
+  assert.equal(checkout.ok, false);
+  assert.doesNotMatch(checkout.detail, /WORK_HARNESS_VERSION/);
+
+  // Unreadable inputs stay UNKNOWN — `harness-drift` above already reds on a missing manifest, and
+  // naming a second, wrong defect for one cause is how an operator learns to wave past both.
+  assert.equal(harnessVersionAgreementVerdict({ ...args, runningFile: "0.5.0", installed: null, recorded: "0.5.0" }).ok, "unknown");
+  assert.equal(harnessVersionAgreementVerdict({ ...args, runningFile: "0.5.0", installed: "0.5.0", recorded: null }).ok, "unknown");
+  assert.equal(harnessVersionAgreementVerdict({ ...args, runningFile: null, installed: "0.5.0", recorded: "0.5.0" }).ok, "unknown");
+
+  // The reader itself: it must resolve THIS tree's VERSION from the file, with no env in the answer.
+  const before = process.env.WORK_HARNESS_VERSION;
+  try {
+    process.env.WORK_HARNESS_VERSION = "42.42.42";
+    const tree = readRunningHarnessVersion();
+    assert.match(tree.version, /^\d+\.\d+\.\d+/);
+    assert.notEqual(tree.version, "42.42.42", "an env override must not reach the file reader");
+    assert.equal(WR.getHarnessVersion(), "42.42.42", "control: the OVERRIDABLE accessor does return it — the two answer different questions");
+    assert.match(tree.path, /VERSION$/);
+  } finally {
+    if (before === undefined) delete process.env.WORK_HARNESS_VERSION; else process.env.WORK_HARNESS_VERSION = before;
+  }
+});
+
+test("DER-3008 remediation round 1: preflight's version leg BINDS to the file reader, not the overridable accessor", async () => {
+  // Same class as the two binding tests below: proving the verdict is correct says nothing about which
+  // function preflight calls, and "preflight called the overridable one" WAS the defect. Known limit,
+  // stated rather than implied: this matches source text inside the leg, not behaviour.
+  const src = await readFile(new URL("./work-runner.mjs", import.meta.url), "utf8");
+  const preflight = src.slice(src.indexOf('case "preflight": {'));
+  assert.ok(preflight.length > 1000, "control: the preflight case must actually be located");
+  const legStart = preflight.indexOf('add("harness-drift"');
+  const legEnd = preflight.indexOf('add("harness-install-current"');
+  assert.ok(legStart > 0 && legEnd > legStart, "control: the version leg must be located");
+  const leg = preflight.slice(legStart, legEnd);
+
+  assert.match(leg, /readRunningHarnessVersion\(\)/, "the running version must come from the FILE reader");
+  assert.match(leg, /harnessVersionAgreementVerdict\(\{/, "and the verdict must be the tested one, not re-inlined");
+  assert.match(leg, /runningFile:/, "…fed as the running-file input, not as some other field");
+  // `getHarnessVersion()` may still appear — the detail reports what the run PUBLISHES — but never as
+  // the running-file reading the comparison turns on.
+  assert.doesNotMatch(leg, /const running = getHarnessVersion\(\)|runningFile: getHarnessVersion\(\)/,
+    "reading the comparison's own input through the overridable accessor re-opens the defect");
 });
 
 test("DER-3019: preflight's codex-probe leg BINDS to classifyCodexProbe — the inline copy of the classification is gone", async () => {
@@ -11324,6 +11457,212 @@ test("DER-3011 remediation: the attestation is bound to a TREE and a UNIT, not t
   const rerun = crossVendorAttestation({ round: 1, sha: SHA2, issueId: "DER-1", priorEvents: ledger, logPath: "/tmp/two.jsonl", logText: codexJsonl({ commands: 9 }), findings });
   assert.equal(rerun.attestation.status, "ran");
   assert.equal(rerun.attestation.covered_sha, SHA2);
+});
+
+test("DER-3011 remediation round 1: a STALE record cannot launder the evidence's original unit", () => {
+  // THE REVIEWER'S EXECUTED CHAIN. Every step reuses ONE codex run's artifacts; codex is never re-run.
+  //   1. it really ran for DER-A@SHA1                      → ran
+  //   2. re-submitted for DER-B@SHA2                       → stale (correct, both before and after)
+  //   3. re-submitted for DER-B@SHA1                       → `ran` BEFORE this fix
+  // Step 3 was accepted because the digest lookup resolved the evidence's unit from the ENCLOSING
+  // receipt when the record carried no `issue` of its own — and the record it landed on was step 2's
+  // stale one, whose enclosing receipt is DER-B. So the intermediate stale event, which exists to
+  // REFUSE a replay, was the thing that rewrote whose evidence it was. Two hops and a replay reads as
+  // a clean first-party round-1 pass.
+  const live = codexJsonl();
+  const findings = [{ title: "Tenant filter dropped", priority: 1, file: "a.ts", line_start: 1, line_end: 2 }];
+  const SHA1 = "1".repeat(40);
+  const SHA2 = "2".repeat(40);
+  const at = (over) => crossVendorAttestation({ round: 1, logPath: "/tmp/one.jsonl", logText: live, findings, ...over });
+  const rec = (issue, a) => ({ type: "review_findings", issue, cross_vendor: a.attestation });
+
+  const ran = at({ sha: SHA1, issueId: "DER-A" });
+  assert.equal(ran.attestation.status, "ran");
+  assert.equal(ran.attestation.first_attested_issue, "DER-A",
+    "the FIRST record must stamp its own unit — leaving it off is what forced the lookup onto the enclosing receipt");
+  assert.equal(ran.attestation.first_attested_round, 1);
+
+  const staled = at({ sha: SHA2, issueId: "DER-B", priorEvents: [rec("DER-A", ran)] });
+  assert.equal(staled.attestation.status, "stale");
+  assert.equal(staled.attestation.first_attested_issue, "DER-A");
+
+  // The lookup is where the evidence's identity is resolved, so it is asserted directly rather than
+  // only through the verdict: read out of DER-B's receipt, the stale record must still say DER-A.
+  const resolved = priorAttestationByDigest([rec("DER-A", ran), rec("DER-B", staled)], staled.attestation.log_sha256);
+  assert.equal(resolved.issue, "DER-A",
+    "the digest lookup must resolve the evidence's OWN unit — falling back to the enclosing receipt is the defect");
+  assert.equal(resolved.first_attested_round, 1);
+  assert.equal(resolved.covered_sha, SHA1);
+
+  const laundered = at({ sha: SHA1, issueId: "DER-B", priorEvents: [rec("DER-A", ran), rec("DER-B", staled)] });
+  assert.equal(laundered.attestation.status, "stale",
+    "a replay that transits a stale record is still a replay — this returned `ran` before the fix");
+  assert.equal(laundered.attestation.covered_sha, SHA1, "and it still names the tree codex really looked at");
+  assert.equal(laundered.attestation.first_attested_issue, "DER-A", "…and the unit it really reviewed");
+  assert.match(crossVendorLabel(laundered.attestation), /STALE — this run covered 1111111111 \(unit DER-A\)/);
+
+  // The same laundering one hop further out: chain THROUGH the laundered record too.
+  const chained = at({
+    sha: SHA1, issueId: "DER-B",
+    priorEvents: [rec("DER-A", ran), rec("DER-B", staled), rec("DER-B", laundered)],
+  });
+  assert.equal(chained.attestation.status, "stale", "the identity is immutable however many records the replay walks");
+  assert.equal(chained.attestation.first_attested_issue, "DER-A");
+
+  // CONTROLS — the fix must not refuse the legitimate shapes, or it has only moved the failure.
+  assert.equal(at({ sha: SHA1, issueId: "DER-A", priorEvents: [rec("DER-A", ran)] }).attestation.status, "ran",
+    "re-recording the SAME artifacts for the SAME unit at the SAME tree is idempotent, not a replay");
+  const fresh = crossVendorAttestation({
+    round: 1, sha: SHA1, issueId: "DER-B", logPath: "/tmp/two.jsonl", logText: codexJsonl({ commands: 9 }), findings,
+    priorEvents: [rec("DER-A", ran), rec("DER-B", staled)],
+  });
+  assert.equal(fresh.attestation.status, "ran", "a genuinely NEW run for DER-B is a real RAN, whatever DER-A's ledger says");
+
+  // The pre-remediation ledger shape: a `ran` with no `first_attested_issue`, whose unit lives only on
+  // the enclosing receipt. That fallback must survive, because for THAT record the receipt really is
+  // the first attestation — the defect was consulting it before the recorded identity, not at all.
+  const { first_attested_issue: _drop, ...legacy } = ran.attestation;
+  const viaLegacy = at({ sha: SHA2, issueId: "DER-A", priorEvents: [{ type: "review_findings", issue: "DER-A", cross_vendor: legacy }] });
+  assert.equal(viaLegacy.attestation.status, "stale");
+  assert.equal(viaLegacy.attestation.first_attested_issue, "DER-A", "a legacy record still resolves to its own unit");
+});
+
+test("DER-3011 remediation round 1: a LEGACY stale record cannot launder the unit either", () => {
+  // The delta review's L1. The first fix resolved identity as
+  // `first_attested_issue ?? issue ?? <enclosing receipt>`, and a PRE-remediation `stale` record has
+  // neither of the first two — so it fell through to the enclosing receipt, which on a stale record is
+  // the unit being replayed INTO. Executed: legacy RAN(DER-A@SHA1) + legacy STALE(enclosed by DER-B)
+  // → replay at DER-B@SHA1 → accepted RAN with first_attested = DER-B.
+  //
+  // Fixtures are DERIVED from real attestations and then downgraded to the pre-remediation wire shape,
+  // rather than hand-written: a hand-written legacy record is a guess about a format, and would keep
+  // passing if the real one changed.
+  const live = codexJsonl();
+  const findings = [{ title: "x", priority: 2 }];
+  const SHA1 = "1".repeat(40);
+  const SHA2 = "2".repeat(40);
+  const at = (over) => crossVendorAttestation({ round: 1, logPath: "/tmp/a.jsonl", logText: live, findings, ...over }).attestation;
+  const ev = (issue, xv) => ({ type: "review_findings", issue, cross_vendor: xv });
+  // Pre-remediation: identity WAS the raw digest, and no `first_attested_*` / `log_sha256_raw` existed.
+  const toLegacy = ({ first_attested_issue, first_attested_round, log_sha256_raw, codex_thread_id, ...rest }) =>
+    ({ ...rest, log_sha256: log_sha256_raw });
+
+  const realRan = at({ sha: SHA1, issueId: "DER-A" });
+  const legacyRan = toLegacy(realRan);
+  const legacyStale = toLegacy(at({ sha: SHA2, issueId: "DER-B", priorEvents: [ev("DER-A", realRan)] }));
+  assert.equal(legacyStale.status, "stale", "control: the fixture must really be a stale record");
+  assert.equal(legacyStale.first_attested_issue, undefined, "…carrying NEITHER field, which is the shape that laundered");
+  assert.equal(legacyStale.issue, undefined);
+
+  // [b] THE EXECUTED CHAIN.
+  const b = at({ sha: SHA1, issueId: "DER-B", priorEvents: [ev("DER-A", legacyRan), ev("DER-B", legacyStale)] });
+  assert.equal(b.status, "stale", "a legacy stale must not hand a replay the unit it was replayed into");
+  assert.equal(b.first_attested_issue, "DER-A");
+  assert.equal(b.covered_sha, SHA1);
+
+  // [a] The upgrade path, unchanged: a legacy RAN's enclosing receipt IS its own unit, so it stays a
+  // correct last-resort reading. Only the STALE side lost that fallback.
+  const a = at({ sha: SHA1, issueId: "DER-B", priorEvents: [ev("DER-A", legacyRan)] });
+  assert.equal(a.status, "stale");
+  assert.equal(a.first_attested_issue, "DER-A");
+
+  // A ledger can already CONTAIN a laundered `ran` written by the pre-remediation code. Identity is
+  // taken from the FIRST `ran`, never the freshest, or the fix would adopt that record's stolen unit.
+  const launderedRan = { ...legacyRan, covered_sha: SHA1 };
+  const chained = at({
+    sha: SHA1, issueId: "DER-B",
+    priorEvents: [ev("DER-A", legacyRan), ev("DER-B", legacyStale), ev("DER-B", launderedRan)],
+  });
+  assert.equal(chained.status, "stale", "a laundered record already in the ledger must not become the identity");
+  assert.equal(chained.first_attested_issue, "DER-A");
+
+  // [d] A legacy STALE with no RAN for the same digest anywhere: the unit is genuinely unknowable.
+  // Fails closed — an unknown identity compared with `!==` would otherwise match everything.
+  const d = at({ sha: SHA1, issueId: "DER-B", priorEvents: [ev("DER-B", legacyStale)] });
+  assert.equal(d.status, "stale", "evidence seen before under a unit nobody can name is not a fresh pass");
+
+  // CONTROLS — the fix must not make everything stale, or it is a check that cannot pass.
+  assert.equal(at({ sha: SHA1, issueId: "DER-A", priorEvents: [ev("DER-A", legacyRan)] }).status, "ran",
+    "re-recording a legacy run for its OWN unit at its OWN tree is still idempotent");
+  const fresh = crossVendorAttestation({
+    round: 1, sha: SHA1, issueId: "DER-B", logPath: "/tmp/b.jsonl", logText: codexJsonl({ commands: 6 }), findings,
+    priorEvents: [ev("DER-A", legacyRan), ev("DER-B", legacyStale)],
+  }).attestation;
+  assert.equal(fresh.status, "ran", "and a genuinely new run for DER-B is still a real RAN");
+});
+
+test("DER-3011 remediation round 1: the attestation's identity is the CANONICAL run, not the log's bytes", () => {
+  // `log_sha256` was sha256 over the raw JSONL TEXT, so the replay check was a claim about a FILE.
+  // Executed by a reviewer: the same log plus ONE BLANK LINE hashed differently, matched no prior
+  // attestation, and was recorded `ran` for a tree and a unit codex never saw. Padding is free.
+  const live = codexJsonl();
+  const findings = [{ title: "x", priority: 2 }];
+  const SHA1 = "1".repeat(40);
+  const SHA2 = "2".repeat(40);
+  const first = crossVendorAttestation({ round: 1, sha: SHA1, issueId: "DER-A", logPath: "/tmp/a.jsonl", logText: live, findings });
+  const ledger = [{ type: "review_findings", issue: "DER-A", cross_vendor: first.attestation }];
+  const replay = (logText) => crossVendorAttestation({ round: 1, sha: SHA2, issueId: "DER-B", logPath: "/tmp/a.jsonl", logText, findings, priorEvents: ledger }).attestation;
+
+  for (const [label, text] of [
+    ["a trailing blank line", `${live}\n`],
+    ["a leading blank line", `\n${live}`],
+    ["blank lines between every event", live.split("\n").join("\n\n")],
+    ["an event type the gate does not read", `${live}\n${JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "OK" } })}`],
+    ["an unknown event type", `${live}\n${JSON.stringify({ type: "totally.unknown", pad: "x".repeat(50) })}`],
+    ["an unparseable line", `${live}\nnot json at all`],
+    ["re-encoded with reordered keys", live.split("\n").map((l) => {
+      const e = JSON.parse(l);
+      return JSON.stringify(Object.fromEntries(Object.entries(e).reverse()));
+    }).join("\n")],
+    ["re-encoded with whitespace", live.split("\n").map((l) => JSON.stringify(JSON.parse(l), null, 2).replace(/\s*\n\s*/g, " ")).join("\n")],
+  ]) {
+    assert.equal(replay(text).status, "stale", `${label} must not mint a new identity for one codex run`);
+  }
+
+  // CONTROL — a genuinely different run is a DIFFERENT identity, or every second unit's real gate would
+  // be reported as a replay. This is the direction that would make the fix useless by over-firing.
+  const other = crossVendorAttestation({ round: 1, sha: SHA2, issueId: "DER-B", logPath: "/tmp/b.jsonl", logText: codexJsonl({ commands: 7 }), findings, priorEvents: ledger });
+  assert.equal(other.attestation.status, "ran");
+  assert.notEqual(other.attestation.log_sha256, first.attestation.log_sha256);
+
+  // The raw digest is still recorded — it is the weaker property, kept so pre-remediation attestations
+  // stay findable and so an auditor can see the file was not merely re-encoded.
+  assert.match(first.attestation.log_sha256_raw, /^[0-9a-f]{64}$/);
+  assert.notEqual(first.attestation.log_sha256, first.attestation.log_sha256_raw,
+    "control: the two digests must actually be different definitions, or this test proves nothing");
+  assert.equal(parseCodexRun(live).rawDigest, first.attestation.log_sha256_raw);
+  assert.equal(parseCodexRun(`${live}\n`).rawDigest !== first.attestation.log_sha256_raw, true,
+    "control: the RAW digest DOES move under padding — that is the property that made it unusable as identity");
+
+  // A pre-remediation ledger records the RAW digest as `log_sha256` and has no `log_sha256_raw`. An
+  // exact-byte replay of that log must still be caught during the upgrade window.
+  const legacy = { ...first.attestation, log_sha256: first.attestation.log_sha256_raw };
+  delete legacy.log_sha256_raw;
+  const viaLegacy = crossVendorAttestation({
+    round: 1, sha: SHA2, issueId: "DER-B", logPath: "/tmp/a.jsonl", logText: live, findings,
+    priorEvents: [{ type: "review_findings", issue: "DER-A", cross_vendor: legacy }],
+  });
+  assert.equal(viaLegacy.attestation.status, "stale", "an exact-byte replay of a pre-remediation attestation is still caught");
+
+  // The producer's own run identity is recorded when the stream carries one (measured against
+  // codex-cli 0.144.6: `{"type":"thread.started","thread_id":"…"}`), and is absent rather than invented
+  // when it does not. It is provenance for a human, never a predicate — `codex exec resume` reuses a
+  // thread id, so matching on it would report a real fresh run as a replay.
+  assert.equal(first.attestation.codex_thread_id, null, "a stream with no thread.started records null, not a guess");
+  const withThread = crossVendorAttestation({
+    round: 1, sha: SHA1, issueId: "DER-A", logPath: "/tmp/c.jsonl", findings,
+    logText: `${JSON.stringify({ type: "thread.started", thread_id: "019fbed0-5d6b-7f42-9219-026ee1a09438" })}\n${live}`,
+  });
+  assert.equal(withThread.attestation.codex_thread_id, "019fbed0-5d6b-7f42-9219-026ee1a09438",
+    "…and it is NOT called `run_id`, which already means the work run everywhere else in this ledger");
+  assert.equal(withThread.attestation.run_id, undefined);
+
+  // …and `codexRunCompleted` still answers the completion question off the SAME parse — one definition
+  // of "the events this gate consumes", or the two copies drift and the looser one lands on the receipt.
+  assert.deepEqual(codexRunCompleted(live), { turnCompleted: true, commands: 2 });
+  assert.deepEqual(codexRunCompleted(`${live}\n\n`), { turnCompleted: true, commands: 2 });
+  assert.equal(codexRunCompleted(codexJsonl({ turnCompleted: false })).turnCompleted, false);
+  assert.equal(priorAttestationByDigest([], "deadbeef"), null, "the historical string signature still resolves");
 });
 
 test("DER-3011 remediation: a round-1 pre-PR fix loop INHERITS, it does not re-attest or refuse", () => {

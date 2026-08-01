@@ -1841,8 +1841,73 @@ export function reviewFindingsEvent(review, { issueId, round = 1, reviewer, acto
 // not completion provenance. Measured 2026-07-25: two runs died at 5-8 commands with no error, and
 // one 401'd before its first turn while `codex login status` still reported "Logged in using ChatGPT".
 export function codexRunCompleted(logText) {
+  const { turnCompleted, commands } = parseCodexRun(logText);
+  return { turnCompleted, commands };
+}
+
+// The events this gate CONSUMES, as one predicate. `codexRunCompleted`'s completion rule, the run's
+// commands count, and the attestation's identity all read the same set — a second enumeration would
+// drift, and the looser copy is always the one that ends up on the receipt.
+//
+// `thread.started` is retained even though no verdict reads it: it carries the producer's own identity
+// for the run, so a replayed log brings it along unchanged and a fresh one cannot borrow it.
+function codexRunEvidenceEvent(event) {
+  if (event?.type === "turn.completed" || event?.type === "thread.started") return true;
+  if (event?.type === "command_execution") return true;
+  if (event?.type === "item.completed" && event?.item?.type === "command_execution") return true;
+  return false;
+}
+
+// Deterministic serialization: keys sorted at every depth, so two encodings of one event hash alike.
+// Only used to build a digest — never written anywhere a human reads.
+function stableJson(value) {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value).sort().map((k) => `${JSON.stringify(k)}:${stableJson(value[k])}`).join(",")}}`;
+  }
+  return value === undefined ? "null" : JSON.stringify(value);
+}
+
+// One pass over the codex `--json` stream, and the ONE definition of what the gate read out of it.
+//
+// ── The digest is over the CANONICAL run, not the raw bytes (remediation round 1) ────────────────
+// `log_sha256` used to be sha256 over the JSONL TEXT, which made the replay check a claim about a FILE
+// rather than about a RUN. Executed by a reviewer: the same log plus ONE BLANK LINE — or plus a JSON
+// line of a type the parser skips — hashed differently, missed the prior attestation entirely, and was
+// recorded `ran` against a tree and a unit that codex never saw. Padding is free; the identity it
+// defeated is the only thing standing between a receipt and a replayed second opinion.
+//
+// So the identity is derived from the events the gate consumes, re-serialized deterministically:
+// whitespace, blank lines, key order and any event outside that set cannot move it, while the run's
+// own content (its thread id, its commands, its completion usage) still separates two real runs.
+//
+// KNOWN LIMIT, stated rather than implied: this resists ADDING content the gate does not read, and any
+// re-encoding of the content it does. It cannot resist a hand-edit of the retained events themselves —
+// codex signs nothing, so no content hash can. That is why the tree/unit binding below is a SECOND and
+// independent control rather than a restatement of this one: defeating the identity still leaves a
+// receipt whose `covered_sha` and first-attested unit have to be made to agree with the tree in hand.
+//
+// The RAW digest is still recorded as `log_sha256_raw` — it is the weaker property (equal bytes imply an
+// equal canonical form, never the reverse), kept because attestations written before this change
+// recorded it as their identity and must stay findable for exact-byte replays.
+//
+// Shapes measured against codex-cli 0.144.6 (`codex exec --json`, 2026-08-01) rather than assumed — a
+// fixture that invents event names proves only that the parser handles a format codex does not emit:
+//   {"type":"thread.started","thread_id":"019fbed0-5d6b-7f42-9219-026ee1a09438"}
+//   {"type":"turn.started"}
+//   {"type":"item.completed","item":{"id":"item_3","type":"agent_message","text":"OK"}}
+//   {"type":"turn.completed","usage":{"input_tokens":25514,"cached_input_tokens":9984,…}}
+// `command_execution` arrives as an `item.completed` item type once a run actually searches the repo.
+//
+// `thread_id` is RECORDED (as `codex_thread_id`, never `run_id` — that name already means the WORK RUN
+// throughout this ledger) and deliberately NOT matched on: `codex exec resume` continues an existing
+// thread, so two genuinely different runs can share one thread id, and matching would report a real
+// fresh run as a replay. It is provenance a human can follow, not a predicate.
+export function parseCodexRun(logText) {
   let turnCompleted = false;
   let commands = 0;
+  let threadId = null;
+  const retained = [];
   for (const line of String(logText ?? "").split("\n")) {
     if (!line.trim()) continue;
     let event;
@@ -1851,15 +1916,31 @@ export function codexRunCompleted(logText) {
     } catch {
       continue;
     }
-    if (event?.type === "turn.completed") turnCompleted = true;
+    if (!event || typeof event !== "object") continue;
+    if (event.type === "turn.completed") turnCompleted = true;
     if (
-      event?.type === "command_execution"
-      || (event?.type === "item.completed" && event?.item?.type === "command_execution")
+      event.type === "command_execution"
+      || (event.type === "item.completed" && event.item?.type === "command_execution")
     ) {
       commands += 1;
     }
+    if (threadId == null && event.type === "thread.started" && typeof event.thread_id === "string" && event.thread_id) {
+      threadId = event.thread_id;
+    }
+    if (codexRunEvidenceEvent(event)) retained.push(stableJson(event));
   }
-  return { turnCompleted, commands };
+  // An empty canonical form would hash to one constant for every evidence-free log. It is unreachable
+  // from either caller — both refuse before the digest is taken unless `turn.completed` was seen, and
+  // that event is itself retained — so `retained` is never empty on anything that gets an identity.
+  const canonical = retained.join("\n");
+  return {
+    turnCompleted,
+    commands,
+    threadId,
+    retained: retained.length,
+    digest: createHash("sha256").update(canonical).digest("hex"),
+    rawDigest: createHash("sha256").update(String(logText ?? "")).digest("hex"),
+  };
 }
 
 // ── DER-3011 — the ROUND-1 codex gate ───────────────────────────────────────────────────────────
@@ -2147,7 +2228,8 @@ export function crossVendorAttestation({
         "union, so the receipt would attest a review whose result no reader can see. Pass the `--output-last-message` JSON too.",
       );
     }
-    const { turnCompleted, commands } = codexRunCompleted(logText ?? "");
+    const run = parseCodexRun(logText ?? "");
+    const { turnCompleted, commands } = run;
     if (!turnCompleted) {
       return bad(
         `review-panel: the codex JSONL has no exact producer turn.completed event (command_execution=${commands}). ` +
@@ -2157,31 +2239,68 @@ export function crossVendorAttestation({
       );
     }
     const list = Array.isArray(findings) ? findings : [];
-    const digest = createHash("sha256").update(String(logText ?? "")).digest("hex");
+    const digest = run.digest;
     // Searched across EVERY unit, not just this one: the reviewer's replay crossed issues as well as
     // shas, and a digest scoped to the unit it is being replayed INTO can never see that.
-    const prior = priorAttestationByDigest(priorEvents, digest);
-    const movedTree = Boolean(prior?.covered_sha && coveredSha && prior.covered_sha !== coveredSha);
-    const movedUnit = Boolean(prior?.issue && issueId && prior.issue !== issueId);
+    const prior = priorAttestationByDigest(priorEvents, { digest, rawDigest: run.rawDigest });
+    // ── The first-attested TREE and UNIT are properties of the EVIDENCE, not of the receipt ────────
+    // Both were previously re-derived from whatever the freshest matching record happened to carry,
+    // and a `stale` record carries its own enclosing receipt's issue — so the identity walked. The
+    // reviewer executed it: a log that ran for DER-A@SHA1, was marked stale for DER-B@SHA2, was then
+    // accepted as `ran` for DER-B@SHA1. Nothing in that chain re-ran codex; the intermediate stale
+    // event alone rewrote which unit the evidence belonged to, and the third receipt read as a clean
+    // first-party pass. So each record now CARRIES the first attestation's identity forward
+    // explicitly, and every later record reads it from the prior record rather than from itself.
+    //
+    // `priorAttestationByDigest` is the ONE place that resolves the evidence's identity out of a record
+    // — including the upgrade path for records written before this change. Re-deriving any of it here
+    // as well would mean two definitions of one fact, and would make neither individually testable: a
+    // mutation of either would be masked by the other while the behaviour stayed correct by accident.
+    const firstIssue = prior ? prior.issue : (issueId ?? null);
+    const firstRound = prior ? prior.first_attested_round : r;
+    // `covered_sha` is non-null on every attestation the CLI can record — `review-panel` runs
+    // `gateShaRefusal(o.sha, { required: true })` before reaching here — so this comparison is live in
+    // production rather than quietly disabled by a null.
+    const firstSha = prior ? (prior.covered_sha ?? null) : coveredSha;
+    const movedTree = Boolean(firstSha && coveredSha && firstSha !== coveredSha);
+    // An UNRESOLVED unit is not a matching one. `firstIssue !== issueId` on a null reads as "no move",
+    // so an identity nobody can name would otherwise pass the check by being absent from it — the
+    // permissive answer, on the one input where less is known than usual.
+    const movedUnit = Boolean(prior?.unit_unresolved)
+      || Boolean(firstIssue && issueId && firstIssue !== issueId);
     const common = {
       reviewer: CROSS_VENDOR_REVIEWER, round: r, log: logPath, log_sha256: digest,
+      // The weaker, byte-exact identity this field used to hold alone. Recorded so a pre-remediation
+      // attestation stays findable, and so an auditor can see the log was not merely re-encoded.
+      // NOT `run_id`: that name already means the WORK RUN throughout this ledger, and two meanings for
+      // one key is a misreading waiting to happen. This is codex's own thread identifier.
+      log_sha256_raw: run.rawDigest, codex_thread_id: run.threadId ?? null,
       commands, findings_total: list.length, blockers: gateBlockerFindings({ findings: list }).length, ts,
     };
-    if (movedTree || movedUnit) {
+    if (prior && (movedTree || movedUnit)) {
       return {
         ok: true, refusal: null,
         attestation: {
           ...common, status: "stale",
           // `covered_sha` stays the tree codex REALLY looked at, so a chain of replays cannot walk it
           // forward one receipt at a time; `receipt_sha` is the tree this receipt is about.
-          covered_sha: prior.covered_sha ?? null,
+          covered_sha: firstSha,
           receipt_sha: coveredSha,
-          first_attested_round: prior.round ?? null,
-          first_attested_issue: prior.issue ?? null,
+          first_attested_round: firstRound,
+          first_attested_issue: firstIssue,
         },
       };
     }
-    return { ok: true, refusal: null, attestation: { ...common, status: "ran", covered_sha: coveredSha } };
+    return {
+      ok: true, refusal: null,
+      attestation: {
+        ...common, status: "ran", covered_sha: coveredSha,
+        // Stamped on the FIRST record too. Leaving it off is what forced the lookup to fall back to the
+        // enclosing receipt in the first place, and a fallback is only ever as trustworthy as the least
+        // trustworthy record it can land on.
+        first_attested_round: firstRound, first_attested_issue: firstIssue,
+      },
+    };
   }
   if (claimsWaived) {
     if (reason.length < CROSS_VENDOR_WAIVER_MIN_REASON) {
@@ -2250,17 +2369,54 @@ export function crossVendorAttestation({
 // unit being replayed INTO is structurally unable to see that. Returns the attestation with its own
 // issue attached, so the caller can say which unit really ran it.
 export function priorAttestationByDigest(events = [], digest = null) {
-  if (!digest) return null;
-  let out = null;
+  // Accepts the canonical digest alone (the historical signature, still used by tests) or
+  // `{ digest, rawDigest }`. The raw form is checked only against records whose identity WAS the raw
+  // digest — pre-remediation attestations. It can never widen the match wrongly: equal bytes imply an
+  // equal canonical form, so anything the raw comparison finds the canonical one would have found had
+  // the record been written after the change.
+  const canonical = typeof digest === "string" ? digest : (digest?.digest ?? null);
+  const raw = typeof digest === "string" ? null : (digest?.rawDigest ?? null);
+  if (!canonical && !raw) return null;
+  let latest = null;
+  let origin = null;
   for (const e of events ?? []) {
     if (e?.type !== "review_findings") continue;
     const xv = e.cross_vendor;
     if (!xv || typeof xv !== "object") continue;
-    if (xv.log_sha256 !== digest) continue;
+    const hit = (canonical && xv.log_sha256 === canonical)
+      || (raw && xv.log_sha256_raw === undefined && xv.log_sha256 === raw);
+    if (!hit) continue;
     if (xv.status !== "ran" && xv.status !== "stale") continue;
-    out = { ...xv, issue: xv.issue ?? e.issue ?? null };
+    // The ORIGIN is the FIRST `ran` for this digest, and only a `ran` may be one. Two reasons it is the
+    // first rather than the freshest: identity is fixed at the first attestation by definition, and a
+    // ledger written by the pre-remediation code can already CONTAIN a laundered `ran` — reading the
+    // freshest would adopt that record's stolen unit as the truth it is being compared against.
+    if (xv.status === "ran" && !origin) origin = { xv, receiptIssue: e.issue ?? null };
+    latest = { xv, receiptIssue: e.issue ?? null };
   }
-  return out;
+  if (!latest) return null;
+  // The evidence's OWN identity, resolved here and ONLY here.
+  //
+  // The enclosing receipt (`e.issue`) is consulted for a `ran` record and NEVER for a `stale` one. That
+  // asymmetry is the whole fix: a `ran` receipt names the unit that really ran it, so it is a correct
+  // last-resort reading for a pre-remediation record that recorded no `first_attested_issue`. A `stale`
+  // receipt names the unit the evidence was replayed INTO — reading it was how a legacy chain
+  // (RAN for DER-A, then STALE enclosed by DER-B) handed a later replay at DER-B a first-party `ran`.
+  const src = origin ?? latest;
+  const issue = origin
+    ? (origin.xv.first_attested_issue ?? origin.xv.issue ?? origin.receiptIssue ?? null)
+    : (latest.xv.first_attested_issue ?? latest.xv.issue ?? null);
+  return {
+    ...latest.xv,
+    issue,
+    // A `stale`-only match with no recorded first-attested unit leaves the identity GENUINELY unknown —
+    // and an unknown unit compared with `!==` matches everything, i.e. silently disables the check. The
+    // caller fails closed on this instead: the evidence has been seen before under a unit nobody can
+    // name, and "this is a fresh first-party pass" is the one reading that is certainly wrong.
+    unit_unresolved: issue == null,
+    first_attested_round: src.xv.first_attested_round ?? (origin ? origin.xv.round : null) ?? null,
+    covered_sha: src.xv.covered_sha ?? latest.xv.covered_sha ?? null,
+  };
 }
 
 // The freshest attestation that actually asserts something (`ran` / `waived`), walking the ledger in
@@ -4961,6 +5117,22 @@ export function getHarnessVersion() {
     } catch { /* try the next candidate layout */ }
   }
   return "unknown";
+}
+
+// The VERSION file sitting beside the code that is ACTUALLY EXECUTING — no env override, no process
+// cache, no fallback string. `getHarnessVersion()` answers a different question ("what does this run
+// report itself as", which is what every event stamp and status line carries) and is deliberately
+// overridable; that makes it unusable for the one check whose whole job is to catch a version claim
+// that disagrees with the bytes on disk. Returns null when no candidate resolves, so "I could not read
+// it" stays distinguishable from a version — never the literal "unknown", which compares as a value.
+export function readRunningHarnessVersion() {
+  for (const rel of ["../../VERSION", "../VERSION", "../../../VERSION"]) {
+    try {
+      const v = readFileSync(new URL(rel, import.meta.url), "utf8").trim();
+      if (/^\d+\.\d+\.\d+/.test(v)) return { version: v, path: fileURLToPath(new URL(rel, import.meta.url)) };
+    } catch { /* try the next candidate layout */ }
+  }
+  return null;
 }
 
 // Pure-ish (reads the process's source id + clock): the exact line `appendEvent` writes. Exported so the
@@ -8956,12 +9128,18 @@ export function harnessDigestVerdict({ hostName, sshAlias, local = {}, remoteRaw
   // aggregates are not comparable at all. Reporting that as CONTENT DRIFT would name a defect that does
   // not exist and send the operator re-installing the wrong host.
   const schemaSkew = !!remoteDigest && !!localDigest && remoteSchema !== localSchema;
-  const ok = !!localDigest && !!remoteDigest && !schemaSkew && localDigest === remoteDigest;
-  const detail = ok
-    ? `identical content digest (${localDigest.slice(0, 12)}, version ${local.version})`
-    : unreachable
-      ? `UNREACHABLE — \`ssh ${sshAlias}\` exited ${remoteExitCode}; the digest was never read, so this is UNKNOWN, not drift. ` +
-        `Re-run \`ssh ${sshAlias} 'cat ~/.claude/${HARNESS_MANIFEST_FILE}'\` by hand and read the error.`
+  // UNREACHABLE is decided BEFORE any comparison, and the detail is ordered to match. Both used to run
+  // equality first, and `remoteRaw` is BUFFERED STDOUT — an ssh that printed the manifest and then died
+  // (or one whose stdout carried anything parseable) left a remote digest equal to the local one, so a
+  // FAILED transport returned `{ ok: true }` under the green "identical content digest" line while
+  // `unreachable: true` sat in the same object, unread. A probe that could not run is never a verdict:
+  // the green answer here is the one an operator uses to authorise a dispatch to that host.
+  const ok = !unreachable && !!localDigest && !!remoteDigest && !schemaSkew && localDigest === remoteDigest;
+  const detail = unreachable
+    ? `UNREACHABLE — \`ssh ${sshAlias}\` exited ${remoteExitCode}; the digest was never read, so this is UNKNOWN, not drift. ` +
+      `Re-run \`ssh ${sshAlias} 'cat ~/.claude/${HARNESS_MANIFEST_FILE}'\` by hand and read the error.`
+    : ok
+      ? `identical content digest (${localDigest.slice(0, 12)}, version ${local.version})`
       : !localDigest
         ? `LOCAL has no ${HARNESS_MANIFEST_FILE} — re-run install.sh here first`
         : !remoteDigest
@@ -8974,6 +9152,70 @@ export function harnessDigestVerdict({ hostName, sshAlias, local = {}, remoteRaw
               `${local.version === remoteVersion ? " — SAME VERSION STRING, DIFFERENT CODE. This is exactly the drift a version check cannot see." : ""}` +
               ` — re-install on ${hostName}`;
   return { ok: ok ? true : (unreachable ? "unknown" : false), detail, localDigest, remoteDigest, localSchema, remoteSchema, schemaSkew, unreachable };
+}
+
+// `harness-version-agreement`, as a pure function (remediation round 1). Three different values are all
+// called "the harness version" and a reader collapses them into one:
+//   (a) the VERSION file beside the RUNNING code — the only one that describes the bytes executing now;
+//   (b) `$DEST/VERSION` — what an installed host resolves;
+//   (c) `manifest.version` — what install.sh recorded when it last wrote the tree.
+//
+// The leg exists to make (a) vs (b) vs (c) loud. It read (a) through `getHarnessVersion()`, which prefers
+// `WORK_HARNESS_VERSION` and then a process-level cache — so the ONE instrument for version skew answered
+// with the override instead of the file. Executed by a reviewer: override, install and manifest all at
+// 0.4.0 with the running file at 0.5.0 printed a green "0.4.0 everywhere". The check that exists to catch
+// a false version claim was the thing making it.
+//
+// The env override is therefore itself reportable, even when the files agree: while it is set, every
+// version-bearing event stamp and status line in this run carries the override rather than a file
+// reading, and this leg is the only place positioned to say so. Two independent rules, deliberately not
+// entangled: ANY active override makes this non-green — ⚠ UNKNOWN, naming the override and the remedy,
+// whether or not it contradicts the running file — and a disagreement among the three FILES reds on its
+// own, override or not. So the red in the executed scenario comes from `0.5.0` running against a `0.4.0`
+// install, not from the override; the override is named in that same detail but never decides the colour.
+// The process cache is not treated as a separate hazard because it is
+// only ever populated FROM the running file (see `getHarnessVersion`), so it cannot disagree with it; the
+// env var is the sole poisoning vector, and a check for a condition that cannot occur is not evidence.
+export function harnessVersionAgreementVerdict({
+  runningFile = null, runningFrom = "", reported = null,
+  installed = null, installedPath = "", recorded = null,
+  manifestFile = HARNESS_MANIFEST_FILE, envOverride = null,
+} = {}) {
+  const env = typeof envOverride === "string" && envOverride.trim() ? envOverride.trim() : null;
+  const overrideNote = env
+    ? `WORK_HARNESS_VERSION=${env} is set: every version this process REPORTS elsewhere (${reported ?? "?"}) is that string, not a file reading — unset it before quoting any version from this run. `
+    : "";
+  // `recorded == null` means there is no manifest at all — `harness-drift` above already reds on that
+  // with the right remedy, and calling it a VERSION disagreement here would name a second, wrong defect
+  // for one cause. A running file that will not resolve is the same shape: compare only what was read.
+  if (runningFile == null || installed == null || recorded == null) {
+    return {
+      ok: "unknown",
+      detail: `cannot compare: ${runningFile == null ? "the running tree's VERSION file did not resolve" : installed == null ? `no ${installedPath}` : `no version in ${manifestFile}`}. ` +
+        `${overrideNote}The running tree resolved from ${runningFrom} describes THAT tree, not necessarily the install. See harness-drift above; re-run install.sh.`,
+    };
+  }
+  const agree = runningFile === installed && installed === recorded;
+  if (!agree) {
+    return {
+      ok: false,
+      detail: `VERSION DISAGREEMENT — the running tree's VERSION file says ${runningFile} (${runningFrom}), ` +
+        `${installedPath} says ${installed}, manifest says ${recorded}. ` +
+        (runningFile !== installed
+          ? "You are running a runner from somewhere other than the install (typically a checkout), so any version this process prints describes THAT tree, not the deployed hosts — do not quote it as a deploy reading. "
+          : "") +
+        overrideNote +
+        "Re-run ./install.sh, then re-run preflight from the installed harness.",
+    };
+  }
+  if (env) {
+    return {
+      ok: "unknown",
+      detail: `${runningFile} in all three files (running tree, ${installedPath}, manifest) — but ${overrideNote.trim()} ` +
+        "The files agree, so nothing is misreported right now; this abstains rather than greens because the version this run publishes is not the version it measured.",
+    };
+  }
+  return { ok: true, detail: `${runningFile} everywhere (running tree at ${runningFrom}, ${installedPath}, and the manifest)` };
 }
 
 // ── 2.7 — staleness of queued work is unchecked, and the NAIVE check is blind ──────────────────
@@ -11395,40 +11637,32 @@ export async function runSubcommand(argv) {
         // DER-3008, defect 3 — WHOSE version is being reported. On 2026-08-01 a deploy verification
         // stated "hosts at 0.3.0" while neither host was at 0.3.0, and there are three different
         // "harness version" values that a reader collapses into one:
-        //   (a) `getHarnessVersion()` — read from `../../VERSION` relative to THIS RUNNING FILE. Run the
-        //       checkout's runner and it reports the CHECKOUT's VERSION, i.e. the version you are about
-        //       to install, described in the present tense as the version that is running. It is also
-        //       process-cached and overridable by `WORK_HARNESS_VERSION`, so a stale export wins forever.
-        //   (b) `$DEST/VERSION` — what an installed host actually resolves (a) to.
+        //   (a) the VERSION file beside the RUNNING code. Run the checkout's runner and that is the
+        //       CHECKOUT's VERSION, i.e. the version you are about to install, described in the present
+        //       tense as the version that is running.
+        //   (b) `$DEST/VERSION` — what an installed host actually resolves.
         //   (c) `manifest.version` — what install.sh recorded when it last wrote the tree.
         // Nothing compared them, so running the checkout's runner against an older install printed the
         // NEW number and attributed it to the installed hosts. This leg makes that disagreement loud.
         // ((c) vs the file on disk is now covered by `harness-drift` itself: VERSION joined the manifest's
         // file list in this same change, so a hand-edited $DEST/VERSION reports MODIFIED.)
+        //
+        // (a) is read with `readRunningHarnessVersion()`, NOT `getHarnessVersion()` — the latter prefers
+        // `WORK_HARNESS_VERSION` and a process cache, which made this leg answer with the override it
+        // exists to expose (remediation round 1; see `harnessVersionAgreementVerdict`).
         {
-          const running = getHarnessVersion();
-          const runningFrom = fileURLToPath(new URL("../../", import.meta.url));
+          const runningTree = readRunningHarnessVersion();
           let installed = null;
           try { installed = (await readFile(join(dest, "VERSION"), "utf8")).trim(); } catch { /* absent ⇒ null */ }
-          const recorded = drift.version ?? null;
-          const envPinned = typeof process.env.WORK_HARNESS_VERSION === "string" && process.env.WORK_HARNESS_VERSION.trim();
-          // `recorded == null` means there is no manifest at all — `harness-drift` above already reds on
-          // that with the right remedy, and calling it a VERSION disagreement here would name a second,
-          // wrong defect for one cause. Compare only what can be compared.
-          const comparable = installed != null && recorded != null;
-          const agree = comparable && running === installed && installed === recorded;
-          add("harness-version-agreement", comparable ? agree : "unknown", !comparable
-            ? `cannot compare: ${installed == null ? `no ${join(dest, "VERSION")}` : `no version in ${HARNESS_MANIFEST_FILE}`}. ` +
-              `This process says ${running} (resolved from ${runningFrom}) — that describes THAT tree, not necessarily the install. See harness-drift above; re-run install.sh.`
-            : agree
-              ? `${running} everywhere (running process, ${join(dest, "VERSION")}, and the manifest)`
-              : `VERSION DISAGREEMENT — this process reports ${running} (resolved from ${runningFrom}), ` +
-                `${join(dest, "VERSION")} says ${installed}, manifest says ${recorded ?? "?"}. ` +
-                (running !== installed
-                  ? "You are running a runner from somewhere other than the install (typically a checkout), so any version this process prints describes THAT tree, not the deployed hosts — do not quote it as a deploy reading. "
-                  : "") +
-                (envPinned ? `WORK_HARNESS_VERSION=${envPinned} is set in this environment and overrides every file read — unset it before believing any version here. ` : "") +
-                "Re-run ./install.sh, then re-run preflight from the installed harness.");
+          const v = harnessVersionAgreementVerdict({
+            runningFile: runningTree?.version ?? null,
+            runningFrom: runningTree?.path ?? fileURLToPath(new URL("../../", import.meta.url)),
+            reported: getHarnessVersion(),
+            installed, installedPath: join(dest, "VERSION"),
+            recorded: drift.version ?? null,
+            envOverride: process.env.WORK_HARNESS_VERSION ?? null,
+          });
+          add("harness-version-agreement", v.ok, v.detail);
         }
 
         // The other half, and the one that actually bit: the 2026-07-31 drift was stale-but-UNTAMPERED.

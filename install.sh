@@ -60,8 +60,8 @@ INSTALLED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 SHIPPED_RELS="$( { (cd "$SRC" && find skills hooks -type f ! -path '*/tmp/*' ! -name '.DS_Store'); echo VERSION; } | LC_ALL=C sort)"
 
 # The manifest's wire format is `path:sha256` lines plus hand-emitted JSON, and BOTH encodings are
-# ambiguous for three characters. Each was reproduced against this script and each failed SILENTLY,
-# at exit 0, with a manifest that looked well-formed:
+# ambiguous for a family of characters. Each was reproduced against this script and each failed
+# SILENTLY, at exit 0, with a manifest that looked well-formed:
 #   `:`      `awk -F:` splits on the FIRST colon, so a payload file `skills/work/notes:draft.md` was
 #            recorded as key "skills/work/notes" with the VALUE "draft.md" in place of a hash.
 #            `aggregateDigest` folds `path:sha` the same way, so the two sides cannot even agree on what
@@ -69,13 +69,23 @@ SHIPPED_RELS="$( { (cd "$SRC" && find skills hooks -type f ! -path '*/tmp/*' ! -
 #   `"`      emitted raw into the JSON string, so `skills/work/say"hi.md` produced a manifest that is not
 #            valid JSON. `measureHarnessDrift` cannot parse it and returns `absent` — an install unable
 #            to attest to itself — while install.sh reported success.
+#   `\`      the SAME failure as `"`, and it was missed when this guard was first written because the
+#            character is harmless to the shell here and only bites the hand-emitted JSON:
+#            `skills/work/say\hi.md` passes `[:"]`, then `JSON.parse` dies on "Bad escaped character".
+#            Reproduced at exit 0 with a written manifest, remediation round 1.
+#   control  tab, CR and friends are the same class one layer down — a literal control byte inside a
+#            JSON string is invalid JSON ("Bad control character in string literal"), and unlike the
+#            quote it is INVISIBLE in any error message that echoes the path back.
 #   newline  splits one path across two `while read` iterations, corrupting both list and aggregate.
 #
 # The payload is repo-controlled and no such filename exists today, so the honest fix is to fail CLOSED
 # at the source rather than build an escaping layer for filenames this project must never ship. Any
 # quoting scheme would also have to be mirrored byte-for-byte in `aggregateDigest`, which is precisely
 # the two-definitions-of-one-digest hazard documented above that function.
-BAD_NAMES="$(printf '%s\n' "$SHIPPED_RELS" | grep -E '[:"]' || true)"
+#
+# `\\` sits mid-class deliberately: a bracket expression ending in `\]` is read differently by different
+# greps, and this one must mean the same thing everywhere it runs.
+BAD_NAMES="$(printf '%s\n' "$SHIPPED_RELS" | LC_ALL=C grep -E '[:"\\]|[[:cntrl:]]' || true)"
 # A newline inside a filename is invisible in the line-oriented list above — it has already split. Count
 # NUL-delimited entries against line-delimited ones instead; a mismatch means some name contains one.
 NL_LINES="$( (cd "$SRC" && find skills hooks -type f ! -path '*/tmp/*' ! -name '.DS_Store') | wc -l | tr -d ' ')"
@@ -83,13 +93,20 @@ NUL_ENTRIES="$( (cd "$SRC" && find skills hooks -type f ! -path '*/tmp/*' ! -nam
 if [ -n "$BAD_NAMES" ] || [ "$NL_LINES" != "$NUL_ENTRIES" ]; then
   echo "INSTALL FAILED: the shipped payload contains a filename the manifest format cannot encode unambiguously." >&2
   if [ -n "$BAD_NAMES" ]; then
-    echo "  these contain ':' or '\"':" >&2
-    printf '    %s\n' "$BAD_NAMES" >&2
+    echo "  these contain ':', '\"', '\\' or a control character:" >&2
+    # `-vt` renders control bytes as ^I / ^M rather than printing them raw: a tab in a path is invisible
+    # in an error message, and an operator cannot rename a character they cannot see. The `t` is not
+    # optional — plain `cat -v` passes TAB through untouched, which is the one control character a
+    # filename is most likely to actually contain.
+    # Indented AFTER rendering, one line at a time: `$BAD_NAMES` is a single multi-line argument, so a
+    # `printf '    %s\n'` prefix reaches only the first name — which is exactly the case where there is
+    # more than one, and the list is what the operator has to read.
+    printf '%s\n' "$BAD_NAMES" | LC_ALL=C cat -vt | sed 's/^/    /' >&2
   fi
   if [ "$NL_LINES" != "$NUL_ENTRIES" ]; then
     echo "  a filename contains a NEWLINE ($NL_LINES line(s) for $NUL_ENTRIES file(s))" >&2
   fi
-  echo "  Rename it in the source tree. A ':' silently corrupts the path:sha256 line and a '\"' emits invalid JSON — both at exit 0, which is why this refuses rather than escapes." >&2
+  echo "  Rename it in the source tree. A ':' silently corrupts the path:sha256 line, and '\"', '\\' or a control byte emits invalid JSON — all at exit 0, which is why this refuses rather than escapes." >&2
   exit 1
 fi
 # The TERRITORY the payload lands in: the top-level paths `cp -R "$SRC/skills/." "$DEST/skills/"` and its

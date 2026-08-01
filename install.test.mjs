@@ -189,7 +189,17 @@ test("install.sh: a payload filename the manifest cannot encode is REFUSED, not 
   //      parse. `measureHarnessDrift` returns `absent` — an install that cannot attest to itself.
   // The payload is repo-controlled, so this fails closed at the source rather than growing an escaping
   // layer that `aggregateDigest` would then have to mirror byte-for-byte.
-  for (const [label, name] of [["colon", "notes:draft.md"], ["quote", 'say"hi.md']]) {
+  //
+  // Remediation round 1 — the first guard enumerated `[:"]`, which is the class the JSON *string
+  // grammar* rejects, minus half its members. Both additions below were reproduced against this
+  // installer at EXIT 0 with a written manifest:
+  //   `skills/work/say\hi.md`  -> `JSON.parse`: "Bad escaped character". Identical failure to `"`, and
+  //      it passed the guard because a backslash is harmless to the SHELL here — only the hand-emitted
+  //      JSON cares.
+  //   `skills/work/say<TAB>hi.md` -> `JSON.parse`: "Bad control character in string literal". Same
+  //      class, and worse to diagnose: the character is invisible in every message that echoes the
+  //      path back, which is why the refusal renders the list through `cat -vt`.
+  for (const [label, name] of [["colon", "notes:draft.md"], ["quote", 'say"hi.md'], ["backslash", "say\\hi.md"], ["tab", "say\thi.md"]]) {
     const f = await fixture();
     try {
       await writeFile(join(f.src, "skills", "work", name), "payload\n", "utf8");
@@ -197,6 +207,11 @@ test("install.sh: a payload filename the manifest cannot encode is REFUSED, not 
       assert.notEqual(r.code, 0, `a ${label} in a shipped filename must refuse the install\n${r.out}`);
       assert.match(r.out, /INSTALL FAILED/i);
       assert.match(r.out, /cannot encode unambiguously/);
+      // The refusal must NAME the file, with control bytes RENDERED (`cat -vt`) — an operator cannot
+      // rename a character they cannot see, and a raw tab is invisible in the echoed path.
+      const shown = label === "tab" ? name.replace("\t", "^I") : name;
+      assert.match(r.out, new RegExp(shown.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+        `the refusal must name the offending ${label} file as the operator will see it\n${r.out}`);
       await assert.rejects(readFile(join(f.dest, "INSTALL-MANIFEST.json")),
         `no manifest may be written for a ${label} payload — a corrupt one reads as drift or as absent, both silently`);
     } finally {
@@ -205,13 +220,19 @@ test("install.sh: a payload filename the manifest cannot encode is REFUSED, not 
   }
 
   // THE CONTROL: the same fixture without the offending file must still install, so the guard is proven
-  // to key on the filename rather than on anything else about the tree.
+  // to key on the filename rather than on anything else about the tree. It carries a name built from the
+  // characters ADJACENT to the rejected class — `]` and `-`, which a bracket expression written as
+  // `[:"\]` or `[:"-\\]` would swallow — so a guard that over-widened fails here rather than silently
+  // refusing to install a legal payload.
   const clean = await fixture();
   try {
+    await writeFile(join(clean.src, "skills", "work", "ok]name-v2.md"), "payload\n", "utf8");
     const r = await runInstall(clean);
     assert.equal(r.code, 0, `control: a clean payload must still install\n${r.out}`);
     const man = JSON.parse(await readFile(join(clean.dest, "INSTALL-MANIFEST.json"), "utf8"));
     assert.ok(Object.keys(man.files).length > 0);
+    assert.ok("skills/work/ok]name-v2.md" in man.files,
+      "a legal filename using characters next to the rejected class must still be shipped and hashed");
   } finally {
     await rm(clean.dir, { recursive: true, force: true });
   }
