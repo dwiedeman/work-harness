@@ -3155,7 +3155,32 @@ export function getCommitAuthorError() { return COMMIT_AUTHOR_ERROR; }
 
 const HOSTS_DEFAULT = { local: { cap: 2 } };
 let HOSTS = { ...HOSTS_DEFAULT };
-export function getHosts() { return HOSTS; }
+// 2.5 — a bare ESM import of this module answers these getters from module DEFAULTS, and a caller that
+// never awaited `applyRepoConfig` cannot tell. Measured: an ad-hoc `node -e` `pickHost()` returned
+// `null` purely from this and was nearly read as "nothing is dispatchable" — a HOLD derived from an
+// unloaded config, not from the run.
+//
+// Re-verified before implementing: the plan says `applyRepoConfig(cfg)` "does not fix it". That is
+// WRONG — awaited against a real repo root it updates all three getters correctly. The live defect is
+// narrower and still real: nothing distinguishes "configured to the defaults" from "never configured".
+//
+// So the fix is a load MARKER, not a rewrite. These getters answer normally once config has been
+// applied, and throw before that — a silent `{local}` is the worst of the three options, because it is
+// the one that looks like an answer.
+let CONFIG_APPLIED = false;
+export function configApplied() { return CONFIG_APPLIED; }
+function assertConfigLoaded(getter) {
+  if (CONFIG_APPLIED) return;
+  throw new Error(
+    `${getter}() was called before applyRepoConfig() — refusing to answer from built-in defaults. ` +
+    "Un-configured, this returns hosts={local}, leadTypes={claude} and preferHosts=[], which is " +
+    "indistinguishable from a repo that really is configured that way: an ad-hoc `node -e` pickHost() " +
+    "returned null purely from this and was nearly read as \"nothing is dispatchable\". " +
+    "Call `await applyRepoConfig(<repoRoot>)` first (runSubcommand does this for you).",
+  );
+}
+
+export function getHosts() { assertConfigLoaded("getHosts"); return HOSTS; }
 
 // Shepherd model override (item 8, 2026-07-15 turnover): `.claude/work.config.json` `shepherdModel`
 // sets the shepherd's model without a per-run `--model` flag (the flag still wins). Null ⇒ the built-in
@@ -3169,7 +3194,7 @@ export function getShepherdModel() { return SHEPHERD_MODEL; }
 // fallback). pickHost still takes the effective preferHosts explicitly; this is the default value. Empty
 // ⇒ unchanged local-first overflow. Absent hosts are ignored by pickHost, so it is safe on a 2nd repo.
 let DEFAULT_PREFER_HOSTS = [];
-export function getDefaultPreferHosts() { return [...DEFAULT_PREFER_HOSTS]; }
+export function getDefaultPreferHosts() { assertConfigLoaded("getDefaultPreferHosts"); return [...DEFAULT_PREFER_HOSTS]; }
 
 // Lead-type registry (CLIProxyAPI comparison, 2026-07-23): named profiles so /work can spawn a lead on
 // Kimi or GPT — routed through the local CLIProxyAPI gateway — instead of Claude, to compare lead
@@ -3179,7 +3204,7 @@ export function getDefaultPreferHosts() { return [...DEFAULT_PREFER_HOSTS]; }
 // `.claude/work.config.json` `leadTypes`. See the README's lead-types section.
 const LEAD_TYPES_DEFAULT = { claude: { proxy: false } };
 let LEAD_TYPES = { ...LEAD_TYPES_DEFAULT };
-export function getLeadTypes() { return LEAD_TYPES; }
+export function getLeadTypes() { assertConfigLoaded("getLeadTypes"); return LEAD_TYPES; }
 
 // Per-issue circuit breaker (2026-07-25 forensics). An issue with no spend ceiling can consume a
 // whole night and land nothing: on run 20260725T020304Z FIVE issues burned 2.36B tokens — 76% of the
@@ -3494,9 +3519,31 @@ export function sweepPlan({ events = [], state = {}, keepRefs = [] } = {}) {
   return { close: close.filter((r) => !keep.has(r)), keep: [...keep] };
 }
 
-export function computeEligible({ issues = [], inflight = [], cap = 2 } = {}) {
+// 2.6 — an entry with an EMPTY fileScope disables every collision rule at once, silently.
+//
+// `globsOverlap([], anything)` is false, `isVersionHolder([])` is false, `touchesStateMd([])` is false —
+// so a scopeless issue conflicts with NOTHING and the whole list reads as eligible. That is not a
+// hypothetical: the run-plan file uses `surfaces`/`versionAxes`, NOT `fileScope`, so feeding its units
+// straight in yields `[]` for every one of them and every collision guard silently switches off. No
+// `fileScope` is recorded anywhere for queued issues — not in plan.md, not in the ledger.
+//
+// A guard that cannot see its own input must refuse, not pass. `strict:false` is kept ONLY for the
+// existing callers that legitimately compute over in-flight units whose scope arrives later via
+// `plan_scope`; the dispatch path passes strict.
+export function computeEligible({ issues = [], inflight = [], cap = 2, strict = false } = {}) {
   const chosen = inflight.map((i) => ({ id: i.id, fileScope: i.fileScope ?? [] }));
   const result = [];
+  if (strict) {
+    const scopeless = issues.filter((i) => !(i.fileScope ?? []).length).map((i) => i.id);
+    if (scopeless.length) {
+      throw new Error(
+        `computeEligible: ${scopeless.length} unit(s) have an EMPTY fileScope (${scopeless.join(", ")}) — refusing. ` +
+        "An empty scope overlaps nothing, so EVERY collision rule (glob overlap, version-holder, state.md) " +
+        "silently passes and the whole list reads as eligible. Note the run-plan file uses `surfaces`/" +
+        "`versionAxes`, not `fileScope` — map them before dispatching, or record a real fileScope per unit.",
+      );
+    }
+  }
   for (const issue of issues) {
     if (chosen.length >= cap) break;
     const scope = issue.fileScope ?? [];
@@ -5080,6 +5127,28 @@ export function materializeState(rawEvents, meta = {}) {
         it.reap_failed = true;
         it.reap_leaks = Array.isArray(e.leaks) ? e.leaks : [];
         it.reap_failed_note = e.reason ?? null;
+        it.reap_cleanup_steps = Array.isArray(e.cleanup) ? e.cleanup : [];
+        // A later retraction wins over an earlier failure; a later FAILURE re-opens it. Both directions,
+        // because a leak that recurs after being retracted is exactly what must not stay hidden.
+        it.reap_retracted = null;
+        break;
+      case "reap_failure_retracted":
+        // 4.4 — an append-only ledger needs a RETRACTION SHAPE.
+        //
+        // `state.reap_failures` listed DER-2868 forever, even after both its leaks were verified
+        // resolved (no process ever existed; the worktree was gone). Terminal events dedupe first-wins,
+        // so there was no way to say so — only a prose note beside it in the ledger, which `state` does
+        // not read. A permanently wrong banner is not a harmless one: it is how operators learn to skip
+        // the banner entirely.
+        //
+        // This preserves the append-only invariant (nothing is edited or deleted) while letting `state`
+        // tell the truth: the original event stays, and a later event REFERENCES it with evidence.
+        // Deliberately requires `retracts` (the event_id being retracted) and `evidence` — a retraction
+        // with neither is indistinguishable from wishful thinking, and this is the one shape that can
+        // clear a safety banner.
+        if (e.retracts && e.evidence) {
+          it.reap_retracted = { retracts: e.retracts, evidence: e.evidence, by: e.actor ?? null, ts: e.ts ?? null };
+        }
         break;
       default:
         break;
@@ -5249,11 +5318,25 @@ export function materializeState(rawEvents, meta = {}) {
     // running or registered. Filtering terminal issues out here would hide exactly the case this exists for.
     reap_failures: Object.entries(issues)
       .filter(([, v]) => v.reap_failed)
-      .map(([k, v]) => ({
-        issue: k, host: v.host, worktree: v.worktree, leaks: v.reap_leaks,
-        reason: v.reap_failed_note,
-        act: (v.reap_leaks ?? []).map((step) => REAP_LEAK_NOTES[step] ?? step),
-      })),
+      .map(([k, v]) => {
+        const guidance = reapLeakGuidance({ leaks: v.reap_leaks, steps: v.reap_cleanup_steps });
+        return {
+          issue: k, host: v.host, worktree: v.worktree, leaks: v.reap_leaks,
+          reason: v.reap_failed_note,
+          // 4.5 — say WHICH: a confirmed survivor and an unrunnable probe need different actions.
+          kinds: guidance.map((g) => g.kind),
+          unverifiable: guidance.some((g) => g.kind === "unverifiable"),
+          act: guidance.map((g) => g.note),
+          // 4.4 — retraction, rendered rather than removed. The entry stays visible with its evidence,
+          // because "this was investigated and closed" is information the next reader needs; what it
+          // must stop doing is reading as an OPEN leak.
+          retracted: v.reap_retracted ?? null,
+          status: v.reap_retracted ? "RETRACTED" : "open",
+          label: v.reap_retracted
+            ? `${k} — RETRACTED (${v.reap_retracted.evidence}) [retracts ${v.reap_retracted.retracts}]`
+            : k,
+        };
+      }),
     spawn_failures: [
       ...Object.entries(issues)
         .filter(([, v]) => v.spawn_failed && !DONE_STATUSES.has(v.status))
@@ -5786,6 +5869,31 @@ export const REAP_LEAK_NOTES = {
   remote_worktree_remove: "the remote worktree is still registered — `git -C <repo> worktree remove --force <path>` on that host (a later run will REFUSE the path, not reclaim it)",
 };
 
+// 4.5 — the probe ALREADY distinguishes "still running" from "could not check". The `reason` field
+// carries it (via KILL_PROBE_NOTES) and always has. But the ALWAYS-SHOWN guidance — `act`, and the CLI
+// banner — rendered every leak with the single confirmed-alive wording above, so an operator read
+// "burning tokens" and went hunting.
+//
+// DER-2868's "leak" was: NO PROCESS EVER EXISTED, and the probe simply could not run because ssh was
+// down. The distinction is not cosmetic — `failed` means go kill something, `unverifiable` means go find
+// out whether there is anything to kill, and one of those is a wild goose chase. Same UNKNOWN-vs-ABSENT
+// discipline the gate verdict and the codex probe both draw.
+export const REAP_LEAK_NOTES_UNVERIFIABLE = {
+  remote_pkill: "UNVERIFIABLE, not confirmed alive: the post-kill probe never returned a verdict (ssh, the remote shell, or pgrep itself failed) — so we do not know whether a process was ever there. FIRST check reachability (`ssh <host> true`), THEN `pgrep -fa <brief path>`. Do not assume a leak: a probe that could not run is not evidence of a survivor.",
+  remote_worktree_remove: "UNVERIFIABLE: the remote cleanup command could not be run or its result could not be read — confirm with `git -C <repo> worktree list` on that host before removing anything",
+};
+
+// Pick the guidance that matches the PROBE's actual verdict. Steps carry `probe: "survivor"|"unknown"`;
+// anything else (a plain nonzero exit) is a genuine failure.
+export function reapLeakGuidance({ leaks = [], steps = [] } = {}) {
+  const probeByStep = new Map((steps ?? []).map((st) => [st.step, st.probe ?? null]));
+  return (leaks ?? []).map((step) => {
+    const unverifiable = probeByStep.get(step) === "unknown";
+    const note = (unverifiable ? REAP_LEAK_NOTES_UNVERIFIABLE : REAP_LEAK_NOTES)[step] ?? step;
+    return { step, kind: unverifiable ? "unverifiable" : "failed", note };
+  });
+}
+
 export function reapCleanupCommands({ worktree, gitCwd } = {}) {
   if (!worktree) return [];
   return [
@@ -5977,9 +6085,32 @@ export function killProbeStep(step, res, { optional = false } = {}) {
 // be reaped freely; an ACTIVE one needs the operator to say the destructive word.
 export const REAP_TERMINAL_ELIGIBLE = (status) => !ACTIVE_STATUSES.has(status);
 
-export function reapRefusal({ issueId, runId, unit, abandon = false } = {}) {
+// 4.3 — a QUEUED, never-dispatched id is a real tracked unit, and `reap` must accept it.
+//
+// THE DEADLOCK, verified against current code before implementing:
+//   * `complete-run` builds `trackedIds` as `Object.keys(issues) ∪ queue`, and counts a never-dispatched
+//     id as non-terminal (`issues[id]?.status ?? "queued"`). Its own remedy text says
+//     "reap --run <r> <id> closes a queued/merged unit".
+//   * `reap` refuses exactly those ids — `state.issues` entries are only created by `ensure(id)` when an
+//     event NAMES the id, so a declared-but-never-dispatched id has no entry, `unit` is undefined, and
+//     the `!unit` branch returns before `abandon` is even consulted.
+//   * There is deliberately no `--force`.
+// So a non-empty `state.queue` at run end is an UNCONDITIONAL deadlock in issue-list mode: the harness
+// prescribes the one command that refuses. Run `20260730T233426Z-der-2869-der-2864` cannot be closed.
+//
+// The root divergence is `run_started.issues` (everything declared) vs `state.issues` (only ever
+// dispatched). This is a RECONCILIATION bug, not a reason for `--force`: both refusals were RIGHT.
+// `reap`'s point is that a phantom terminal event is permanent in an append-only ledger — and a queued
+// id is not a phantom, it is a unit the run declared and never started.
+//
+// So: tear nothing down (there is nothing to tear down), and append `reaped` with `never_started: true`.
+// That keeps "every tracked unit reached a terminal state" TRUE *and* records how it got there, which a
+// bare `reaped` would not. And it does NOT weaken the phantom guard — an id that is neither a known unit
+// nor in the declared queue is still refused.
+export function reapRefusal({ issueId, runId, unit, abandon = false, queued = false } = {}) {
   if (!issueId) return "reap needs an issue id: reap --run <r> <DER-id>";
   if (!unit) {
+    if (queued) return null; // declared, never dispatched — terminal-eligible, nothing to destroy
     return `reap: ${issueId} is not a unit in run ${runId ?? "<none>"} — refusing. Nothing is torn down (an ` +
       "unknown id owns no worktree and no host), but the reap would append a TERMINAL `reaped` for a " +
       "unit that does not exist, and `reaped` is deduped first-wins so the phantom is permanent. Check " +
@@ -6890,6 +7021,10 @@ export async function applyRepoConfig(repoRoot) {
   SHEPHERD_MODEL = null;
   DEFAULT_PREFER_HOSTS = [];
   LEAD_TYPES = { ...LEAD_TYPES_DEFAULT };
+  // 2.5 — set BEFORE parsing, not after: a repo with no config file at all is still a repo that has
+  // been configured (to the defaults), and it must not be left looking un-configured. What the marker
+  // distinguishes is "applyRepoConfig ran" from "nobody ever called it".
+  CONFIG_APPLIED = true;
   BUDGET = { ...BUDGET_DEFAULT };
   MODEL_PRICES = { ...MODEL_PRICES_DEFAULT };
   REPO_IDENTITY = { ...REPO_IDENTITY_DEFAULT };
@@ -7226,6 +7361,91 @@ export async function measureHarnessDrift(dest) {
   return harnessDriftVerdict({ manifest, digests });
 }
 
+// ── 6.3 — memory/swap guard, MECHANICAL rather than remembered ─────────────────────────────────
+// Local swap hit 7,257 MB / 8,192 MB (88.6%) on 2026-07-31 — the documented freeze zone that once
+// pinned an orchestrator and a shepherd at 0% CPU for ~40 minutes. That dispatch was declined only
+// because the orchestrator happened to check. `work/SKILL.md` says to check `sysctl vm.swapusage` by
+// hand, which is guidance, not a guard: the whole point of an unattended run is that nobody is there to
+// remember. So the threshold refuses at the dispatch, not in prose.
+export const SWAP_REFUSE_PCT = 85;
+export const SWAP_WARN_PCT = 70;
+
+// `sysctl vm.swapusage` → "vm.swapusage: total = 8192.00M  used = 7257.00M  free = 935.00M"
+// Returns null when it cannot be parsed — UNKNOWN, never 0%. A guard that reads an unparseable probe as
+// "plenty of headroom" fails open at exactly the moment the box is sickest.
+export function parseSwapUsage(stdout) {
+  const text = String(stdout ?? "");
+  const total = /total\s*=\s*([\d.]+)([MG])/i.exec(text);
+  const used = /used\s*=\s*([\d.]+)([MG])/i.exec(text);
+  if (!total || !used) return null;
+  const mb = (m) => Number(m[1]) * (m[2].toUpperCase() === "G" ? 1024 : 1);
+  const t = mb(total); const u = mb(used);
+  if (!Number.isFinite(t) || !Number.isFinite(u) || t <= 0) return null;
+  return { totalMb: t, usedMb: u, pct: Math.round((u / t) * 1000) / 10 };
+}
+
+export function swapVerdict(swap) {
+  if (!swap) {
+    return { ok: "unknown", refuse: false, detail: "could not read `sysctl vm.swapusage` — UNKNOWN, not healthy. Check by hand before a heavy local dispatch." };
+  }
+  const at = `swap ${Math.round(swap.usedMb)}/${Math.round(swap.totalMb)} MB (${swap.pct}%)`;
+  if (swap.pct >= SWAP_REFUSE_PCT) {
+    return { ok: false, refuse: true, detail: `${at} — at/over ${SWAP_REFUSE_PCT}%, the documented freeze zone (a prior run pinned orch+shepherd at 0% CPU for ~40 min here). REFUSING a heavy local lane; dispatch to a mini or free memory first.` };
+  }
+  if (swap.pct >= SWAP_WARN_PCT) return { ok: true, refuse: false, detail: `${at} — over ${SWAP_WARN_PCT}%, watch it; a heavy local lane will push this into the freeze zone.` };
+  return { ok: true, refuse: false, detail: at };
+}
+
+// ── 6.1 — a `.local` ssh HostName fails off-LAN and reads as "HOST IS DOWN" ─────────────────────
+// `macmini-hermes` → `Derreks-Mac-mini.local` is Bonjour/mDNS, LAN-ONLY. Off-network it produced
+// `could not resolve hostname`, and that went into a run handoff as "MINI IS DOWN, cap-5 lane gone".
+// The box had been up 21 days. A documented `192.168.x` fallback is equally useless off-network — its
+// presence in a config comment is FALSE REASSURANCE, which is worse than nothing.
+//
+// Already fixed on this machine (HostName → a Tailscale 100.x address, which routes direct on-LAN so
+// there is no on-LAN cost). This is the harness half: warn on the shape, and never call a host down
+// without checking the overlay first.
+export function isMdnsHostName(hostName) {
+  return /\.local\.?$/i.test(String(hostName ?? "").trim());
+}
+
+// A host being absent from `tailscale status` is not proof it is down, and tailscale not being
+// installed says nothing at all about the host — both are UNKNOWN. Only a POSITIVE sighting is used to
+// contradict a failed ssh, never to confirm one.
+export function tailscaleSees({ status = "", host = "" } = {}) {
+  const h = String(host ?? "").trim();
+  if (!h || !String(status ?? "").trim()) return null;
+  return String(status).split("\n").some((line) => line.includes(h)) ? true : null;
+}
+
+// ── 2.3 — sleep is undetectable by the obvious query ───────────────────────────────────────────
+// The machine slept ~20:29Z–21:36Z and the first check said it had not. Power-assertion greps and
+// `uptime` CANNOT report a sleep event — neither could have returned the failing answer. `pmset -g log`
+// confirmed five cycles across the 88-minute gap.
+//
+// The non-obvious half: THREE `caffeinate` assertions were live during that sleep and the box slept
+// anyway. `caffeinate` does NOT hold off battery or clamshell sleep.
+//
+// So rather than asking the OS after the fact, `watch` notices its OWN missing time: a poll loop that
+// should have ticked in ~2.5s and finds 40 minutes elapsed was not running. That makes a blackout a
+// ledger event instead of a forensic exercise.
+export const SLEEP_GAP_FACTOR = 6;
+export function sleepGapDetected({ expectedMs, actualMs, minGapMs = 60000 } = {}) {
+  if (!Number.isFinite(expectedMs) || !Number.isFinite(actualMs)) return null;
+  const gap = actualMs - expectedMs;
+  if (gap < minGapMs || actualMs < expectedMs * SLEEP_GAP_FACTOR) return null;
+  return {
+    gap_ms: gap,
+    gap_s: Math.round(gap / 1000),
+    expected_ms: Math.round(expectedMs),
+    actual_ms: Math.round(actualMs),
+    note: `the watch loop lost ${Math.round(gap / 1000)}s of wall clock it should have been polling through — ` +
+      "the host almost certainly SLEPT. Confirm with `pmset -g log | grep -E 'Sleep|Wake'` (uptime and " +
+      "power-assertion greps CANNOT report a past sleep). Note caffeinate does NOT prevent battery or " +
+      "clamshell sleep: an unattended wave needs AC power and the lid OPEN, or run it on the mini.",
+  };
+}
+
 // The files whose skew between hosts silently loses telemetry or gates. `session-token-report.mjs` joined
 // the list because a remote skills dir without it makes EVERY mini lead gap its token spend while
 // `skills-sync` reported "in sync" on work-runner.mjs alone.
@@ -7537,6 +7757,20 @@ export async function runSubcommand(argv) {
       const ltCfg = getLeadTypes()[leadType];
       if (!ltCfg) throw new Error(`unknown lead type "${leadType}" — define it in .claude/work.config.json leadTypes (have: ${Object.keys(getLeadTypes()).join(", ")})`);
       const hostName = o.host ?? "local";
+      // 6.3 — refuse a LOCAL dispatch when this box is already in the swap freeze zone. Mechanical on
+      // purpose: the one time this was caught, it was caught because an orchestrator happened to check
+      // `sysctl vm.swapusage` by hand and declined a db-lane lead at 88.6%. An unattended run has nobody
+      // to remember, and the failure mode is not a slow lead — it is orch+shepherd pinned at 0% CPU for
+      // ~40 minutes, which reads exactly like a wedge. Remote hosts are unaffected (their memory is
+      // their own), and --force is the deliberate override.
+      if (hostName === "local" && !o.dryRun && !o.force) {
+        const swapRes = await runCommand({ command: "sysctl", args: ["vm.swapusage"], timeoutMs: 5000 }).catch(() => ({ exitCode: 1, stdout: "" }));
+        const v = swapVerdict(parseSwapUsage(swapRes.stdout));
+        if (v.refuse) {
+          throw new Error(`spawn-lead ${o.issueId}: REFUSING a local dispatch — ${v.detail} ` +
+            "Dispatch to a mini (--host <name>), free memory, or override with --force if you accept the freeze risk.");
+        }
+      }
       // The host allowlist is the SINGLE gate for where a proxy-backed type may run. It used to be
       // backed up by a blanket "no proxy type on any remote host" throw below, which was correct only
       // while `local` was the one machine with a gateway. A host now qualifies by being provisioned
@@ -8416,8 +8650,28 @@ export async function runSubcommand(argv) {
       // gone on purpose: an unknown id is a refusal, never an empty unit that folds a phantom `reaped`.
       const it = state.issues[o.issueId];
       const abandoned = Boolean(o.abandon || o.force);
-      const refusal = reapRefusal({ issueId: o.issueId, runId: o.runId, unit: it, abandon: abandoned });
+      // 4.3 — is this a DECLARED-but-never-dispatched id? `state.queue` is the run's own answer, so a
+      // typo'd id is still refused: the queue is built from `run_started.issues`, not from the argv.
+      const neverStarted = !it && (state.queue ?? []).includes(o.issueId);
+      const refusal = reapRefusal({ issueId: o.issueId, runId: o.runId, unit: it, abandon: abandoned, queued: neverStarted });
       if (refusal) throw new Error(refusal);
+      if (neverStarted) {
+        // Nothing to tear down: no worktree, no host, no lead process ever existed. The whole point is
+        // that the ledger records WHY this unit is terminal, rather than the run being unclosable or
+        // someone hand-appending a `reaped` that claims a teardown that never happened.
+        const ev = {
+          actor: "orch", type: "reaped", issue: o.issueId,
+          never_started: true, cleanup_ok: true, cleanup: [],
+          note: "declared in run_started.issues and never dispatched — no worktree, host or lead process ever existed, so nothing was torn down",
+          ts: new Date().toISOString(),
+        };
+        if (!o.dryRun) await appendEvent(runDir, ev);
+        return {
+          event: ev,
+          stdout: `reaped ${o.issueId} — NEVER STARTED (declared, never dispatched). Nothing torn down; ` +
+            `the unit is now terminal so \`complete-run\` can close the run.${o.dryRun ? " [dry-run: nothing appended]" : ""}`,
+        };
+      }
       // Only load-bearing when the unit was ACTIVE — an --abandon on an already-merged unit is a no-op
       // flag, and stamping `abandoned: true` there would claim a destruction that did not happen.
       const abandonedActive = abandoned && !REAP_TERMINAL_ELIGIBLE(it.status);
@@ -8584,7 +8838,10 @@ export async function runSubcommand(argv) {
       // NOT a gate — DER-2740's leaked-teardown banner survives terminal status on purpose, and the
       // settled completion contract does not include it. But a run whose reap left a remote lead alive is
       // still spending, so the success receipt says so out loud rather than reading unqualified-clean.
-      const leaks = finalState.reap_failures ?? [];
+      // 4.4 — a RETRACTED leak is not an open one. It stays in state.reap_failures with its evidence
+      // (the append-only record is intact and the investigation is still readable), but the run's exit
+      // banner must stop telling the operator to go check something already verified resolved.
+      const leaks = (finalState.reap_failures ?? []).filter((l) => !l.retracted);
       return {
         completed: true, event: ev, units, state: finalState, stateWritten, reapFailures: leaks,
         rejectedMarkers,
@@ -8787,6 +9044,27 @@ export async function runSubcommand(argv) {
         const pct = Number((line.match(/(\d+)%/) ?? [])[1]);
         add("disk", Number.isFinite(pct) && pct < 90, `home volume ${pct}% used${pct >= 90 ? " — ≥90% is the freeze co-factor; clean before a run" : ""}`);
       }
+      // 4b. 6.3 — swap. The other half of the freeze signature, and until now checked only by an
+      // orchestrator remembering to. An unparseable read is UNKNOWN, never "plenty of headroom".
+      {
+        const res = await runCommand({ command: "sysctl", args: ["vm.swapusage"], timeoutMs: 5000 }).catch(() => ({ exitCode: 1, stdout: "" }));
+        const v = swapVerdict(parseSwapUsage(res.stdout));
+        add("swap", v.ok, v.detail);
+      }
+      // 4c. 2.3 — power. `caffeinate` is NOT a sleep guard: three assertions were live while the box
+      // slept for 88 minutes on 2026-07-31. Battery and clamshell sleep are the ones that bite, and an
+      // unattended wave that sleeps looks exactly like a wedged one.
+      {
+        const res = await runCommand({ command: "pmset", args: ["-g", "ps"], timeoutMs: 5000 }).catch(() => ({ exitCode: 1, stdout: "" }));
+        const out = String(res.stdout ?? "");
+        const onBattery = /Battery Power/i.test(out);
+        const known = /AC Power|Battery Power/i.test(out);
+        add("power", known ? !onBattery : "unknown", !known
+          ? "could not read `pmset -g ps` — UNKNOWN. An unattended wave needs AC power and the lid OPEN; caffeinate does NOT prevent battery/clamshell sleep."
+          : onBattery
+            ? "ON BATTERY — an unattended wave will sleep through its own run. caffeinate does NOT prevent battery or clamshell sleep (measured: 3 live assertions, 5 sleep cycles, 88 min lost). Plug in and open the lid, or dispatch to the mini."
+            : "on AC power (keep the lid OPEN — clamshell sleep is not held off by caffeinate either)");
+      }
       // 5. Transcript persistence — H10: without it ALL telemetry under-reports silently.
       {
         const childMarker = !!process.env.CLAUDE_CODE_CHILD_SESSION;
@@ -8887,6 +9165,19 @@ export async function runSubcommand(argv) {
       // 7. Skills skew vs remote hosts — a lead on the mini following a stale brief loses gates silently,
       // and a remote skills dir without session-token-report.mjs makes every mini lead gap its spend, so
       // BOTH files are hashed (a missing file yields no hash at all ⇒ SKEW, never a matching-broken pair).
+      // 6.1 — before anything ssh-shaped runs, check the HostName SHAPE. A `.local` alias is mDNS and
+      // resolves only on the LAN; off-network it fails in a way that reads as "the host is down", and
+      // that exact misreading went into a run handoff ("MINI IS DOWN, cap-5 lane gone") for a box that
+      // had been up 21 days.
+      for (const [hostName, hostCfg] of Object.entries(getHosts())) {
+        if (hostCfg.kind === "cloud" || !hostCfg.ssh) continue;
+        const g = await runCommand({ command: "ssh", args: ["-G", hostCfg.ssh], timeoutMs: 10000 }).catch(() => ({ exitCode: 1, stdout: "" }));
+        const hn = (String(g.stdout ?? "").split("\n").find((l) => l.startsWith("hostname ")) ?? "").slice(9).trim();
+        if (!hn) { add(`ssh-hostname:${hostName}`, "unknown", `could not read \`ssh -G ${hostCfg.ssh}\` — cannot tell whether this alias is mDNS-only`); continue; }
+        add(`ssh-hostname:${hostName}`, !isMdnsHostName(hn), isMdnsHostName(hn)
+          ? `HostName is ${hn} — mDNS/Bonjour, LAN-ONLY. Off-network this fails as "could not resolve hostname" and reads as HOST DOWN. Use a Tailscale 100.x address (it routes direct on-LAN, so there is no on-LAN cost). A documented 192.168.x fallback is NOT a fix — it is equally useless off-network and its presence in a comment is false reassurance.`
+          : `HostName ${hn}`);
+      }
       for (const [hostName, hostCfg] of Object.entries(getHosts())) {
         if (hostCfg.kind === "cloud" || !hostCfg.ssh) continue;
         const localHash = await runCommand({ command: "sh", args: ["-c", skillsHashCommand(SKILLS_SYNC_FILES.map((f) => join(skillsDir, f)))] });
@@ -9225,7 +9516,7 @@ export async function runSubcommand(argv) {
               // because the alternative — the old behaviour — was that it never surfaced at all and read
               // as healthy in-flight work. Role failures (no issue) appear as "shepherd"/"orch".
               spawn_failures: (st.spawn_failures ?? []).map((f) => f.issue ?? f.role),
-              reap_failures: (st.reap_failures ?? []).map((f) => f.issue),
+              reap_failures: (st.reap_failures ?? []).filter((f) => !f.retracted).map((f) => f.label),
               // DER-2839: hosts whose remote ledger could not be READ this cycle — missing, unreadable, or
               // an ssh failure. Distinct from `held_fragment_stale` (a tail stuck MID-LINE, where the read
               // succeeded) because the remedy differs: nothing here has been ingested at all. Carries the
@@ -9298,7 +9589,22 @@ export async function runSubcommand(argv) {
           // Consume noise: the offset has already advanced past it, so we keep blocking without re-scan.
         }
         if (Date.now() - started >= timeoutMs) return { stdout: await wakePayload("timeout") };
-        await sleep(pollMs);
+        // 2.3 — the loop notices its OWN missing time. A tick that should take ~pollMs and took 40
+        // minutes was not running, and the host almost certainly slept. Recording it here turns a
+        // blackout into a ledger event instead of a forensic exercise the next morning: on 2026-07-31
+        // an 88-minute sleep was first reported as "it didn't sleep", because `uptime` and
+        // power-assertion greps are both structurally incapable of reporting a past sleep.
+        {
+          const before = Date.now();
+          await sleep(pollMs);
+          const gap = sleepGapDetected({ expectedMs: pollMs, actualMs: Date.now() - before });
+          if (gap) {
+            await appendEvent(runDir, {
+              actor: "orch", type: "host_sleep_detected", host: hostname(),
+              ...gap, ts: new Date().toISOString(),
+            }).catch(() => { /* a ledger write failure must never kill the watcher */ });
+          }
+        }
       }
       } finally {
         for (const [sig, fn] of sigHandlers) process.off(sig, fn);

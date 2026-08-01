@@ -163,6 +163,68 @@ residual risk, and unknown gaps are why *Reporting a vulnerability* exists.
 Authenticated privileged-event ingress is **explicitly out of scope** for now; see the trust-boundary
 section above for what that implies.
 
+## Verifying a remote host's identity (`known_hosts`)
+
+The harness dispatches leads to remote hosts over ssh (see `preflight`'s host checks, and the `.local`
+HostName warning covered in the README). When ssh reports `REMOTE HOST IDENTIFICATION HAS CHANGED`, that
+is a live warning about the identity of the box you are about to hand credentials to, not a formality to
+clear.
+
+**Do not run `ssh-keygen -R <host>` as a reflex, and never script it or wire it into the harness.**
+Removing the `known_hosts` entry destroys the only local evidence that the key changed. Once it is gone,
+ssh will connect to whatever key answers next — including an attacker's — and there is nothing left to
+compare against.
+
+The common case really is benign: a Tailscale (or any DHCP) IP gets reassigned, and the warning fires
+against a `known_hosts` line recorded by whichever machine held that IP before. **But "usually stale" is
+not "provably stale,"** and a real man-in-the-middle wants to hide inside exactly that assumption. Prove
+it before acting on it.
+
+### Prove staleness under two independent names, mechanically
+
+A host that really is the box you think it is presents the **same key** under every name it answers to.
+If the same host also has a `.local` mDNS name and a stable LAN IP already recorded in `known_hosts`,
+those are **two attestations established independently** of the Tailscale-IP entry now in question. If
+the presented key matches both, the Tailscale entry is stale. If it matches only one, or neither, stop —
+that is not proof, and this is a case for the human operator, not for the harness to route around.
+
+```bash
+KEY_TYPE=ed25519            # the type named in the changed-host warning
+HOST_IP=100.x.x.x           # the Tailscale IP that triggered the warning
+HOST_MDNS=hostname.local    # independent attestation 1
+HOST_LAN=192.168.x.x        # independent attestation 2
+
+# Compare the presented key against BOTH independent names — mechanically, not visually.
+diff <(ssh-keyscan -t "$KEY_TYPE" "$HOST_IP"   2>/dev/null | ssh-keygen -lf -) \
+     <(ssh-keyscan -t "$KEY_TYPE" "$HOST_MDNS" 2>/dev/null | ssh-keygen -lf -) \
+  && echo "MATCHES .local"
+
+diff <(ssh-keyscan -t "$KEY_TYPE" "$HOST_IP"  2>/dev/null | ssh-keygen -lf -) \
+     <(ssh-keyscan -t "$KEY_TYPE" "$HOST_LAN" 2>/dev/null | ssh-keygen -lf -) \
+  && echo "MATCHES LAN IP"
+```
+
+**Compare fingerprints with `diff`, never by reading them.** In the incident that motivated this section,
+the presented fingerprint and the stale one diverged only after the first character — `9W…` vs `9S…` —
+with every other character identical. Read side by side at the end of a long run, that pair is the kind
+of thing a tired human calls "the same" and waves through, which is precisely a MITM's fingerprint too.
+`diff` on two `ssh-keygen -lf -` outputs doesn't skim: it reports exact equality (silent, exit 0) or it
+doesn't, and only the exact-equality case is evidence.
+
+### Only after both comparisons confirm the match, remove the stale entry
+
+```bash
+# Both diffs above matched: the presented key is attested independently by
+# .local AND the LAN IP, so the Tailscale-IP entry is proven stale, not a MITM.
+ssh-keygen -R "$HOST_IP"
+ssh <host-alias>   # re-add known_hosts under the now-verified key
+```
+
+Name what was proven when you remove the entry — in the run ledger or a commit message, not only in your
+head: which two independent names the presented key matched, and that the match was checked mechanically.
+A removal with no stated proof is indistinguishable, later, from someone who just made the warning go
+away.
+
 ## Verifying your own install
 
 ```bash
