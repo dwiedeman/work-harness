@@ -35,24 +35,96 @@ cp "$SRC/VERSION" "$DEST/VERSION"
 echo "Recording content digests → $DEST/INSTALL-MANIFEST.json"
 SOURCE_COMMIT="$(git -C "$SRC" rev-parse HEAD 2>/dev/null || echo unknown)"
 INSTALLED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-# Hash what was actually COPIED, walking $DEST — not $SRC. Hashing the source would attest to the bytes
-# we meant to install rather than the bytes that landed, and a `cp` that silently dropped a file would
-# still produce a matching manifest. The point is to measure the tree preflight will later re-measure.
+
+# DER-3008 — the digest is scoped to the SHIPPED PAYLOAD, not to everything under $DEST/skills.
+#
+# This walk used to be `find skills hooks -type f` under $DEST, i.e. every file in the operator's
+# ~/.claude/skills tree. `~/.claude/skills` is a SHARED directory: this MacBook carries 59 top-level
+# skills (823 files — email skills, hyperframes symlinks, __pycache__) against the mini's handful. So
+# the aggregate could never match across two hosts no matter how faithfully both were installed.
+# Measured 2026-08-01, both hosts at 0.4.0 from source_commit 0ba513f with every harness-suite file
+# byte-identical: MacBook f18703c0bca0… vs mini a1cc1fae4a5c…. `harness-digest:<host>` compares exactly
+# that aggregate, so a KNOWN-GOOD deploy reported "CONTENT DRIFT — SAME VERSION STRING, DIFFERENT CODE".
+# A gate that reds on a correct deploy gets waved past, which is how the drift it exists to catch gets
+# through.
+#
+# The list therefore comes from $SRC (what this script ships), and every hash is still taken at $DEST
+# (what actually landed) — measure-what-landed is the property that makes a `cp` which silently dropped
+# a file fail rather than vanish from both sides of the compare. A missing $DEST copy has no hash, and
+# rather than skipping the line (which would just shorten the list and still produce a valid-looking
+# digest) it FAILS THE INSTALL by name.
 #
 # `tmp/` is excluded because the runner writes run state under skills/work/tmp/; including it would make
 # every install drift against itself the moment anything ran, and a drift check that always reds is one
 # nobody reads.
-DIGEST_LINES="$(cd "$DEST" && find skills hooks -type f ! -path '*/tmp/*' ! -name '.DS_Store' \
-  | LC_ALL=C sort \
-  | while IFS= read -r f; do printf '%s:%s\n' "$f" "$(shasum -a 256 "$f" | cut -d' ' -f1)"; done)"
+SHIPPED_RELS="$( { (cd "$SRC" && find skills hooks -type f ! -path '*/tmp/*' ! -name '.DS_Store'); echo VERSION; } | LC_ALL=C sort)"
+
+# The manifest's wire format is `path:sha256` lines plus hand-emitted JSON, and BOTH encodings are
+# ambiguous for three characters. Each was reproduced against this script and each failed SILENTLY,
+# at exit 0, with a manifest that looked well-formed:
+#   `:`      `awk -F:` splits on the FIRST colon, so a payload file `skills/work/notes:draft.md` was
+#            recorded as key "skills/work/notes" with the VALUE "draft.md" in place of a hash.
+#            `aggregateDigest` folds `path:sha` the same way, so the two sides cannot even agree on what
+#            the line means — and a perfectly clean install then reads as PERMANENT drift.
+#   `"`      emitted raw into the JSON string, so `skills/work/say"hi.md` produced a manifest that is not
+#            valid JSON. `measureHarnessDrift` cannot parse it and returns `absent` — an install unable
+#            to attest to itself — while install.sh reported success.
+#   newline  splits one path across two `while read` iterations, corrupting both list and aggregate.
+#
+# The payload is repo-controlled and no such filename exists today, so the honest fix is to fail CLOSED
+# at the source rather than build an escaping layer for filenames this project must never ship. Any
+# quoting scheme would also have to be mirrored byte-for-byte in `aggregateDigest`, which is precisely
+# the two-definitions-of-one-digest hazard documented above that function.
+BAD_NAMES="$(printf '%s\n' "$SHIPPED_RELS" | grep -E '[:"]' || true)"
+# A newline inside a filename is invisible in the line-oriented list above — it has already split. Count
+# NUL-delimited entries against line-delimited ones instead; a mismatch means some name contains one.
+NL_LINES="$( (cd "$SRC" && find skills hooks -type f ! -path '*/tmp/*' ! -name '.DS_Store') | wc -l | tr -d ' ')"
+NUL_ENTRIES="$( (cd "$SRC" && find skills hooks -type f ! -path '*/tmp/*' ! -name '.DS_Store' -print0) | tr -dc '\0' | wc -c | tr -d ' ')"
+if [ -n "$BAD_NAMES" ] || [ "$NL_LINES" != "$NUL_ENTRIES" ]; then
+  echo "INSTALL FAILED: the shipped payload contains a filename the manifest format cannot encode unambiguously." >&2
+  if [ -n "$BAD_NAMES" ]; then
+    echo "  these contain ':' or '\"':" >&2
+    printf '    %s\n' "$BAD_NAMES" >&2
+  fi
+  if [ "$NL_LINES" != "$NUL_ENTRIES" ]; then
+    echo "  a filename contains a NEWLINE ($NL_LINES line(s) for $NUL_ENTRIES file(s))" >&2
+  fi
+  echo "  Rename it in the source tree. A ':' silently corrupts the path:sha256 line and a '\"' emits invalid JSON — both at exit 0, which is why this refuses rather than escapes." >&2
+  exit 1
+fi
+# The TERRITORY the payload lands in: the top-level paths `cp -R "$SRC/skills/." "$DEST/skills/"` and its
+# hooks twin write into — `skills/work`, `skills/prep-for-work`, `hooks/context-wrap-nudge.mjs`, … .
+# Recorded in the manifest because `measureHarnessDrift` needs it to find UNTRACKED files: with the file
+# list now scoped, a walk of all of `skills/` would report the operator's other 798 files as untracked on
+# every clean install. Scoping the WALK to these roots keeps rogue-file and stale-leftover detection
+# alive exactly where the runner loads code from, and nowhere else.
+#
+# `cut -f1-2` gives `skills/<dir>` for a nested skill file and `hooks/<file>` for a hook — deliberately
+# the individual hook FILES, not the whole `hooks/` directory, because ~/.claude/hooks is shared with
+# other tools and a co-tenant's hook is not harness drift. VERSION is in `files` but is not a root.
+SHIPPED_ROOTS="$(printf '%s\n' "$SHIPPED_RELS" | grep -E '^(skills|hooks)/' | cut -d/ -f1-2 | LC_ALL=C sort -u)"
+DIGEST_LINES="$(cd "$DEST" && printf '%s\n' "$SHIPPED_RELS" | while IFS= read -r f; do
+  [ -n "$f" ] || continue
+  h="$(shasum -a 256 "$f" 2>/dev/null | cut -d' ' -f1)"
+  if [ -z "$h" ]; then
+    echo "INSTALL FAILED: $DEST/$f is in the shipped payload but is not readable after the copy — refusing to write a manifest that attests to a file that did not land." >&2
+    exit 1
+  fi
+  printf '%s:%s\n' "$f" "$h"
+done)"
 # The aggregate is sha256 over those `path:sha256` lines joined by newline, NO trailing newline —
 # byte-identical to `aggregateDigest()` in work-runner.mjs, which the unit suite pins with a control that
 # recomputes this from the manifest's own files map. Two definitions of one digest that disagree would
 # make every cross-host comparison read as drift.
 CONTENT_DIGEST="$(printf '%s' "$DIGEST_LINES" | shasum -a 256 | cut -d' ' -f1)"
+# `manifest_schema` exists so a v1 manifest (whole-tree file list, no `roots`) is RECOGNISED as old
+# rather than compared against a v2 one and reported as content drift. The cross-host check reads it and
+# says "re-install BOTH hosts" instead of naming a drift that isn't one.
 {
-  printf '{\n  "version": "%s",\n  "installed_at": "%s",\n  "source_commit": "%s",\n  "content_digest": "%s",\n  "files": {\n' \
+  printf '{\n  "manifest_schema": 2,\n  "version": "%s",\n  "installed_at": "%s",\n  "source_commit": "%s",\n  "content_digest": "%s",\n  "roots": [' \
     "$(cat "$SRC/VERSION")" "$INSTALLED_AT" "$SOURCE_COMMIT" "$CONTENT_DIGEST"
+  printf '%s\n' "$SHIPPED_ROOTS" | awk 'NR>1{printf ", "} {printf "\"%s\"", $0}'
+  printf '],\n  "files": {\n'
   printf '%s\n' "$DIGEST_LINES" | awk -F: 'NR>1{printf ",\n"} {printf "    \"%s\": \"%s\"", $1, $2}'
   printf '\n  }\n}\n'
 } > "$DEST/INSTALL-MANIFEST.json"

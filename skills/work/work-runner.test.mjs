@@ -27,6 +27,9 @@ import {
   aggregateTokenUsage, renderUsageMd, eventSeenKey,
   clampWatchTimeout, WATCH_TIMEOUT_MAX_S,
   harnessDriftVerdict, aggregateDigest, measureHarnessDrift, HARNESS_MANIFEST_FILE,
+  harnessDigestVerdict, crossHostTargets, manifestRoots, getConfigSource, skillsSyncVerdict,
+  workConfigVerdict, crossHostCoverageVerdict,
+  HARNESS_MANIFEST_SCHEMA, HARNESS_MANIFEST_ROOTS,
   resolveCodexBinFrom,
   parseLensVerdicts, reviewSwapEvent, gateShaRefusal, codexWaiverFrom, gateBlockerCountVerdict,
   parsePanelLensOutput, parsePanelVerifyOutput, unionPanelFindings, applyFalsifications,
@@ -9499,6 +9502,425 @@ test("measureHarnessDrift WALKS the tree, so a file absent from the manifest is 
     assert.equal((await measureHarnessDrift(dir)).status, "clean", "runtime state under tmp/ must never read as drift");
   } finally {
     await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// DER-3008 — the aggregate digest could never match across two hosts, and the cross-host checks that
+// compare it silently did not run.
+//
+// Both were live on 2026-08-01. The MacBook and the mini were at the same version (0.4.0) from the same
+// source_commit (0ba513f) with every harness-suite file byte-identical, and their aggregates were
+// f18703c0bca0… vs a1cc1fae4a5c… — because install.sh's digest walked `find skills hooks -type f` under
+// $DEST, i.e. the operator's whole ~/.claude/skills tree (798 unrelated files here, 4 on the mini).
+// `harness-digest:<host>` compares exactly that aggregate, so it would have reported "CONTENT DRIFT —
+// SAME VERSION STRING, DIFFERENT CODE" on a known-good deploy.
+
+// A v2 install fixture: the shipped payload under `roots`, plus however many unrelated skills the
+// operator happens to keep in the same shared ~/.claude/skills directory.
+async function installFixture({ unrelatedSkills = 0, payload = { "skills/work/work-runner.mjs": "RUNNER", "skills/work-lead/SKILL.md": "LEAD", "hooks/context-wrap-nudge.mjs": "HOOK", "VERSION": "0.4.0\n" } } = {}) {
+  const dir = await mkdtemp(join(tmpdir(), "harness-scope-"));
+  const files = {};
+  for (const [rel, body] of Object.entries(payload)) {
+    await mkdir(join(dir, rel, ".."), { recursive: true });
+    await writeFile(join(dir, rel), body);
+    files[rel] = createHash("sha256").update(body).digest("hex");
+  }
+  for (let i = 0; i < unrelatedSkills; i += 1) {
+    await mkdir(join(dir, "skills", `unrelated-skill-${i}`), { recursive: true });
+    await writeFile(join(dir, "skills", `unrelated-skill-${i}`, "SKILL.md"), `# unrelated ${i}\n`);
+  }
+  const manifest = {
+    manifest_schema: HARNESS_MANIFEST_SCHEMA,
+    version: "0.4.0",
+    source_commit: "0ba513f52da779cbc889df7f3718a781b1f8ed62",
+    content_digest: aggregateDigest(files),
+    roots: ["hooks/context-wrap-nudge.mjs", "skills/work", "skills/work-lead"],
+    files,
+  };
+  await writeFile(join(dir, HARNESS_MANIFEST_FILE), JSON.stringify(manifest));
+  return { dir, manifest };
+}
+
+// The whole-tree definition this change replaced, kept HERE as the control. Without it the test below
+// would pass just as happily against an implementation that never had the bug, and could not show that
+// the fixture actually models the failure it claims to.
+async function legacyWholeTreeDigest(dir) {
+  const files = {};
+  const walk = async (rel) => {
+    let entries;
+    try { entries = await readdir(join(dir, rel), { withFileTypes: true }); } catch { return; }
+    for (const ent of entries) {
+      const child = `${rel}/${ent.name}`;
+      if (ent.isDirectory()) await walk(child);
+      else if (ent.isFile()) files[child] = createHash("sha256").update(await readFile(join(dir, child))).digest("hex");
+    }
+  };
+  await walk("skills");
+  await walk("hooks");
+  return aggregateDigest(files);
+}
+
+test("DER-3008: two hosts with DIFFERENT unrelated ~/.claude/skills populations get the SAME content digest", async () => {
+  // The exact live scenario: identical harness payload, wildly different co-tenant skill counts.
+  const mac = await installFixture({ unrelatedSkills: 400 });
+  const mini = await installFixture({ unrelatedSkills: 2 });
+  try {
+    // THE CONTROL, first: the fixtures must actually differ under the old definition, or the assertion
+    // below proves nothing. This is the pair of aggregates that were measured as f18703c0… vs a1cc1fae….
+    assert.notEqual(
+      await legacyWholeTreeDigest(mac.dir),
+      await legacyWholeTreeDigest(mini.dir),
+      "control: under the OLD whole-tree definition these two hosts MUST disagree — if they agree, the fixture no longer models the defect and the assertion below is vacuous",
+    );
+
+    assert.equal(mac.manifest.content_digest, mini.manifest.content_digest,
+      "a payload-scoped digest is a function of the shipped bytes alone, so two correctly-installed hosts agree no matter what else lives in ~/.claude/skills");
+
+    // And each still reads CLEAN locally: scoping the file list without scoping the WALK would report
+    // all 400 unrelated files as UNTRACKED on a clean install, which reds the gate forever.
+    assert.equal((await measureHarnessDrift(mac.dir)).status, "clean", "400 unrelated skills are not harness drift");
+    assert.equal((await measureHarnessDrift(mini.dir)).status, "clean");
+
+    // The cross-host verdict itself must say CLEAN for this pair — the acceptance criterion is that the
+    // check can report clean, not only that it can report drift.
+    const clean = harnessDigestVerdict({
+      hostName: "mini", sshAlias: "macmini-hermes",
+      local: await measureHarnessDrift(mac.dir),
+      remoteRaw: JSON.stringify(mini.manifest), remoteExitCode: 0,
+    });
+    assert.equal(clean.ok, true, clean.detail);
+  } finally {
+    await rm(mac.dir, { recursive: true, force: true });
+    await rm(mini.dir, { recursive: true, force: true });
+  }
+});
+
+test("DER-3008: a drifted harness file on the remote host turns harness-digest RED (the must-fail control)", async () => {
+  const mac = await installFixture({ unrelatedSkills: 400 });
+  const mini = await installFixture({ unrelatedSkills: 2, payload: {
+    "skills/work/work-runner.mjs": "RUNNER-BUT-DIFFERENT", // one byte of real harness code differs
+    "skills/work-lead/SKILL.md": "LEAD",
+    "hooks/context-wrap-nudge.mjs": "HOOK",
+    "VERSION": "0.4.0\n", // SAME version string — the drift a version check cannot see
+  } });
+  try {
+    const v = harnessDigestVerdict({
+      hostName: "mini", sshAlias: "macmini-hermes",
+      local: await measureHarnessDrift(mac.dir),
+      remoteRaw: JSON.stringify(mini.manifest), remoteExitCode: 0,
+    });
+    assert.equal(v.ok, false, "a real content difference must still be caught — scoping the digest must not blind it");
+    assert.match(v.detail, /CONTENT DRIFT/);
+    assert.match(v.detail, /SAME VERSION STRING, DIFFERENT CODE/, "both hosts claim 0.4.0, which is the point");
+  } finally {
+    await rm(mac.dir, { recursive: true, force: true });
+    await rm(mini.dir, { recursive: true, force: true });
+  }
+});
+
+test("DER-3008: a file install.sh no longer ships is UNTRACKED drift, not silently re-blessed", async () => {
+  // The stale-leftover decision, stated as a test. Three such files were live on this MacBook when the
+  // issue was written (PUBLIC-README.draft.md, SCRUB-MANIFEST.md, TURNOVER-2026-07-15-…md) and the old
+  // whole-tree walk hashed them INTO the manifest, so they read as shipped forever. A retired module
+  // under skills/work/ is code the runner can still import; it is drift.
+  const { dir } = await installFixture();
+  try {
+    await writeFile(join(dir, "skills", "work", "RETIRED-HELPER.mjs"), "// shipped in 0.3.0, not in 0.4.0");
+    const v = await measureHarnessDrift(dir);
+    assert.equal(v.status, "drift");
+    assert.deepEqual(v.unexpected, ["skills/work/RETIRED-HELPER.mjs"]);
+    assert.match(v.reason, /rm .*RETIRED-HELPER\.mjs/, "the verdict must name the remedy — re-installing does NOT prune");
+    assert.match(v.reason, /never prunes/);
+    // A leftover OUTSIDE the shipped roots is the operator's business, not ours.
+    await rm(join(dir, "skills", "work", "RETIRED-HELPER.mjs"));
+    await mkdir(join(dir, "skills", "some-other-tool"), { recursive: true });
+    await writeFile(join(dir, "skills", "some-other-tool", "SKILL.md"), "# not ours");
+    assert.equal((await measureHarnessDrift(dir)).status, "clean", "a co-tenant skill is never harness drift");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("DER-3008: a v1 manifest is re-measured with the LEGACY whole-tree roots, never with v2 roots", async () => {
+  // Upgrade path. A host still carrying a pre-DER-3008 manifest must keep reading its own install
+  // correctly until it is re-installed — measuring a v1 file list against v2 roots would report every
+  // unrelated skill it legitimately lists as MISSING.
+  assert.deepEqual(manifestRoots({ files: {} }), HARNESS_MANIFEST_ROOTS, "no `roots` key ⇒ legacy");
+  assert.deepEqual(manifestRoots({ roots: [], files: {} }), HARNESS_MANIFEST_ROOTS, "an empty list is not a declaration");
+  assert.deepEqual(manifestRoots({ roots: ["skills/work"], files: {} }), ["skills/work"]);
+
+  const dir = await mkdtemp(join(tmpdir(), "harness-v1-"));
+  try {
+    await mkdir(join(dir, "skills", "unrelated"), { recursive: true });
+    await mkdir(join(dir, "hooks"), { recursive: true });
+    await writeFile(join(dir, "skills", "unrelated", "SKILL.md"), "# co-tenant");
+    await writeFile(join(dir, "hooks", "context-wrap-nudge.mjs"), "HOOK");
+    // v1 manifests listed EVERYTHING under skills/ + hooks/, unrelated skills included.
+    const files = {
+      "skills/unrelated/SKILL.md": createHash("sha256").update("# co-tenant").digest("hex"),
+      "hooks/context-wrap-nudge.mjs": createHash("sha256").update("HOOK").digest("hex"),
+    };
+    await writeFile(join(dir, HARNESS_MANIFEST_FILE), JSON.stringify({ version: "0.3.0", content_digest: aggregateDigest(files), files }));
+    const v = await measureHarnessDrift(dir);
+    assert.equal(v.status, "clean", "a v1 install must still read clean against its own v1 manifest");
+    assert.equal(v.manifest_schema, 1, "and must be RECOGNISABLE as v1 so the cross-host check can say so");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("DER-3008: a v1/v2 manifest pair is SCHEMA SKEW, never reported as content drift", async () => {
+  const { dir, manifest } = await installFixture();
+  try {
+    const v = harnessDigestVerdict({
+      hostName: "mini", sshAlias: "macmini-hermes",
+      local: await measureHarnessDrift(dir),
+      remoteRaw: JSON.stringify({ version: "0.4.0", content_digest: "deadbeef".repeat(8), files: {} }), // no manifest_schema ⇒ v1
+      remoteExitCode: 0,
+    });
+    assert.equal(v.ok, false);
+    assert.equal(v.schemaSkew, true);
+    assert.match(v.detail, /SCHEMA SKEW/);
+    assert.match(v.detail, /BOTH hosts/, "the remedy is to re-install both, not to chase a drift that does not exist");
+    assert.doesNotMatch(v.detail, /CONTENT DRIFT/, "naming this drift sends the operator to re-install the wrong thing");
+    assert.equal(manifest.manifest_schema, HARNESS_MANIFEST_SCHEMA);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("DER-3008: an UNREACHABLE host is UNKNOWN, not 'the host has no manifest'", async () => {
+  // `cat … 2>/dev/null || true` exits 0 with empty output for an absent file AND prints nothing when the
+  // box never answered, so only ssh's exit code separates them. Printing "re-install on mini" for a box
+  // that is offline sends an operator to ssh into a machine that is not there.
+  const { dir } = await installFixture();
+  try {
+    const local = await measureHarnessDrift(dir);
+    const down = harnessDigestVerdict({ hostName: "mini", sshAlias: "macmini-hermes", local, remoteRaw: "", remoteExitCode: 255 });
+    assert.equal(down.ok, "unknown", "a probe that could not run is never a verdict");
+    assert.match(down.detail, /UNREACHABLE/);
+    assert.doesNotMatch(down.detail, /re-install on mini/);
+
+    const noManifest = harnessDigestVerdict({ hostName: "mini", sshAlias: "macmini-hermes", local, remoteRaw: "", remoteExitCode: 0 });
+    assert.equal(noManifest.ok, false, "reachable-but-unattested is a real failing verdict");
+    assert.match(noManifest.detail, /answered but has no readable/);
+
+    // And the local side: two absences must never read as a match.
+    const noLocal = harnessDigestVerdict({ hostName: "mini", sshAlias: "macmini-hermes", local: {}, remoteRaw: "", remoteExitCode: 0 });
+    assert.equal(noLocal.ok, false);
+    assert.match(noLocal.detail, /LOCAL has no/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("DER-3008: crossHostTargets never skips a host silently — every skip carries a reason", () => {
+  // The second defect: the three cross-host loops inlined `if (kind === "cloud" || !ssh) continue;`, so
+  // "no host was checked" printed ZERO lines and was indistinguishable from three passing checks. On
+  // 2026-08-01 a preflight emitted no `:mini` line at all, with the mini plainly configured, because its
+  // cwd was a work-harness checkout — which carries no `.claude/work.config.json`, so `getHosts()` fell
+  // back to the built-in `{local:{cap:2}}`. `local` has no `ssh`, so every loop skipped it in silence.
+  const unconfigured = crossHostTargets({ local: { cap: 2 } });
+  assert.deepEqual(unconfigured.targets, [], "this is the exact shape the fallback produces");
+  assert.equal(unconfigured.skipped.length, 1, "and the caller must still be handed something to print");
+  assert.match(unconfigured.skipped[0].why, /this host/);
+
+  const real = crossHostTargets({
+    local: { cap: 2 },
+    mini: { cap: 5, ssh: "macmini-hermes" },
+    cloud: { kind: "cloud", cap: 99 },
+    orphan: { cap: 3 }, // non-cloud, dispatchable, no transport
+  });
+  assert.deepEqual(real.targets.map(([n]) => n), ["mini"]);
+  assert.deepEqual(real.skipped.map((s) => s.name).sort(), ["cloud", "local", "orphan"]);
+  assert.ok(real.skipped.every((s) => typeof s.why === "string" && s.why.length > 20),
+    "a skip with no reason is the silence this fix exists to remove");
+
+  // A non-cloud host with no ssh is a CONFIG ERROR, not a benign skip: it can receive dispatch and can
+  // never be verified. Only that one is flagged.
+  assert.deepEqual(real.skipped.filter((s) => s.misconfigured).map((s) => s.name), ["orphan"]);
+  assert.match(real.skipped.find((s) => s.name === "orphan").why, /can NEVER be checked/);
+
+  // A `enabled:false` host is still checked: it is degraded for DISPATCH, which says nothing about
+  // whether its installed harness matches. Silently dropping it would re-open this defect in a new shape.
+  assert.deepEqual(crossHostTargets({ mini: { ssh: "macmini-hermes", enabled: false } }).targets.map(([n]) => n), ["mini"]);
+
+  assert.deepEqual(crossHostTargets({}).targets, [], "an empty host map is handled, not thrown on");
+  assert.deepEqual(crossHostTargets().targets, []);
+});
+
+test("DER-3008: skills-sync treats an unreachable host as UNKNOWN, matching harness-digest from the same loop", () => {
+  // The two legs are printed from ONE loop iteration against ONE box, so disagreeing about whether that
+  // box answered is a self-contradiction visible in the output: `skills-sync` reded "SKEW … rsync -a …"
+  // — a confident remedy naming a host that never replied — directly beside `harness-digest`'s correct
+  // "UNREACHABLE … UNKNOWN, not drift". An rsync is also the wrong action for a down host, and from a
+  // stale local tree it is the action most likely to make things worse.
+  const files = ["work-runner.mjs", "session-token-report.mjs"];
+  const args = { hostName: "mini", sshAlias: "macmini-hermes", files };
+
+  const down = skillsSyncVerdict({ ...args, localHash: "abc123", remoteHash: "", remoteExitCode: 255 });
+  assert.equal(down.ok, "unknown", "a probe that could not run is never a verdict");
+  assert.match(down.detail, /UNREACHABLE/);
+  assert.doesNotMatch(down.detail, /rsync -a/, "no remedy may be prescribed from a reading that never happened");
+
+  // Pin the agreement rather than restating it: the same failed transport must produce the same
+  // tri-state on both legs, or the pair contradicts itself again.
+  const digest = harnessDigestVerdict({ ...args, local: { content_digest: "d", manifest_schema: 2 }, remoteRaw: "", remoteExitCode: 255 });
+  assert.equal(down.ok, digest.ok, "skills-sync and harness-digest must agree about whether the host answered");
+
+  // …and the check must still be able to red on a REAL skew, which is what it exists for.
+  const skew = skillsSyncVerdict({ ...args, localHash: "abc123", remoteHash: "def456", remoteExitCode: 0 });
+  assert.equal(skew.ok, false);
+  assert.match(skew.detail, /SKEW/);
+  assert.match(skew.detail, /rsync -a/, "a real skew DOES get the remedy");
+
+  assert.equal(skillsSyncVerdict({ ...args, localHash: "abc123", remoteHash: "abc123", remoteExitCode: 0 }).ok, true,
+    "and it must be able to say clean");
+
+  // A reachable host that returns nothing is a real failing verdict, not a transport problem.
+  const empty = skillsSyncVerdict({ ...args, localHash: "abc123", remoteHash: "", remoteExitCode: 0 });
+  assert.equal(empty.ok, false);
+  assert.match(empty.detail, /answered but returned no hash/);
+
+  // A missing LOCAL file is verifiable HERE, so it is reported even when the remote is unreachable —
+  // the remote's silence says nothing about our own install.
+  const noLocal = skillsSyncVerdict({ ...args, localHash: "", remoteHash: "", remoteExitCode: 255 });
+  assert.equal(noLocal.ok, false, "a broken local install must not hide behind a down remote");
+  assert.match(noLocal.detail, /LOCAL file is missing/);
+});
+
+test("DER-3008: an UNREADABLE work.config.json REDS preflight; only an ABSENT one is unknown", async () => {
+  // `unknown` does not fail the gate. Collapsing both cases into it meant a JSON syntax error in the
+  // real 5-host config degraded silently to {local:{cap:2}} and printed PREFLIGHT GREEN with the mini
+  // lane simply gone. Absent is genuinely ambiguous (a single-host repo looks the same); a file that
+  // exists and does not parse is not.
+  // Bound to the function `preflight` actually calls — an earlier draft of this test re-implemented the
+  // severity rule locally, so mutating the production expression left it green. A test that recomputes
+  // the thing it is meant to be checking is the "binds to a symbol, not a call site" defect in its purest
+  // form, and it survived a mutation run before being caught.
+  const dir = await mkdtemp(join(tmpdir(), "harness-cfgsev-"));
+  try {
+    await applyRepoConfig(dir);
+    assert.equal(workConfigVerdict({ source: getConfigSource(), hosts: getHosts() }).ok, "unknown",
+      "absent stays UNKNOWN — it cannot be told from a single-host repo");
+
+    await mkdir(join(dir, ".claude"), { recursive: true });
+    await writeFile(join(dir, ".claude", "work.config.json"), '{ "hosts": { "mini": { "ssh": "macmini-hermes" } },, }');
+    await applyRepoConfig(dir);
+    const broken = workConfigVerdict({ source: getConfigSource(), hosts: getHosts() });
+    assert.equal(getConfigSource().loaded, false);
+    assert.equal(broken.ok, false, "a config that EXISTS and does not parse must FAIL the gate, not warn — `unknown` does not fail it");
+    assert.match(broken.detail, /BROKEN CONFIG/);
+    assert.deepEqual(Object.keys(getHosts()), ["local"],
+      "control: the malformed config really does silently lose the mini lane, which is why it must red");
+
+    await writeFile(join(dir, ".claude", "work.config.json"), JSON.stringify({ hosts: { mini: { ssh: "macmini-hermes" } } }));
+    await applyRepoConfig(dir);
+    const good = workConfigVerdict({ source: getConfigSource(), hosts: getHosts() });
+    assert.equal(good.ok, true, "and the healthy answer is still reachable");
+    assert.match(good.detail, /mini/, "the green line names the hosts it found");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+    await applyRepoConfig(process.cwd());
+  }
+});
+
+test("DER-3008: a declared-but-unverifiable host is never summarised as a single-host repo", () => {
+  // F6, bound to the function preflight calls. `orphan` has a cap, so it CAN receive dispatch; calling
+  // that shape "genuinely single-host" tells the operator the opposite of what the `cross-host:orphan`
+  // line printed directly above it says.
+  const broken = crossHostTargets({ local: { cap: 2 }, orphan: { cap: 3 } });
+  assert.deepEqual(broken.targets, [], "control: this really is a zero-target run");
+  assert.deepEqual(broken.skipped.filter((s) => s.misconfigured).map((s) => s.name), ["orphan"]);
+
+  const v = crossHostCoverageVerdict({ ...broken, configLoaded: true });
+  assert.equal(v.ok, "unknown", "a declared-but-unverifiable host must stop this reading as a clean pass");
+  assert.match(v.detail, /NOT a single-host repo/);
+  assert.match(v.detail, /orphan is declared but unverifiable/);
+  assert.doesNotMatch(v.detail, /genuinely single-host/, "the two claims are contradictory; only one may print");
+
+  // The other side of the same branch: a repo that really has no remote hosts is a clean green.
+  const single = crossHostCoverageVerdict({ ...crossHostTargets({ local: { cap: 2 } }), configLoaded: true });
+  assert.equal(single.ok, true);
+  assert.match(single.detail, /genuinely single-host repo/);
+
+  // And zero targets with no config at all stays UNKNOWN rather than borrowing either answer.
+  const noCfg = crossHostCoverageVerdict({ ...crossHostTargets({ local: { cap: 2 } }), configLoaded: false });
+  assert.equal(noCfg.ok, "unknown");
+  assert.match(noCfg.detail, /config did NOT load/);
+
+  // A healthy multi-host run still reports the hosts it checked.
+  const ok = crossHostCoverageVerdict({ ...crossHostTargets({ local: { cap: 2 }, mini: { ssh: "macmini-hermes" } }), configLoaded: true });
+  assert.equal(ok.ok, true);
+  assert.match(ok.detail, /1 ssh host\(s\) checked below: mini/);
+});
+
+test("DER-3008: preflight's cross-host loops BIND to crossHostTargets — no loop may re-inline the silent skip", async () => {
+  // The tests above prove `crossHostTargets` classifies correctly. They do NOT prove `preflight` calls
+  // it, and that gap is the whole defect: the classification always existed inline, four times, and its
+  // silence was the bug. So this scans the module SOURCE for the shape rather than asserting a symbol
+  // exists — the AGENTS.md "a test binds to a symbol; production binds to a call site" class.
+  //
+  // Known limit, stated rather than implied: this matches source text, not behaviour. It cannot prove
+  // the printed lines are correct; it can only prove no loop has quietly gone back to skipping hosts
+  // without a reason. `preflight` itself is not unit-runnable — it shells out to ssh, gh, cmux and a
+  // 1-token model completion against real hosts.
+  const src = await readFile(new URL("./work-runner.mjs", import.meta.url), "utf8");
+  const preflight = src.slice(src.indexOf('case "preflight": {'));
+  assert.ok(preflight.length > 1000, "control: the preflight case must actually be located, or everything below is vacuous");
+
+  assert.match(preflight, /const crossHost = crossHostTargets\(getHosts\(\)\)/, "one classification feeds every loop");
+  assert.match(preflight, /add\("cross-host-checks"/, "zero checkable hosts must PRINT, never be inferred from absent lines");
+  assert.match(preflight, /add\("work-config"/, "and the resolved config path must print, so 'wrong directory' is visible in one read");
+  // Every verdict the tests above exercise must be the one preflight calls. These four were each inlined
+  // once; an inlined copy is unreachable from a unit test and is how the round-1 defects survived.
+  for (const fn of ["harnessDigestVerdict", "skillsSyncVerdict", "workConfigVerdict", "crossHostCoverageVerdict"]) {
+    assert.match(preflight, new RegExp(`${fn}\\(\\{`), `${fn} must be CALLED by preflight, not merely exported beside it`);
+  }
+
+  // The exact pre-fix shape, in the whole module: a loop over the host map that drops hosts inline.
+  const silentSkips = [...src.matchAll(/for \(const \[[^\]]+\] of Object\.entries\(getHosts\(\)\)\)/g)];
+  assert.deepEqual(silentSkips.map((m) => m[0]), [],
+    "a loop over the raw host map re-opens DER-3008: it skips unreachable hosts with no printed line, which reads exactly like a passing check");
+
+  // …and every loop the fix converted is still driven by it. Three loops carry the four checks:
+  // `ssh-hostname`, then `skills-sync` with `harness-digest` nested in its body, then `claude-probe`.
+  const bound = [...preflight.matchAll(/for \(const \[[^\]]+\] of crossHost\.targets\)/g)];
+  assert.equal(bound.length, 3, `expected all three cross-host loops to be bound to the classification, found ${bound.length}`);
+  for (const name of ["ssh-hostname:", "skills-sync:", "harness-digest:", "claude-probe:"]) {
+    assert.ok(preflight.includes(`add(\`${name}`), `${name}<host> must still be emitted from a bound loop`);
+  }
+});
+
+test("DER-3008: getConfigSource records WHICH work.config.json answered, and whether it parsed", async () => {
+  // The fact that would have made the missing `:mini` lines self-explaining in one read: preflight can
+  // now print the resolved path instead of silently keeping the built-in defaults.
+  const dir = await mkdtemp(join(tmpdir(), "harness-cfgsrc-"));
+  try {
+    await applyRepoConfig(dir);
+    let src = getConfigSource();
+    assert.equal(src.loaded, false);
+    assert.equal(src.error, "absent");
+    assert.match(src.path, /\.claude\/work\.config\.json$/, "the path must be reported so 'wrong directory' is visible");
+    assert.deepEqual(Object.keys(getHosts()), ["local"], "control: absent config really does yield the un-checkable fallback");
+
+    await mkdir(join(dir, ".claude"), { recursive: true });
+    await writeFile(join(dir, ".claude", "work.config.json"), "{ this is not json");
+    await applyRepoConfig(dir);
+    src = getConfigSource();
+    assert.equal(src.loaded, false, "a syntax error in a 35KB config used to be indistinguishable from no config at all");
+    assert.match(src.error, /^unreadable: /);
+
+    await writeFile(join(dir, ".claude", "work.config.json"), JSON.stringify({ hosts: { mini: { cap: 5, ssh: "macmini-hermes" } } }));
+    await applyRepoConfig(dir);
+    src = getConfigSource();
+    assert.equal(src.loaded, true, "and the check must be able to report the healthy answer too");
+    assert.equal(src.error, null);
+    assert.deepEqual(crossHostTargets(getHosts()).targets.map(([n]) => n), ["mini"]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+    await applyRepoConfig(process.cwd()); // module state is global — restore it for the tests that follow
   }
 });
 

@@ -3836,6 +3836,21 @@ let HOSTS = { ...HOSTS_DEFAULT };
 // the one that looks like an answer.
 let CONFIG_APPLIED = false;
 export function configApplied() { return CONFIG_APPLIED; }
+
+// DER-3008 — WHICH config answered, and did it parse. `applyRepoConfig` reads
+// `<repoRoot>/.claude/work.config.json` and swallows every failure into the built-in defaults, so an
+// absent file, an unreadable one and a JSON syntax error are all indistinguishable from a repo that
+// really is configured `{local:{cap:2}}` — and `{local}` has no `ssh`, so all three cross-host preflight
+// checks skip every host and print NOTHING.
+//
+// Measured 2026-08-01: a `preflight` produced no `ssh-hostname:mini` / `skills-sync:mini` /
+// `harness-digest:mini` line at all with no `--skip-probes` given, and the mini plainly configured. The
+// run had cwd = a work-harness checkout, which carries no `.claude/work.config.json` — and preflight's
+// own `harness-install-current` check tells the operator to run it from exactly there ("Run preflight
+// from the checkout"). So the two halves of this command want different working directories and losing
+// either half is silent. This records the resolution so preflight can print it instead of guessing.
+let CONFIG_SOURCE = { path: null, loaded: false, error: null };
+export function getConfigSource() { return { ...CONFIG_SOURCE }; }
 function assertConfigLoaded(getter) {
   if (CONFIG_APPLIED) return;
   throw new Error(
@@ -3848,6 +3863,30 @@ function assertConfigLoaded(getter) {
 }
 
 export function getHosts() { assertConfigLoaded("getHosts"); return HOSTS; }
+
+// DER-3008 — which configured hosts the ssh-shaped preflight checks can actually reach, and WHY each of
+// the others cannot be reached. Pure, so the "no host was checked" outcome is unit-testable without an
+// ssh anywhere near it.
+//
+// All four cross-host loops used to inline `if (hostCfg.kind === "cloud" || !hostCfg.ssh) continue;`,
+// which collapses four very different situations into one silent skip: this host, a cloud host with no
+// ssh transport, a misconfigured host that SHOULD have one, and "there are no hosts because the config
+// never loaded". Only the first two are benign, and a loop that prints nothing cannot tell an operator
+// which one they got. Returning the skip REASONS is the whole point — the caller prints them.
+export function crossHostTargets(hosts = {}) {
+  const targets = [];
+  const skipped = [];
+  for (const [name, cfg] of Object.entries(hosts ?? {})) {
+    const c = cfg ?? {};
+    if (name === "local") { skipped.push({ name, why: "this host — measured directly by the checks above, not over ssh" }); continue; }
+    if (c.kind === "cloud") { skipped.push({ name, why: "kind=cloud — no ssh transport; a cloud lead's harness is provisioned per session, not installed on a box we can hash" }); continue; }
+    // A non-cloud host with no `ssh` alias is a CONFIG ERROR, not a benign skip: it is dispatchable (it
+    // has a cap) yet nothing can ever verify what harness it runs. Flagged so the caller reds it.
+    if (!c.ssh) { skipped.push({ name, why: `non-cloud host with no \`ssh\` alias in work.config.json — it can receive dispatch but its harness version and content can NEVER be checked. Add \`"ssh": "<alias>"\` or \`"kind": "cloud"\`.`, misconfigured: true }); continue; }
+    targets.push([name, c]);
+  }
+  return { targets, skipped };
+}
 
 // Shepherd model override (item 8, 2026-07-15 turnover): `.claude/work.config.json` `shepherdModel`
 // sets the shepherd's model without a per-run `--model` flag (the flag still wins). Null ⇒ the built-in
@@ -7820,12 +7859,21 @@ export async function applyRepoConfig(repoRoot) {
   TRUSTED_PR_AUTHORS_EXTRA = [];
   COMMIT_AUTHOR = null;
   COMMIT_AUTHOR_ERROR = null;
+  const cfgPath = join(repoRoot, ".claude", "work.config.json");
+  CONFIG_SOURCE = { path: cfgPath, loaded: false, error: null };
   let cfg;
   try {
-    cfg = JSON.parse(await readFile(join(repoRoot, ".claude", "work.config.json"), "utf8"));
-  } catch {
+    cfg = JSON.parse(await readFile(cfgPath, "utf8"));
+  } catch (err) {
+    // Still a silent degrade to defaults for every subcommand — a repo with no config is a legitimate
+    // repo, and this function runs before every command including ones that read nothing from it. What
+    // changes (DER-3008) is that the failure is now RECORDED, so preflight can say "hosts came from
+    // built-in defaults because <path> does not exist" instead of printing nothing at all. A JSON syntax
+    // error in a 35KB config is the same shape and was equally invisible.
+    CONFIG_SOURCE.error = err && err.code === "ENOENT" ? "absent" : `unreadable: ${err instanceof Error ? err.message : String(err)}`;
     return;
   }
+  CONFIG_SOURCE.loaded = true;
   if (Array.isArray(cfg.versionHolderPrefixes)) VERSION_HOLDER_PREFIXES = cfg.versionHolderPrefixes;
   if (Array.isArray(cfg.versionHolderFiles)) VERSION_HOLDER_FILES = new Set(cfg.versionHolderFiles);
   if (Array.isArray(cfg.serializedFiles)) SERIALIZED_FILES = new Set(cfg.serializedFiles);
@@ -8037,7 +8085,14 @@ export async function fileDigest(path) {
 // This MUST stay byte-identical to install.sh's `CONTENT_DIGEST`: `path:sha256` lines, LC_ALL=C sort,
 // joined by "\n" with no trailing newline. Two definitions of one digest that disagree would make every
 // cross-host comparison report drift between two identical installs — a check that cannot say "clean".
-// The unit suite pins the agreement by recomputing this from a real manifest's own `files` map.
+//
+// Pinned in TWO places, because this comment previously claimed a test that did not exist: the unit
+// suite fixes the wire format against a hand-computed constant, and `install.test.mjs`'s real-install
+// test asserts `content_digest === aggregateDigest(files)` on a manifest install.sh actually wrote —
+// which is the only control that can catch the shell and JS sides diverging.
+//
+// Note the format is ambiguous if a path contains `:`. install.sh refuses to ship such a filename
+// rather than escaping it, precisely so this function needs no matching escape rule.
 export function aggregateDigest(files = {}) {
   const lines = Object.keys(files).sort().map((p) => `${p}:${files[p]}`);
   return createHash("sha256").update(lines.join("\n")).digest("hex");
@@ -8070,6 +8125,24 @@ export function harnessDriftVerdict({ manifest, digests = {} } = {}) {
   }
   // A file present in the install but absent from the manifest is drift too: it is either a leftover
   // from an older layout or something that was never shipped, and both mislead a reader of this tree.
+  //
+  // DER-3008 decided this deliberately for the STALE-LEFTOVER case — a file that install.sh shipped
+  // once and no longer ships. Because `files` is now the payload list rather than a walk of $DEST, such
+  // a file is no longer silently re-blessed into the manifest on the next install: it stays UNTRACKED
+  // and reds. That is the wanted answer. A retired module left behind under `skills/work/` is code the
+  // runner can still import, and a `SCRUB-MANIFEST.md` left behind is a document an agent can still
+  // read and act on — measured on this MacBook at 2026-08-01, three such leftovers were present
+  // (PUBLIC-README.draft.md, SCRUB-MANIFEST.md, TURNOVER-2026-07-15-cloud-run-findings.md), invisible
+  // because the old whole-tree walk hashed them into the manifest as though they were shipped.
+  // Deliberately NOT in `content_digest`: the cross-host aggregate must stay a function of the source
+  // commit alone, or defect 1 returns in a new shape.
+  //
+  // The COST of that choice, stated exactly rather than waved at: this full re-measure runs only against
+  // the LOCAL install. The cross-host leg (`harness-digest:<host>`) compares the digest each side
+  // RECORDED at install time; it does not ask the remote to re-measure. So a leftover, a rogue file, or
+  // a post-install hand-edit on the mini is invisible from here — it moves the mini's measured tree but
+  // not its recorded manifest. Catching it needs `preflight` run ON that host. (An earlier draft of this
+  // comment claimed "every host runs this same local check", which is not something this code arranges.)
   const unexpected = Object.keys(digests).filter((p) => !(p in recorded)).sort();
   const ok = !modified.length && !missing.length && !unexpected.length;
   const parts = [];
@@ -8084,29 +8157,55 @@ export function harnessDriftVerdict({ manifest, digests = {} } = {}) {
     source_commit: manifest.source_commit ?? null,
     installed_at: manifest.installed_at ?? null,
     content_digest: manifest.content_digest ?? null,
+    manifest_schema: Number.isInteger(manifest.manifest_schema) ? manifest.manifest_schema : 1,
     reason: ok
       ? `install matches its manifest (${Object.keys(recorded).length} files, version ${manifest.version ?? "?"}, ` +
         `source_commit ${String(manifest.source_commit ?? "?").slice(0, 12)}, installed ${manifest.installed_at ?? "?"})`
       : `HARNESS DRIFT — ${parts.join("; ")}. The installed tree is NOT what install.sh wrote. ` +
-        "Re-run install.sh from a clean checkout; do not dispatch until this is clean.",
+        "Re-run install.sh from a clean checkout; do not dispatch until this is clean." +
+        (unexpected.length
+          ? ` UNTRACKED files are leftovers install.sh no longer ships — \`cd ${"$"}{CLAUDE_HOME:-~/.claude} && rm ${unexpected.join(" ")}\`; ` +
+            "re-installing will NOT clear them (install.sh copies over the tree, it never prunes it)."
+          : ""),
   };
 }
 
-// The install roots the manifest attests to, and the exclusions install.sh applies when writing it.
-// Kept beside `measureHarnessDrift` because the two must agree: a path install.sh hashes but this walk
-// skips reads as MISSING on every clean install, and a path this walk finds but install.sh skips reads
-// as UNTRACKED on every clean install. Either way the check reds forever and stops being read.
+// The LEGACY (manifest_schema 1) roots: install.sh's digest used to walk all of `$DEST/skills` and
+// `$DEST/hooks`, so a v1 manifest attests to that whole tree and must still be re-measured that way.
+// v2 manifests carry their own `roots` (see HARNESS_MANIFEST_SCHEMA below) and this is not used.
 export const HARNESS_MANIFEST_ROOTS = ["skills", "hooks"];
+
+// DER-3008. v1: whole-tree file list, no `roots`. v2: payload-scoped `files` + explicit `roots`.
+// The number is compared across hosts so a v1/v2 pair is reported as "re-install both", never as drift.
+export const HARNESS_MANIFEST_SCHEMA = 2;
+
 const manifestExcluded = (rel) => rel.split("/").includes("tmp") || basename(rel) === ".DS_Store";
 
-// Every file under `roots`, relative to `dest`. Absent roots yield nothing rather than throwing — a
-// hooks-less install is a drift finding (MISSING), not a crash.
+// The roots this manifest's UNTRACKED scan should walk. A v2 manifest names them; anything older gets
+// the legacy whole-tree pair, which is what its own `files` map was built from — measuring a v1 manifest
+// with v2 roots would report every unlisted file it legitimately carries as MISSING.
+export function manifestRoots(manifest) {
+  const declared = manifest?.roots;
+  if (Array.isArray(declared) && declared.length && declared.every((r) => typeof r === "string" && r)) return declared;
+  return HARNESS_MANIFEST_ROOTS;
+}
+
+// Every file under `roots`, relative to `dest`. A root may be a DIRECTORY (walk it) or a single FILE
+// (`hooks/context-wrap-nudge.mjs` — install.sh records hook roots per-file because ~/.claude/hooks is
+// shared with other tools and a co-tenant's hook is not harness drift). Absent roots yield nothing
+// rather than throwing — a hooks-less install is a drift finding (MISSING), not a crash.
 async function walkInstalledFiles(dest, roots = HARNESS_MANIFEST_ROOTS) {
   const out = [];
   const walk = async (rel) => {
     let entries;
     try { entries = await readdir(join(dest, rel), { withFileTypes: true }); }
-    catch { return; }
+    catch {
+      // Not a directory (or unreadable). A file-root still has to be measured, or the hook files would
+      // read MISSING on every clean install and this check would red forever.
+      try { if ((await stat(join(dest, rel))).isFile() && !manifestExcluded(rel)) out.push(rel); }
+      catch { /* genuinely absent — the manifest's own entry reports it MISSING */ }
+      return;
+    }
     for (const ent of entries) {
       const childRel = `${rel}/${ent.name}`;
       if (manifestExcluded(childRel)) continue;
@@ -8131,7 +8230,10 @@ export async function measureHarnessDrift(dest) {
   catch { return harnessDriftVerdict({ manifest: null }); }
   const digests = {};
   const seen = new Set();
-  for (const rel of await walkInstalledFiles(dest)) {
+  // Walk the roots this manifest declares (v2) or the legacy whole-tree pair (v1). Scoping the walk is
+  // what lets the file list be payload-scoped without every unrelated skill in a shared ~/.claude/skills
+  // reading as UNTRACKED on a clean install.
+  for (const rel of await walkInstalledFiles(dest, manifestRoots(manifest))) {
     seen.add(rel);
     const d = await fileDigest(join(dest, rel));
     if (d != null) digests[rel] = d;
@@ -8144,6 +8246,140 @@ export async function measureHarnessDrift(dest) {
     if (d != null) digests[rel] = d;
   }
   return harnessDriftVerdict({ manifest, digests });
+}
+
+// `work-config`, as a pure function (DER-3008 round 2).
+//
+// ABSENT and UNREADABLE are NOT the same verdict, and collapsing them into `unknown` made the worse one
+// harmless: `unknown` does not fail the gate, so a JSON syntax error in a real five-host config degraded
+// silently to `{local:{cap:2}}` and printed PREFLIGHT GREEN with the mini lane simply gone. Absent is
+// genuinely ambiguous — a single-host repo looks identical — so it stays UNKNOWN. A file that EXISTS and
+// does not parse is not ambiguous at all: the operator believes it is in force. That REDS.
+export function workConfigVerdict({ source = {}, hosts = {} } = {}) {
+  const names = Object.keys(hosts);
+  if (source.loaded) return { ok: true, detail: `${source.path} — ${names.length} host(s): ${names.join(", ")}` };
+  if (source.error === "absent") {
+    return {
+      ok: "unknown",
+      detail: `NO CONFIG at ${source.path} — hosts fall back to the built-in {local:{cap:2}}, so every cross-host ` +
+        "check below has nothing to check. UNKNOWN, not green: it cannot tell a single-host repo from a preflight " +
+        "run in the wrong directory. Run preflight from the repo whose `.claude/work.config.json` declares the " +
+        "hosts, or pass --repo-root <that repo>.",
+    };
+  }
+  return {
+    ok: false,
+    detail: `BROKEN CONFIG at ${source.path} — ${source.error ?? "unreadable"}. The file EXISTS and did not parse, ` +
+      "so every value it declares (hosts, lead types, budget, merge policy, commit author) is silently at its " +
+      "built-in default right now — hosts are {local:{cap:2}} and the remote lanes are gone. This REDS rather than " +
+      "warns: unlike an absent config, there is no reading of this that is correct. Fix the JSON and re-run.",
+  };
+}
+
+// `cross-host-checks`, as a pure function (DER-3008 round 2). Answers "did the ssh-shaped checks below
+// run against anything, and if not, is that FINE or is it a defect?"
+//
+// The subtlety worth the function: zero targets is a legitimate green for a genuinely single-host repo,
+// but NOT while a host is declared-and-unverifiable. Such a host has a cap, so it can receive dispatch —
+// the shape is a broken multi-host repo, and printing "genuinely single-host repo" tells the operator
+// the opposite of what the `cross-host:<name>` line directly above it says.
+export function crossHostCoverageVerdict({ targets = [], skipped = [], configLoaded = false } = {}) {
+  const misconfigured = skipped.filter((s) => s.misconfigured).map((s) => s.name);
+  if (targets.length) {
+    return {
+      ok: true,
+      detail: `${targets.length} ssh host(s) checked below: ${targets.map(([n]) => n).join(", ")}` +
+        (skipped.length ? ` — not checked: ${skipped.map((s) => `${s.name} (${s.why})`).join("; ")}` : ""),
+    };
+  }
+  const why = misconfigured.length
+    ? `NOT a single-host repo — ${misconfigured.join(", ")} ${misconfigured.length === 1 ? "is" : "are"} declared but ` +
+      `unverifiable (see cross-host:${misconfigured[0]}); fix the config rather than reading this as "no remote hosts".`
+    : configLoaded
+      ? "The config loaded and declares no remote hosts, so this is a genuinely single-host repo."
+      : "The config did NOT load — see work-config above.";
+  return {
+    ok: configLoaded && !misconfigured.length ? true : "unknown",
+    detail: "NO ssh-reachable host to check — ssh-hostname/skills-sync/harness-digest emit NOTHING this run. " +
+      `Hosts seen: ${skipped.map((s) => `${s.name} (${s.why})`).join("; ") || "none at all"}. ${why}`,
+  };
+}
+
+// `skills-sync:<host>`, as a pure function (DER-3008 round 2). Same unreachable-vs-different distinction
+// `harnessDigestVerdict` makes, and it was missing HERE — which was visible in the output as a direct
+// self-contradiction, because both lines are printed from the SAME loop iteration against the SAME box:
+// a failed ssh yields an empty remote hash, and `!!lh && lh === rh` then reported
+//   🔴 skills-sync:mini — SKEW … rsync -a ~/.claude/skills/work/ macmini-hermes:.claude/skills/work/
+//   ⚠️  harness-digest:mini — UNREACHABLE … this is UNKNOWN, not drift
+// i.e. a confident remedy naming an rsync to a host that never answered, beside a correct abstention.
+// The rsync is also the wrong action for an unreachable box and, run against a stale local tree, is the
+// action most likely to make things worse.
+export function skillsSyncVerdict({ hostName, sshAlias, localHash = "", remoteHash = "", remoteExitCode = 0, files = [] } = {}) {
+  const lh = String(localHash ?? "").trim();
+  const rh = String(remoteHash ?? "").trim();
+  const list = files.join(" + ");
+  // Ordered deliberately. A missing LOCAL file is a real, locally-verifiable failure and is reported
+  // even when the remote is down — the remote's silence says nothing about our own install. Only then
+  // does transport failure become the answer.
+  if (!lh) {
+    return { ok: false, detail: `a LOCAL file is missing from ${list} — re-run install.sh here first (checked before the remote: the remote's state cannot excuse a broken local install)` };
+  }
+  if (remoteExitCode !== 0) {
+    return { ok: "unknown", detail: `UNREACHABLE — \`ssh ${sshAlias}\` exited ${remoteExitCode}; the remote hash was never read, so this is UNKNOWN, not skew. ` +
+      `Do NOT rsync on this evidence — it names a host that did not answer. Re-run \`ssh ${sshAlias} true\` by hand and read the error.` };
+  }
+  if (!rh) {
+    return { ok: false, detail: `${hostName} answered but returned no hash for ${list} — the files are missing there. ` +
+      `ssh ${sshAlias} 'cd ~/Projects/work-harness && git pull --ff-only && ./install.sh'` };
+  }
+  return lh === rh
+    ? { ok: true, detail: `in sync (${list})` }
+    : { ok: false, detail: `SKEW in ${list} — rsync -a ~/.claude/skills/work/ ${sshAlias}:.claude/skills/work/` };
+}
+
+// The cross-host half of the drift check, as a PURE function (DER-3008). It used to be ~15 lines inlined
+// in the `preflight` case, reachable only by an ssh to a real box — so the one verdict an operator acts
+// on ("re-install on mini") had no test that could return the failing answer, and the digest-scope defect
+// this function's caller was built on went unnoticed through a whole deploy.
+//
+// `remoteExitCode` is a separate input from `remoteRaw` on purpose: the remote command is
+// `cat … 2>/dev/null || true`, which exits 0 for an ABSENT manifest AND prints nothing for an
+// UNREACHABLE host. Only ssh's own exit code separates "the box said it has no manifest" from "the box
+// never answered", and printing the first when you measured the second sends an operator to ssh into a
+// machine that is not there. Unreachable is UNKNOWN — a probe that could not run is never a verdict.
+export function harnessDigestVerdict({ hostName, sshAlias, local = {}, remoteRaw = "", remoteExitCode = 0 } = {}) {
+  let remoteDigest = null, remoteVersion = null, remoteSchema = null;
+  try {
+    const m = JSON.parse(String(remoteRaw ?? "").trim());
+    remoteDigest = m?.content_digest ?? null;
+    remoteVersion = m?.version ?? null;
+    remoteSchema = Number.isInteger(m?.manifest_schema) ? m.manifest_schema : 1;
+  } catch { /* absent, unreachable or unparseable ⇒ null, discriminated below */ }
+  const localDigest = local.content_digest ?? null;
+  const localSchema = local.manifest_schema ?? 1;
+  const unreachable = remoteExitCode !== 0;
+  // Checked BEFORE equality: two manifests of different schemas enumerate different file SETS, so their
+  // aggregates are not comparable at all. Reporting that as CONTENT DRIFT would name a defect that does
+  // not exist and send the operator re-installing the wrong host.
+  const schemaSkew = !!remoteDigest && !!localDigest && remoteSchema !== localSchema;
+  const ok = !!localDigest && !!remoteDigest && !schemaSkew && localDigest === remoteDigest;
+  const detail = ok
+    ? `identical content digest (${localDigest.slice(0, 12)}, version ${local.version})`
+    : unreachable
+      ? `UNREACHABLE — \`ssh ${sshAlias}\` exited ${remoteExitCode}; the digest was never read, so this is UNKNOWN, not drift. ` +
+        `Re-run \`ssh ${sshAlias} 'cat ~/.claude/${HARNESS_MANIFEST_FILE}'\` by hand and read the error.`
+      : !localDigest
+        ? `LOCAL has no ${HARNESS_MANIFEST_FILE} — re-run install.sh here first`
+        : !remoteDigest
+          ? `${hostName} answered but has no readable ${HARNESS_MANIFEST_FILE} — ssh ${sshAlias} 'cd ~/Projects/work-harness && git pull --ff-only && ./install.sh'`
+          : schemaSkew
+            ? `MANIFEST SCHEMA SKEW — local v${localSchema}, ${hostName} v${remoteSchema}. The two manifests describe different file SETS ` +
+              `(v1 hashed every file under ~/.claude/skills including the operator's unrelated skills; v2 hashes only the shipped payload — DER-3008), ` +
+              `so the aggregates are NOT comparable and this is not evidence of drift. Re-run install.sh on BOTH hosts from the same commit.`
+            : `CONTENT DRIFT vs ${hostName}: ${localDigest.slice(0, 12)} (v${local.version}) vs ${remoteDigest.slice(0, 12)} (v${remoteVersion})` +
+              `${local.version === remoteVersion ? " — SAME VERSION STRING, DIFFERENT CODE. This is exactly the drift a version check cannot see." : ""}` +
+              ` — re-install on ${hostName}`;
+  return { ok: ok ? true : (unreachable ? "unknown" : false), detail, localDigest, remoteDigest, localSchema, remoteSchema, schemaSkew, unreachable };
 }
 
 // ── 2.7 — staleness of queued work is unchecked, and the NAIVE check is blind ──────────────────
@@ -10392,6 +10628,45 @@ export async function runSubcommand(argv) {
         const drift = await measureHarnessDrift(dest);
         add("harness-drift", drift.ok, drift.reason);
 
+        // DER-3008, defect 3 — WHOSE version is being reported. On 2026-08-01 a deploy verification
+        // stated "hosts at 0.3.0" while neither host was at 0.3.0, and there are three different
+        // "harness version" values that a reader collapses into one:
+        //   (a) `getHarnessVersion()` — read from `../../VERSION` relative to THIS RUNNING FILE. Run the
+        //       checkout's runner and it reports the CHECKOUT's VERSION, i.e. the version you are about
+        //       to install, described in the present tense as the version that is running. It is also
+        //       process-cached and overridable by `WORK_HARNESS_VERSION`, so a stale export wins forever.
+        //   (b) `$DEST/VERSION` — what an installed host actually resolves (a) to.
+        //   (c) `manifest.version` — what install.sh recorded when it last wrote the tree.
+        // Nothing compared them, so running the checkout's runner against an older install printed the
+        // NEW number and attributed it to the installed hosts. This leg makes that disagreement loud.
+        // ((c) vs the file on disk is now covered by `harness-drift` itself: VERSION joined the manifest's
+        // file list in this same change, so a hand-edited $DEST/VERSION reports MODIFIED.)
+        {
+          const running = getHarnessVersion();
+          const runningFrom = fileURLToPath(new URL("../../", import.meta.url));
+          let installed = null;
+          try { installed = (await readFile(join(dest, "VERSION"), "utf8")).trim(); } catch { /* absent ⇒ null */ }
+          const recorded = drift.version ?? null;
+          const envPinned = typeof process.env.WORK_HARNESS_VERSION === "string" && process.env.WORK_HARNESS_VERSION.trim();
+          // `recorded == null` means there is no manifest at all — `harness-drift` above already reds on
+          // that with the right remedy, and calling it a VERSION disagreement here would name a second,
+          // wrong defect for one cause. Compare only what can be compared.
+          const comparable = installed != null && recorded != null;
+          const agree = comparable && running === installed && installed === recorded;
+          add("harness-version-agreement", comparable ? agree : "unknown", !comparable
+            ? `cannot compare: ${installed == null ? `no ${join(dest, "VERSION")}` : `no version in ${HARNESS_MANIFEST_FILE}`}. ` +
+              `This process says ${running} (resolved from ${runningFrom}) — that describes THAT tree, not necessarily the install. See harness-drift above; re-run install.sh.`
+            : agree
+              ? `${running} everywhere (running process, ${join(dest, "VERSION")}, and the manifest)`
+              : `VERSION DISAGREEMENT — this process reports ${running} (resolved from ${runningFrom}), ` +
+                `${join(dest, "VERSION")} says ${installed}, manifest says ${recorded ?? "?"}. ` +
+                (running !== installed
+                  ? "You are running a runner from somewhere other than the install (typically a checkout), so any version this process prints describes THAT tree, not the deployed hosts — do not quote it as a deploy reading. "
+                  : "") +
+                (envPinned ? `WORK_HARNESS_VERSION=${envPinned} is set in this environment and overrides every file read — unset it before believing any version here. ` : "") +
+                "Re-run ./install.sh, then re-run preflight from the installed harness.");
+        }
+
         // The other half, and the one that actually bit: the 2026-07-31 drift was stale-but-UNTAMPERED.
         // Every installed file matched what install.sh wrote, so per-file hashes alone report CLEAN —
         // correctly — while the install lags the source of truth by ~12 commits. Only `source_commit`
@@ -10415,6 +10690,26 @@ export async function runSubcommand(argv) {
           }
         }
       }
+      // 6e. DER-3008 — WHERE the host list came from, and WHETHER the cross-host checks below can run.
+      //
+      // The three loops that follow used to `continue` past every host they could not check, so the
+      // outcome of "no hosts configured" was ZERO printed lines — indistinguishable from three passing
+      // checks, and from `--skip-probes` (which does not even gate them). That happened for real on
+      // 2026-08-01: a preflight with the mini plainly configured printed no `:mini` line at all, because
+      // its cwd was a work-harness checkout, which has no `.claude/work.config.json` — and
+      // `harness-install-current` above tells the operator to run preflight from exactly there. Silence
+      // is never an acceptable outcome for a documented gate, so both facts now print.
+      const crossHost = crossHostTargets(getHosts());
+      {
+        const cfg = workConfigVerdict({ source: getConfigSource(), hosts: getHosts() });
+        add("work-config", cfg.ok, cfg.detail);
+        for (const s of crossHost.skipped) {
+          if (!s.misconfigured) continue;
+          add(`cross-host:${s.name}`, false, s.why);
+        }
+        const coverage = crossHostCoverageVerdict({ ...crossHost, configLoaded: getConfigSource().loaded });
+        add("cross-host-checks", coverage.ok, coverage.detail);
+      }
       // 7. Skills skew vs remote hosts — a lead on the mini following a stale brief loses gates silently,
       // and a remote skills dir without session-token-report.mjs makes every mini lead gap its spend, so
       // BOTH files are hashed (a missing file yields no hash at all ⇒ SKEW, never a matching-broken pair).
@@ -10422,8 +10717,7 @@ export async function runSubcommand(argv) {
       // resolves only on the LAN; off-network it fails in a way that reads as "the host is down", and
       // that exact misreading went into a run handoff ("MINI IS DOWN, cap-5 lane gone") for a box that
       // had been up 21 days.
-      for (const [hostName, hostCfg] of Object.entries(getHosts())) {
-        if (hostCfg.kind === "cloud" || !hostCfg.ssh) continue;
+      for (const [hostName, hostCfg] of crossHost.targets) {
         const g = await runCommand({ command: "ssh", args: ["-G", hostCfg.ssh], timeoutMs: 10000 }).catch(() => ({ exitCode: 1, stdout: "" }));
         const hn = (String(g.stdout ?? "").split("\n").find((l) => l.startsWith("hostname ")) ?? "").slice(9).trim();
         if (!hn) { add(`ssh-hostname:${hostName}`, "unknown", `could not read \`ssh -G ${hostCfg.ssh}\` — cannot tell whether this alias is mDNS-only`); continue; }
@@ -10431,13 +10725,18 @@ export async function runSubcommand(argv) {
           ? `HostName is ${hn} — mDNS/Bonjour, LAN-ONLY. Off-network this fails as "could not resolve hostname" and reads as HOST DOWN. Use a Tailscale 100.x address (it routes direct on-LAN, so there is no on-LAN cost). A documented 192.168.x fallback is NOT a fix — it is equally useless off-network and its presence in a comment is false reassurance.`
           : `HostName ${hn}`);
       }
-      for (const [hostName, hostCfg] of Object.entries(getHosts())) {
-        if (hostCfg.kind === "cloud" || !hostCfg.ssh) continue;
+      for (const [hostName, hostCfg] of crossHost.targets) {
         const localHash = await runCommand({ command: "sh", args: ["-c", skillsHashCommand(SKILLS_SYNC_FILES.map((f) => join(skillsDir, f)))] });
         const remoteHash = await runCommand({ command: "ssh", args: [hostCfg.ssh, skillsHashCommand(SKILLS_SYNC_FILES.map((f) => `~/.claude/skills/work/${f}`), { quote: false })], timeoutMs: 20000 }).catch(() => ({ exitCode: 1, stdout: "" }));
-        const lh = String(localHash.stdout ?? "").trim();
-        const rh = String(remoteHash.stdout ?? "").trim();
-        add(`skills-sync:${hostName}`, !!lh && lh === rh, lh === rh ? `in sync (${SKILLS_SYNC_FILES.join(" + ")})` : `SKEW in ${SKILLS_SYNC_FILES.join(" + ")}${lh ? "" : " (a LOCAL file is missing — re-run install.sh)"} — rsync -a ~/.claude/skills/work/ ${hostCfg.ssh}:.claude/skills/work/`);
+        const sync = skillsSyncVerdict({
+          hostName,
+          sshAlias: hostCfg.ssh,
+          localHash: localHash.stdout,
+          remoteHash: remoteHash.stdout,
+          remoteExitCode: remoteHash.exitCode,
+          files: SKILLS_SYNC_FILES,
+        });
+        add(`skills-sync:${hostName}`, sync.ok, sync.detail);
         // P0.3, cross-host half: `skills-sync` above covers TWO files, so a host can differ in
         // SKILL.md, prep-runner.mjs or the config example and still read "in sync" — which is how a
         // seven-file drift hid behind a green check. The manifest's `content_digest` covers every
@@ -10450,21 +10749,14 @@ export async function runSubcommand(argv) {
             args: [hostCfg.ssh, `cat ~/.claude/${HARNESS_MANIFEST_FILE} 2>/dev/null || true`],
             timeoutMs: 20000,
           }).catch(() => ({ exitCode: 1, stdout: "" }));
-          let remoteDigest = null, remoteVersion = null;
-          try {
-            const m = JSON.parse(String(remoteMan.stdout ?? "").trim());
-            remoteDigest = m?.content_digest ?? null;
-            remoteVersion = m?.version ?? null;
-          } catch { /* absent or unparseable ⇒ null, reported below */ }
-          const localDigest = localMan.content_digest ?? null;
-          const ok = !!localDigest && !!remoteDigest && localDigest === remoteDigest;
-          add(`harness-digest:${hostName}`, ok, ok
-            ? `identical content digest (${localDigest.slice(0, 12)}, version ${localMan.version})`
-            : !localDigest ? `LOCAL has no ${HARNESS_MANIFEST_FILE} — re-run install.sh here first`
-            : !remoteDigest ? `${hostName} has no ${HARNESS_MANIFEST_FILE} — ssh ${hostCfg.ssh} 'cd ~/Projects/work-harness && git pull --ff-only && ./install.sh'`
-            : `CONTENT DRIFT vs ${hostName}: ${localDigest.slice(0, 12)} (v${localMan.version}) vs ${remoteDigest.slice(0, 12)} (v${remoteVersion})` +
-              `${localMan.version === remoteVersion ? " — SAME VERSION STRING, DIFFERENT CODE. This is exactly the drift a version check cannot see." : ""}` +
-              ` — re-install on ${hostName}`);
+          const v = harnessDigestVerdict({
+            hostName,
+            sshAlias: hostCfg.ssh,
+            local: localMan,
+            remoteRaw: remoteMan.stdout,
+            remoteExitCode: remoteMan.exitCode,
+          });
+          add(`harness-digest:${hostName}`, v.ok, v.detail);
         }
       }
       // 8. Stale side-copies of the runner (H6) — leads that find them misdiagnose the harness.
@@ -10484,8 +10776,11 @@ export async function runSubcommand(argv) {
           const out = String(res.stdout ?? "").trim();
           add("claude-probe:local", /\bOK\b/.test(out), out.slice(0, 120) || "no output");
         }
-        for (const [hostName, hostCfg] of Object.entries(getHosts())) {
-          if (hostCfg.kind === "cloud" || !hostCfg.ssh) continue;
+        // Same host set as the checks above (DER-3008) — this loop carried the identical inline
+        // `kind === "cloud" || !ssh ⇒ continue`, so it went silent in exactly the same situations, and
+        // `cross-host-checks` above already reported why. Deriving all four loops from one classification
+        // is the point: fixing three of them would have left this one skipping the mini in silence.
+        for (const [hostName, hostCfg] of crossHost.targets) {
           // FALSE-RED FIX: a bare `zsh -lc` over ssh does not pick up a remote host's user-level node /
           // claude install, so a perfectly healthy account printed NOTHING and read as a dead account.
           // Proven with paired controls in one call: the old form → empty; the same command with the
