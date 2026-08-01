@@ -80,7 +80,7 @@ export function parseArgs(argv) {
     // `--issue DER-x` is an explicit alias for the positional id — review-usage reads better with it,
     // and a lead pasting a long shell block is less likely to drop a flagged value than a bare token.
     else if (a === "--issue") o.issueIdFlag = argv[++i];
-    else if (a === "--round") o.round = Number(argv[++i]);
+    else if (a === "--round") { o.roundRaw = argv[++i]; o.round = Number(o.roundRaw); }
     else if (a === "--host") o.host = argv[++i];
     else if (a === "--prefer") o.prefer = argv[++i];
     else if (a === "--title") o.title = argv[++i];
@@ -2303,10 +2303,18 @@ export function crossVendorLabel(xv = null) {
       return `xvendor=${who} STALE — this run covered ${at(xv.covered_sha)}${xv.first_attested_issue ? ` (unit ${xv.first_attested_issue})` : ""}, NOT this tree (${at(xv.receipt_sha)}); re-run codex or carry it forward as stale`;
     case "waived":
       return `xvendor=${who} WAIVED at round ${xv.round ?? "?"} — ${xv.reason ?? "no reason recorded"}`;
-    case "inherited":
-      return String(xv.inherited_status) === "stale"
-        ? `xvendor=${who} STALE (carried forward from round ${xv.from_round ?? "?"}; that run covered ${at(xv.covered_sha)}, not this tree)`
-        : `xvendor=${who} ${String(xv.inherited_status ?? "?").toUpperCase()} at round ${xv.from_round ?? "?"} (carried forward${xv.reason ? ` — ${xv.reason}` : ""})`;
+    case "inherited": {
+      if (String(xv.inherited_status) === "stale") {
+        return `xvendor=${who} STALE (carried forward from round ${xv.from_round ?? "?"}; that run covered ${at(xv.covered_sha)}, not this tree)`;
+      }
+      // An inherited WAIVED must be as informative as the direct waived render above — "no reason
+      // recorded" is itself information, and dropping it only on the inherited path made the carried
+      // copy quieter than the thing it carried.
+      const tail = String(xv.inherited_status) === "waived"
+        ? ` — ${xv.reason ?? "no reason recorded"}`
+        : xv.reason ? ` — ${xv.reason}` : "";
+      return `xvendor=${who} ${String(xv.inherited_status ?? "?").toUpperCase()} at round ${xv.from_round ?? "?"} (carried forward${tail})`;
+    }
     default:
       return `xvendor=NONE — no codex gate recorded for this unit`;
   }
@@ -9907,7 +9915,7 @@ export async function runSubcommand(argv) {
       // `--round 1.5` is neither round 1 nor a revision round, and `--round 0` reads as round 1 while
       // recording something no reader can order against the others.
       if (o.round !== undefined && !(Number.isInteger(Number(o.round)) && Number(o.round) > 0)) {
-        throw new Error(`review-panel: --round ${JSON.stringify(o.round)} is not a positive integer. Rounds are ordinals — a fractional or zero round cannot be compared against the round-1 rule, and every reader that orders receipts by round would place it arbitrarily.`);
+        throw new Error(`review-panel: --round ${JSON.stringify(o.roundRaw ?? o.round)} is not a positive integer. Rounds are ordinals — a fractional or zero round cannot be compared against the round-1 rule, and every reader that orders receipts by round would place it arbitrarily.`);
       }
       const panelRound = o.round === undefined ? 1 : Number(o.round);
       // The ledger is read whenever the answer depends on it: a receipt attesting nothing of its own
@@ -11559,34 +11567,28 @@ export async function runSubcommand(argv) {
           // real binary on PATH cost two agents ~40 minutes and a wrong root cause, because its hang is
           // byte-identical to a quota wall. If nothing resolves, this is UNKNOWN — the probe could not
           // run, which is not the same claim as "codex is down".
+          // DER-3019: this leg BINDS to classifyCodexProbe — the same classifier the codex-probe
+          // subcommand uses — instead of carrying a second inline copy of the classification. The
+          // inline copy tested the success marker FIRST, so "OK, but: 401 invalid_refresh_token"
+          // read as healthy here while the canonical classifier called it unauthenticated: two
+          // definitions of one predicate, drifted, which is the exact class the repo's review
+          // rules name. One classifier, two call sites, zero copies.
           const resolved = resolveCodexBin();
-          if (!resolved.bin) {
-            add("codex-probe", "unknown", `${resolved.why}. Probe by hand with stdin closed and READ THE ERROR TEXT: ` +
-              `\`<path-to>/codex exec --sandbox read-only "reply OK" < /dev/null\`. A real quota wall SAYS so ` +
-              `("You've hit your usage limit"); CPU% is NOT a discriminator.`);
-          } else {
-            const res = await runCommand({ command: resolved.bin, args: ["exec", "--json", "Reply with exactly: OK"], timeoutMs: 120000 })
+          let probeOut = "";
+          let probeExit = null;
+          if (resolved.bin) {
+            const res = await runCommand({ command: resolved.bin, args: ["exec", "--json", "--sandbox", "read-only", "reply OK"], timeoutMs: 120000 })
               .catch((err) => ({ exitCode: 1, stdout: "", stderr: err instanceof Error ? err.message : String(err) }));
-            const out = `${String(res.stdout ?? "")}${String(res.stderr ?? "")}`;
-            const shimNote = resolved.skipped.length ? ` [skipped shim: ${resolved.skipped.join(", ")}]` : "";
-            const where = ` (${resolved.bin} via ${resolved.source})${shimNote}`;
-            if (out.includes("turn.completed") || /\bOK\b/.test(out)) {
-              add("codex-probe", true, `turn.completed seen${where}`);
-            } else if (out.includes("401")) {
-              add("codex-probe", false, `401 — credential expired (login status LIES; re-login)${where}`);
-            } else if (/usage limit|rate limit|quota/i.test(out)) {
-              // A wall that SAYS it is a wall is a real verdict — that is the whole discriminator.
-              add("codex-probe", false, `usage wall: ${out.trim().slice(-160)}${where}`);
-            } else if (!out.trim()) {
-              // The failure this item exists for. ~0 bytes is no evidence, so it must not become a verdict.
-              add("codex-probe", "unknown", `NO OUTPUT${where} — treat as UNKNOWN, not a dead gate. ` +
-                `Re-run by hand with stdin closed: \`${resolved.bin} exec --sandbox read-only "reply OK" < /dev/null\` ` +
-                `and read the error text. A real wall prints a message and a date; a real hang BURNS CPU. ` +
-                `~0% CPU with ~0 bytes is a wall or a broken wrapper, never work in progress.`);
-            } else {
-              add("codex-probe", false, `${out.trim().slice(-160)}${where}`);
-            }
+            probeOut = `${String(res.stdout ?? "")}${String(res.stderr ?? "")}`;
+            probeExit = res.exitCode ?? null;
           }
+          const verdict = classifyCodexProbe({
+            output: probeOut, exitCode: probeExit, bin: resolved.bin, why: resolved.why, skipped: resolved.skipped,
+          });
+          const handHint = verdict.status === "unknown"
+            ? ` Probe by hand with stdin closed and READ THE ERROR TEXT: \`${resolved.bin ?? "<path-to>/codex"} exec --sandbox read-only "reply OK" < /dev/null\`. A real quota wall SAYS so; CPU% is NOT a discriminator.`
+            : "";
+          add("codex-probe", verdict.ok ? true : verdict.status === "unknown" ? "unknown" : false, `${verdict.detail}${handHint}`);
         }
       }
       // Tri-state, strictly: only an explicit `false` fails the gate. `"unknown"` is neither — it is a

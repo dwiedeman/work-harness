@@ -9896,6 +9896,28 @@ test("DER-3008: preflight's cross-host loops BIND to crossHostTargets — no loo
   }
 });
 
+test("DER-3019: preflight's codex-probe leg BINDS to classifyCodexProbe — the inline copy of the classification is gone", async () => {
+  // The preflight leg carried a SECOND copy of the probe classification, and it tested the success
+  // marker first — so a 401 body containing "OK" read as healthy there while the canonical
+  // classifier called it unauthenticated. Two copies of one predicate drift; this pins the binding
+  // the same way the cross-host loops are pinned above.
+  const src = await readFile(new URL("./work-runner.mjs", import.meta.url), "utf8");
+  const preflight = src.slice(src.indexOf('case "preflight": {'));
+  assert.ok(preflight.length > 1000, "control: the preflight case must actually be located");
+  const legStart = preflight.indexOf("resolveCodexBin()");
+  const legEnd = preflight.indexOf('add("codex-probe"');
+  assert.ok(legStart > 0 && legEnd > legStart, "control: the codex-probe leg must be located");
+  const leg = preflight.slice(legStart, legEnd);
+  assert.match(leg, /classifyCodexProbe\(\{/, "the canonical classifier must be CALLED by preflight's leg");
+  assert.doesNotMatch(leg, /includes\("turn\.completed"\)|includes\("401"\)|usage limit\|rate limit/,
+    "an inline classification predicate in the preflight leg re-opens the drifted-copy defect (DER-3019)");
+  // The drift fixture both call sites must agree on: a 401 body containing "OK" is unauthenticated,
+  // never healthy — the exact input the pre-fix preflight copy classified as GREEN.
+  const v = classifyCodexProbe({ output: "OK, but: 401 invalid_refresh_token", exitCode: 1, bin: "/x/codex" });
+  assert.equal(v.status, "unauthenticated");
+  assert.equal(v.ok, false);
+});
+
 test("DER-3008: getConfigSource records WHICH work.config.json answered, and whether it parsed", async () => {
   // The fact that would have made the missing `:mini` lines self-explaining in one read: preflight can
   // now print the resolved path instead of silently keeping the built-in defaults.

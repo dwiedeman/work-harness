@@ -15,7 +15,7 @@ run materially different harness code against **one shared ledger** with no way 
 gate itself gained the missing half below — attesting the *acting* process's own version, not only
 versions already recorded in the ledger — in DER-2779.
 
-## [Unreleased]
+## [0.5.0] — 2026-08-01
 
 **`codex exec` returns as the DEFAULT gate of the first complete diff; the Claude panel becomes the
 backup (DER-3011).** 0.4.0 (below) dropped `codex exec` out of every brief when the panel became the
@@ -103,6 +103,76 @@ it, and no revision-round brief does.
   `command_execution` (it never has — only `turn.completed` is completion provenance; command counts are
   search-coverage evidence, and a healthy read-only client may suppress them).
 
+- **DER-3008 (P0) — the cross-host `content_digest` could never match, and the checks that compare it
+  ran on no hosts at all.** Two independent defects, both measured live on 2026-08-01 against a
+  known-good deploy. **(1) Scope.** 0.3.0's digest (see its `INSTALL-MANIFEST.json` entry below, which
+  described the behaviour accurately for that release) walked `find skills hooks -type f` under `$DEST`
+  — i.e. every file in `~/.claude/skills`, a **shared** directory holding 798 unrelated files on this
+  MacBook against 4 on the mini. With both hosts at `0.4.0` from `source_commit 0ba513f` and every
+  harness-suite file byte-identical, the aggregates were `f18703c0bca0…` vs `a1cc1fae4a5c…`, so
+  `harness-digest:<host>` would have printed *"CONTENT DRIFT — SAME VERSION STRING, DIFFERENT CODE"* on a
+  correct deploy — and a gate that reds on a correct deploy gets waved past. The file list now comes from
+  the **shipped payload** (`$SRC`'s `skills/`, `hooks/`, and `VERSION`) while every hash is still taken at
+  `$DEST`, keeping the measure-what-landed property: a shipped file that does not land now **fails the
+  install by name** rather than quietly shortening the list. **(2) Silence.** `ssh-hostname:<host>`,
+  `skills-sync:<host>`, `harness-digest:<host>` and `claude-probe:<host>` each inlined
+  `if (kind === "cloud" || !ssh) continue`, so "no host was checked" printed **zero lines** —
+  indistinguishable from four passing checks. A `preflight` run from a work-harness checkout produced no
+  `:mini` line at all, because a checkout carries no `.claude/work.config.json` and `getHosts()` fell back
+  to the built-in `{local:{cap:2}}` — while `harness-install-current` tells the operator to run preflight
+  from exactly that checkout. All four loops now derive from one `crossHostTargets()` classification that
+  returns a REASON per skipped host, and two new legs print what used to be inferred from absence:
+  `work-config` (which `work.config.json` answered, and whether it parsed) and `cross-host-checks` (which
+  hosts are checkable, and why the rest are not). A non-cloud host with no `ssh` alias is now a config
+  error rather than a silent skip, and an unreachable host is `UNKNOWN`, never "the host has no manifest".
+  **Upgrade:** the manifest carries `manifest_schema: 2` and an explicit `roots` list. A v1 manifest is
+  still re-measured with the legacy whole-tree roots, so an un-upgraded host keeps reading its own install
+  correctly — but a v1/v2 pair enumerates different file SETS, so the cross-host check reports
+  `MANIFEST SCHEMA SKEW` and asks for a re-install of **both** hosts rather than naming a drift that does
+  not exist. Because `files` is now the payload rather than a walk of `$DEST`, a file install.sh shipped
+  once and no longer ships is no longer silently re-blessed into the manifest: it reads `UNTRACKED` and
+  reds `harness-drift`, with the `rm` naming it. That is deliberate — a retired module under
+  `skills/work/` is code the runner can still import. Three such leftovers were live on this MacBook when
+  the issue was written (`PUBLIC-README.draft.md`, `SCRUB-MANIFEST.md`,
+  `TURNOVER-2026-07-15-cloud-run-findings.md`), so the first `preflight` after this deploy reds until they
+  are deleted; re-installing does not prune them.
+- **DER-3008 (review round 2) — four more silent-success shapes in the same family.** (a) A payload
+  filename containing `:` or `"` corrupted the manifest at **exit 0**: `awk -F:` split
+  `skills/work/notes:draft.md` into the key `skills/work/notes` with the *value* `draft.md` where a
+  sha256 belongs (a clean install then re-measures as permanent drift), and `skills/work/say"hi.md`
+  emitted JSON that does not parse (`measureHarnessDrift` returns `absent`). Both reproduced against the
+  installer; it now **refuses** such a payload by name — the payload is repo-controlled, and any escaping
+  scheme would have to be mirrored byte-for-byte in `aggregateDigest`, which is the two-definitions
+  hazard itself. (b) `skills-sync:<host>` reported `SKEW … rsync -a …` when the ssh had simply **failed**
+  — a confident remedy naming a host that never answered, printed from the same loop iteration in which
+  `harness-digest` correctly abstained with `UNREACHABLE … UNKNOWN, not drift`. It now makes the same
+  distinction, and a missing LOCAL file is still reported first (the remote's silence cannot excuse a
+  broken local install). (c) `work-config` collapsed *absent* and *unreadable* into `unknown`, which does
+  not fail the gate — so a JSON syntax error in the real five-host config degraded silently to
+  `{local:{cap:2}}` and printed `PREFLIGHT GREEN` with the mini lane gone. Absent stays UNKNOWN (a
+  single-host repo looks identical); a file that exists and does not parse now **REDS**. (d)
+  `cross-host-checks` called a repo "genuinely single-host" while a declared-but-unverifiable host was
+  flagged in the same run — that host has a cap and can receive dispatch, so the shape is a broken
+  multi-host repo, not a single-host one. Four verdicts (`harnessDigestVerdict`, `skillsSyncVerdict`,
+  `workConfigVerdict`, `crossHostCoverageVerdict`) are now pure exported functions the preflight case
+  calls, because every defect above lived in an inlined expression no unit test could reach.
+- **DER-3008 — three "harness version" values were never compared to each other.** A 2026-08-01 deploy
+  reading reported "hosts at 0.3.0" while neither host was. `getHarnessVersion()` resolves
+  `../../VERSION` **relative to the running file**, so the checkout's runner reports the checkout's
+  version — the one about to be installed — in the present tense; it is also process-cached and
+  overridden by `WORK_HARNESS_VERSION`. The new `harness-version-agreement` leg compares that reading
+  against `$DEST/VERSION` and the manifest's `version`, and says which tree each came from. `VERSION`
+  also joined the manifest's file list, so a hand-edited `$DEST/VERSION` now reads as `MODIFIED` instead
+  of being the one shipped file nothing attested to.
+
+- **DER-3019 — `preflight`’s codex probe now BINDS to `classifyCodexProbe`.** The preflight leg carried a
+  second, drifted copy of the probe classification that tested the success marker FIRST, so a 401 body
+  containing "OK" read as GREEN there while the canonical classifier called it unauthenticated. The leg
+  now calls the classifier (source-pinned by a binding test carrying the 401+"OK" drift fixture) and
+  gained `--sandbox read-only` on its spawn. Two delta-review label nits landed with it: a refused
+  `--round abc` echoes the typed value instead of `null`, and an inherited WAIVED renders "no reason
+  recorded" exactly like the direct render.
+
 ### Known limits (accepted, not defects)
 
 - **A revision-round codex attestation does not record that the shepherd ASKED for it.** `review-panel`
@@ -110,8 +180,6 @@ it, and no revision-round brief does.
   no trace of who requested it or why. The policy — panel-only on revisions unless the shepherd explicitly
   asks — is therefore documented but not evidenced. Accepted: the round is on the receipt, so an auditor
   can see that a revision-round run happened and ask who wanted it.
-- **`preflight`'s own codex probe still classifies success-first** and does not share
-  `classifyCodexProbe`, so the two can drift. It sits in a region another change owns; tracked as DER-3019.
 
 ## [0.4.0] — 2026-08-01
 
@@ -657,67 +725,6 @@ would otherwise conclude the file had drifted.
 
 ### Fixed
 
-- **DER-3008 (P0) — the cross-host `content_digest` could never match, and the checks that compare it
-  ran on no hosts at all.** Two independent defects, both measured live on 2026-08-01 against a
-  known-good deploy. **(1) Scope.** 0.3.0's digest (see its `INSTALL-MANIFEST.json` entry above, which
-  described the behaviour accurately for that release) walked `find skills hooks -type f` under `$DEST`
-  — i.e. every file in `~/.claude/skills`, a **shared** directory holding 798 unrelated files on this
-  MacBook against 4 on the mini. With both hosts at `0.4.0` from `source_commit 0ba513f` and every
-  harness-suite file byte-identical, the aggregates were `f18703c0bca0…` vs `a1cc1fae4a5c…`, so
-  `harness-digest:<host>` would have printed *"CONTENT DRIFT — SAME VERSION STRING, DIFFERENT CODE"* on a
-  correct deploy — and a gate that reds on a correct deploy gets waved past. The file list now comes from
-  the **shipped payload** (`$SRC`'s `skills/`, `hooks/`, and `VERSION`) while every hash is still taken at
-  `$DEST`, keeping the measure-what-landed property: a shipped file that does not land now **fails the
-  install by name** rather than quietly shortening the list. **(2) Silence.** `ssh-hostname:<host>`,
-  `skills-sync:<host>`, `harness-digest:<host>` and `claude-probe:<host>` each inlined
-  `if (kind === "cloud" || !ssh) continue`, so "no host was checked" printed **zero lines** —
-  indistinguishable from four passing checks. A `preflight` run from a work-harness checkout produced no
-  `:mini` line at all, because a checkout carries no `.claude/work.config.json` and `getHosts()` fell back
-  to the built-in `{local:{cap:2}}` — while `harness-install-current` tells the operator to run preflight
-  from exactly that checkout. All four loops now derive from one `crossHostTargets()` classification that
-  returns a REASON per skipped host, and two new legs print what used to be inferred from absence:
-  `work-config` (which `work.config.json` answered, and whether it parsed) and `cross-host-checks` (which
-  hosts are checkable, and why the rest are not). A non-cloud host with no `ssh` alias is now a config
-  error rather than a silent skip, and an unreachable host is `UNKNOWN`, never "the host has no manifest".
-  **Upgrade:** the manifest carries `manifest_schema: 2` and an explicit `roots` list. A v1 manifest is
-  still re-measured with the legacy whole-tree roots, so an un-upgraded host keeps reading its own install
-  correctly — but a v1/v2 pair enumerates different file SETS, so the cross-host check reports
-  `MANIFEST SCHEMA SKEW` and asks for a re-install of **both** hosts rather than naming a drift that does
-  not exist. Because `files` is now the payload rather than a walk of `$DEST`, a file install.sh shipped
-  once and no longer ships is no longer silently re-blessed into the manifest: it reads `UNTRACKED` and
-  reds `harness-drift`, with the `rm` naming it. That is deliberate — a retired module under
-  `skills/work/` is code the runner can still import. Three such leftovers were live on this MacBook when
-  the issue was written (`PUBLIC-README.draft.md`, `SCRUB-MANIFEST.md`,
-  `TURNOVER-2026-07-15-cloud-run-findings.md`), so the first `preflight` after this deploy reds until they
-  are deleted; re-installing does not prune them.
-- **DER-3008 (review round 2) — four more silent-success shapes in the same family.** (a) A payload
-  filename containing `:` or `"` corrupted the manifest at **exit 0**: `awk -F:` split
-  `skills/work/notes:draft.md` into the key `skills/work/notes` with the *value* `draft.md` where a
-  sha256 belongs (a clean install then re-measures as permanent drift), and `skills/work/say"hi.md`
-  emitted JSON that does not parse (`measureHarnessDrift` returns `absent`). Both reproduced against the
-  installer; it now **refuses** such a payload by name — the payload is repo-controlled, and any escaping
-  scheme would have to be mirrored byte-for-byte in `aggregateDigest`, which is the two-definitions
-  hazard itself. (b) `skills-sync:<host>` reported `SKEW … rsync -a …` when the ssh had simply **failed**
-  — a confident remedy naming a host that never answered, printed from the same loop iteration in which
-  `harness-digest` correctly abstained with `UNREACHABLE … UNKNOWN, not drift`. It now makes the same
-  distinction, and a missing LOCAL file is still reported first (the remote's silence cannot excuse a
-  broken local install). (c) `work-config` collapsed *absent* and *unreadable* into `unknown`, which does
-  not fail the gate — so a JSON syntax error in the real five-host config degraded silently to
-  `{local:{cap:2}}` and printed `PREFLIGHT GREEN` with the mini lane gone. Absent stays UNKNOWN (a
-  single-host repo looks identical); a file that exists and does not parse now **REDS**. (d)
-  `cross-host-checks` called a repo "genuinely single-host" while a declared-but-unverifiable host was
-  flagged in the same run — that host has a cap and can receive dispatch, so the shape is a broken
-  multi-host repo, not a single-host one. Four verdicts (`harnessDigestVerdict`, `skillsSyncVerdict`,
-  `workConfigVerdict`, `crossHostCoverageVerdict`) are now pure exported functions the preflight case
-  calls, because every defect above lived in an inlined expression no unit test could reach.
-- **DER-3008 — three "harness version" values were never compared to each other.** A 2026-08-01 deploy
-  reading reported "hosts at 0.3.0" while neither host was. `getHarnessVersion()` resolves
-  `../../VERSION` **relative to the running file**, so the checkout's runner reports the checkout's
-  version — the one about to be installed — in the present tense; it is also process-cached and
-  overridden by `WORK_HARNESS_VERSION`. The new `harness-version-agreement` leg compares that reading
-  against `$DEST/VERSION` and the manifest's `version`, and says which tree each came from. `VERSION`
-  also joined the manifest's file list, so a hand-edited `$DEST/VERSION` now reads as `MODIFIED` instead
-  of being the one shipped file nothing attested to.
 - **DER-2774 — a red CI no longer parses as "no checks."** `parseChecksOutput` matched the CI status row
   by the literal job name `checks`, a carry-over from the repo this harness grew up on, and returned
   `checks: null` for any repo using different job names — indistinguishable from "the probe died" and
