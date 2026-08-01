@@ -9871,3 +9871,70 @@ test("6.1 an mDNS HostName is flagged; a Tailscale or LAN address is not", () =>
   assert.equal(tailscaleSees({ status: "100.116.5.7  other  macOS  -", host: "mini" }), null);
   assert.equal(tailscaleSees({ status: "", host: "mini" }), null, "tailscale not installed says nothing about the host");
 });
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// Findings from the 3-lens adversarial panel on this branch. All three are recorded here rather than
+// only fixed, because each is a case where the FIX introduced (or left) the very shape it was meant to
+// remove — which is the failure mode this whole wave is about.
+
+test("4.4 REGRESSION: retracting an EARLIER leak must not silence a LATER, live one", () => {
+  // Found by the correctness AND security lenses independently. Only one `reap_failed` is folded per
+  // issue (last wins), and the first implementation required `retracts` to be merely non-empty. So
+  // retracting a resolved leak cleared the banner for a DIFFERENT, un-investigated one — dropping a
+  // possibly-still-running remote lead from state, every watch wake, and complete-run's exit banner.
+  // A silent pass, introduced by the fix for a banner that lied.
+  const base = [
+    { ts: "2026-07-31T00:00:00Z", actor: "orch", type: "run_started", run_id: "R", mode: "issue-list", issues: ["DER-1"], harness_version: "0.3.0" },
+    { ts: "2026-07-31T00:01:00Z", actor: "orch", type: "reaped", issue: "DER-1", cleanup_ok: false },
+    { ts: "2026-07-31T00:02:00Z", actor: "orch", type: "reap_failed", issue: "DER-1", event_id: "EV-1", leaks: ["remote_pkill"], cleanup: [{ step: "remote_pkill", probe: "unknown" }] },
+    { ts: "2026-07-31T00:03:00Z", actor: "orch", type: "reap_failed", issue: "DER-1", event_id: "EV-2", leaks: ["remote_worktree_remove"], cleanup: [{ step: "remote_worktree_remove", exit_code: 1 }] },
+  ];
+  const retractStale = materializeState([...base,
+    { ts: "2026-07-31T00:04:00Z", actor: "orch", type: "reap_failure_retracted", issue: "DER-1", retracts: "EV-1", evidence: "EV-1 was never real" },
+  ], { run_id: "R" }).reap_failures[0];
+  assert.equal(retractStale.status, "open", "the LIVE EV-2 leak must survive a retraction aimed at EV-1");
+  assert.match(retractStale.retraction_rejected, /CURRENT reap_failed is EV-2/,
+    "and the operator must be TOLD it was rejected — silence here is the same defect one level up");
+
+  // Control: retracting the CURRENT failure still works, or the fix is just an outage.
+  const retractCurrent = materializeState([...base,
+    { ts: "2026-07-31T00:04:00Z", actor: "orch", type: "reap_failure_retracted", issue: "DER-1", retracts: "EV-2", evidence: "worktree confirmed gone" },
+  ], { run_id: "R" }).reap_failures[0];
+  assert.equal(retractCurrent.status, "RETRACTED");
+  assert.equal(retractCurrent.retraction_rejected, null);
+
+  // And a NEW failure after a valid retraction re-opens the banner — a recurring leak must not stay hidden.
+  const recurred = materializeState([...base,
+    { ts: "2026-07-31T00:04:00Z", actor: "orch", type: "reap_failure_retracted", issue: "DER-1", retracts: "EV-2", evidence: "confirmed gone" },
+    { ts: "2026-07-31T00:05:00Z", actor: "orch", type: "reap_failed", issue: "DER-1", event_id: "EV-3", leaks: ["remote_pkill"], cleanup: [{ step: "remote_pkill", probe: "survivor" }] },
+  ], { run_id: "R" }).reap_failures[0];
+  assert.equal(recurred.status, "open");
+});
+
+test("2.6 computeEligible REFUSES an empty fileScope by default — a guard nothing calls is not a guard", () => {
+  // Found by the correctness lens: this shipped with `strict = false` and a comment claiming "the
+  // dispatch path passes strict". There is no such path — computeEligible has NO caller inside the
+  // runner; the orchestrator invokes it from SKILL.md prose. So the guard could never fire.
+  const scopeless = [{ id: "DER-1" }, { id: "DER-2", fileScope: [] }];
+  assert.throws(() => computeEligible({ issues: scopeless, cap: 2 }), /EMPTY fileScope/,
+    "the DEFAULT must refuse — that is the only setting the real (prose-driven) caller will ever use");
+  // Control: real scopes still compute, and disjoint ones are still both eligible.
+  assert.deepEqual(computeEligible({ issues: [{ id: "DER-1", fileScope: ["src/a/**"] }, { id: "DER-2", fileScope: ["src/b/**"] }], cap: 2 }), ["DER-1", "DER-2"]);
+  // Control: the collision rules still bite, so the refusal has not replaced the logic it guards.
+  assert.deepEqual(computeEligible({ issues: [{ id: "DER-1", fileScope: ["src/a/**"] }, { id: "DER-2", fileScope: ["src/a/**"] }], cap: 2 }), ["DER-1"]);
+  // The permissive path stays available, but must be asked for out loud.
+  assert.deepEqual(computeEligible({ issues: scopeless, cap: 2, strict: false }), ["DER-1", "DER-2"]);
+});
+
+test("2.3 sleepGapDetected's FACTOR clause is load-bearing (mutation-covered)", () => {
+  // Found by the repro lens: deleting `actualMs < expectedMs * SLEEP_GAP_FACTOR` left the whole suite
+  // GREEN. A clause no test covers is a clause that can be deleted by a future refactor, and this one
+  // is what stops a merely-slow long poll from being reported as a host sleep.
+  // 100s expected, 170s actual: a 70s overrun — over the 60s minimum gap, but only 1.7x, far under 6x.
+  assert.equal(sleepGapDetected({ expectedMs: 100000, actualMs: 170000 }), null,
+    "a long poll that overran by 70s is NOT a sleep — without the factor clause this reports one");
+  // Paired controls, so the null above cannot be passing for the wrong reason:
+  assert.ok(sleepGapDetected({ expectedMs: 100000, actualMs: 100000 * 8 }), "8x IS a sleep");
+  assert.equal(sleepGapDetected({ expectedMs: 2500, actualMs: 2500 * 8 }), null,
+    "…but 8x of a 2.5s tick is only 20s — under the 60s floor, so still not a sleep");
+});

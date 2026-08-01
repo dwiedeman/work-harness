@@ -3539,10 +3539,17 @@ export function sweepPlan({ events = [], state = {}, keepRefs = [] } = {}) {
 // straight in yields `[]` for every one of them and every collision guard silently switches off. No
 // `fileScope` is recorded anywhere for queued issues — not in plan.md, not in the ledger.
 //
-// A guard that cannot see its own input must refuse, not pass. `strict:false` is kept ONLY for the
-// existing callers that legitimately compute over in-flight units whose scope arrives later via
-// `plan_scope`; the dispatch path passes strict.
-export function computeEligible({ issues = [], inflight = [], cap = 2, strict = false } = {}) {
+// A guard that cannot see its own input must refuse, not pass — so this DEFAULTS to refusing.
+//
+// It shipped defaulting to `strict:false` with a comment claiming "the dispatch path passes strict".
+// An adversarial review found that false: `computeEligible` has NO caller inside this runner at all —
+// it is invoked by the orchestrator from `SKILL.md`'s prose, so nothing was ever going to pass the
+// flag, and the guard could not fire on the one path that matters. A guard nothing calls is not a
+// guard, and a comment asserting otherwise is worse than no comment.
+//
+// `strict:false` remains available for a caller that legitimately computes over in-flight units whose
+// scope arrives later via `plan_scope` — but it must now be asked for out loud.
+export function computeEligible({ issues = [], inflight = [], cap = 2, strict = true } = {}) {
   const chosen = inflight.map((i) => ({ id: i.id, fileScope: i.fileScope ?? [] }));
   const result = [];
   if (strict) {
@@ -5177,9 +5184,13 @@ export function materializeState(rawEvents, meta = {}) {
         it.reap_leaks = Array.isArray(e.leaks) ? e.leaks : [];
         it.reap_failed_note = e.reason ?? null;
         it.reap_cleanup_steps = Array.isArray(e.cleanup) ? e.cleanup : [];
-        // A later retraction wins over an earlier failure; a later FAILURE re-opens it. Both directions,
-        // because a leak that recurs after being retracted is exactly what must not stay hidden.
+        // The event_id a retraction must NAME. Only ONE reap_failed is folded per issue (last wins), so
+        // without this a retraction of an EARLIER leak silently clears the banner for the CURRENT one.
+        it.reap_failed_event_id = e.event_id ?? null;
+        // A later FAILURE re-opens a retracted unit. A leak that recurs after being retracted is exactly
+        // what must not stay hidden.
         it.reap_retracted = null;
+        it.reap_retraction_rejected = null;
         break;
       case "reap_failure_retracted":
         // 4.4 — an append-only ledger needs a RETRACTION SHAPE.
@@ -5195,8 +5206,26 @@ export function materializeState(rawEvents, meta = {}) {
         // Deliberately requires `retracts` (the event_id being retracted) and `evidence` — a retraction
         // with neither is indistinguishable from wishful thinking, and this is the one shape that can
         // clear a safety banner.
-        if (e.retracts && e.evidence) {
+        //
+        // REFERENCE INTEGRITY, added after an adversarial review caught the obvious hole: requiring
+        // `retracts` to be merely NON-EMPTY is not the same as requiring it to name the leak actually
+        // on the board. Only one `reap_failed` is folded per issue (last wins), so this sequence
+        //     reap_failed EV-1 (remote_pkill) → reap_failed EV-2 (worktree) → retract EV-1
+        // cleared the banner for EV-2, a live and never-investigated leak — a remote lead possibly
+        // still running and spending, dropped from `state`, from every `watch` wake and from
+        // `complete-run`'s exit banner. That is a SILENT PASS introduced by the very fix that was
+        // meant to stop a banner from lying. Fail closed: a retraction that does not name the current
+        // failure is REJECTED and SAYS SO, because an operator who records one and sees nothing change
+        // must not be left guessing whether it was ignored, mistyped, or never arrived.
+        if (!e.retracts || !e.evidence) {
+          it.reap_retraction_rejected = "a retraction needs BOTH `retracts` (the reap_failed event_id) and `evidence` — one without the other is wishful thinking, and this is the only shape that can clear a safety banner";
+        } else if (!it.reap_failed_event_id) {
+          it.reap_retraction_rejected = `cannot retract: no reap_failed with an event_id is on record for this unit (retracts=${e.retracts})`;
+        } else if (e.retracts !== it.reap_failed_event_id) {
+          it.reap_retraction_rejected = `retracts=${e.retracts} but the CURRENT reap_failed is ${it.reap_failed_event_id} — refusing. Retracting an earlier leak must never clear a later, un-investigated one. Investigate ${it.reap_failed_event_id} and retract THAT.`;
+        } else {
           it.reap_retracted = { retracts: e.retracts, evidence: e.evidence, by: e.actor ?? null, ts: e.ts ?? null };
+          it.reap_retraction_rejected = null;
         }
         break;
       default:
@@ -5380,6 +5409,10 @@ export function materializeState(rawEvents, meta = {}) {
           // because "this was investigated and closed" is information the next reader needs; what it
           // must stop doing is reading as an OPEN leak.
           retracted: v.reap_retracted ?? null,
+          // A REJECTED retraction is named, for the same reason a rejected gate_adjudication is: an
+          // operator who recorded one and sees the banner unchanged otherwise cannot tell whether it
+          // was ignored, mistyped, or never arrived.
+          retraction_rejected: v.reap_retraction_rejected ?? null,
           status: v.reap_retracted ? "RETRACTED" : "open",
           label: v.reap_retracted
             ? `${k} — RETRACTED (${v.reap_retracted.evidence}) [retracts ${v.reap_retracted.retracts}]`

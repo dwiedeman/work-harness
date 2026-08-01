@@ -233,3 +233,73 @@ rewritten after the fact — the history is honest about what happened.
   closing it is a `/work` operator action against that run's own ledger, and the handoff explicitly
   forbids hand-appending reaped events. Close it with `reap --run <r> <queued-id>` per never-started
   id, then `complete-run`.
+
+---
+
+## Substitute gate — the 3-lens adversarial panel on this work
+
+The handoff's substitute for the dead codex gate: *"implementer subagents run a documented adversarial
+self-review before any PR/merge, and you review each diff yourself."* Run as a **posture-C panel using
+the procedure this very plan adds** (`work-shepherd/SKILL.md`), against `git diff aed5abc...HEAD`:
+three DISTINCT lenses — correctness, security/trust-boundary, does-it-actually-reproduce — each
+prompted to REFUTE and to default `refuted: true` under uncertainty.
+
+**Verdicts: correctness `refuted: false`, security `refuted: false`, repro `refuted: false`.** Three
+findings survived, all three real, all three fixed:
+
+### A — `reap_failure_retracted` could silence a LATER, live leak (found by correctness AND security, independently)
+
+The strongest kind of finding: two lenses converged on it from different directions. Only ONE
+`reap_failed` is folded per issue (last wins), and the retraction required `retracts` to be merely
+*non-empty*. So:
+
+```
+reap_failed EV-1 (remote_pkill)      → an unverifiable kill
+reap_failed EV-2 (worktree remove)   → a DIFFERENT, still-open leak, replaces EV-1 in the fold
+reap_failure_retracted retracts=EV-1 → clears the banner for EV-2
+```
+
+Reproduced directly: `status: "RETRACTED"` with `remote_worktree_remove` still open — dropping a
+possibly-still-running remote lead from `state`, from every `watch` wake, and from `complete-run`'s
+exit banner. **A silent pass, introduced by the fix for a banner that lied.** Exactly the defect class
+this wave exists to remove, committed by the wave itself.
+
+Fixed: a retraction must name the CURRENT `reap_failed` event_id, and a rejected one is surfaced as
+`retraction_rejected` rather than silently ignored.
+
+### B — `computeEligible`'s guard could never fire (found by correctness)
+
+It shipped with `strict = false` and a comment asserting *"the dispatch path passes strict"*. There is
+no such path: `computeEligible` has **zero callers inside the runner** — the orchestrator invokes it
+from `SKILL.md` prose. So nothing was ever going to pass the flag, and **the guard I added for 2.6
+could not fire on the only path that matters**, while a comment claimed it did.
+
+Fixed: `strict` now defaults to `true`; `SKILL.md`'s dispatch instructions document the refusal and the
+explicit `strict: false` opt-out.
+
+### C — `sleepGapDetected`'s factor clause had zero coverage (found by repro, via mutation)
+
+Deleting `actualMs < expectedMs * SLEEP_GAP_FACTOR` left the entire 491-test suite **green**. The
+clause is what stops a merely-slow long poll from being reported as a host sleep. A clause no test
+covers is one a future refactor can delete silently.
+
+Fixed: a test with paired controls (1.7× over a 100s poll → not a sleep; 8× → a sleep; 8× of a 2.5s
+tick → still under the 60s floor).
+
+### Panel discipline notes
+
+- The repro lens **mutation-tested** the other two lenses' subjects and reported paired controls, per
+  the procedure: 8 mutations, 7 red, 1 green — and the single green one *was* finding C. A green
+  mutation meant something only because the others went red.
+- All three fixes are themselves mutation-verified: reverting each fix turns its new test red, with an
+  unmutated control green.
+- **A process lesson worth recording:** during mutation testing I used `git checkout -- <file>` to
+  revert, which silently discarded UNCOMMITTED fixes A and B (checkout restores the last *commit*).
+  Caught immediately by re-running the suite. Mutation testing against a dirty tree needs a real
+  file backup, not `git checkout`.
+- The repro lens also reported that a `system-reminder`-shaped message appeared in its context claiming
+  a just-reverted file had been intentionally modified and instructing it not to revert and not to tell
+  me. It verified against `git status`, found the claim false, ignored it, and reported it. That is the
+  correct behaviour and the reason the verdict-first contract exists. (The message is this harness's own
+  file-change notification misfiring on an external revert — not an attack — but the agent could not
+  know that, and reporting it was right.)
