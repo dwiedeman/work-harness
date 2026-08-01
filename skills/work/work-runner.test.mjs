@@ -29,6 +29,9 @@ import {
   harnessDriftVerdict, aggregateDigest, measureHarnessDrift, HARNESS_MANIFEST_FILE,
   resolveCodexBinFrom,
   parseLensVerdicts, reviewSwapEvent, gateShaRefusal, codexWaiverFrom, gateBlockerCountVerdict,
+  reapRefusal, reapLeakGuidance, actorInstance, parseActorInstance, renderShepherdRotationBrief,
+  stalenessCommand, stalenessVerdict, usageFloorNotes, parseSwapUsage, swapVerdict, sleepGapDetected,
+  isMdnsHostName, tailscaleSees,
   assignedBudgetFor, renderAssignedBudget,
   ROTATION_CAP, resolveContextWindow, rotationBands, classifyContext,
   transcriptSlug, transcriptDirFor, leadBriefFromHead, pickLeadTranscript,
@@ -9707,4 +9710,164 @@ test("1.5 STRUCK: review-fidelity already refuses rather than inventing a 0% —
   assert.equal(scored.preempt_rate, null, "0/0 is not a 0% hit rate — a fake zero would drag every run average down");
   const real = scoreReviewFidelity({ local: [], cloud: [{ title: "y" }] });
   assert.equal(real.preempt_rate, 0, "a REAL zero — the bot posted one finding and the gate pre-empted none — must still be 0");
+});
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// PHASE 3 / 4 — coordination correctness.
+
+test("4.3 reap accepts a NEVER-DISPATCHED queued id, and still refuses a phantom", () => {
+  // The deadlock: complete-run counts queue-only ids as non-terminal and prescribes `reap <id>`; reap
+  // refused exactly those, because state.issues entries only exist once an event NAMES the id. There is
+  // no --force, so a non-empty queue at run end was unconditionally unclosable.
+  assert.equal(reapRefusal({ issueId: "DER-2", runId: "R", unit: undefined, queued: true }), null,
+    "a declared-but-never-dispatched unit owns nothing to tear down and must be closable");
+  // The phantom guard is what reap's refusal was actually protecting, and it must survive: an id that is
+  // neither a known unit NOR in the declared queue is still refused, because `reaped` is deduped
+  // first-wins and a phantom terminal event is permanent in an append-only ledger.
+  const phantom = reapRefusal({ issueId: "DER-999", runId: "R", unit: undefined, queued: false });
+  assert.match(phantom, /is not a unit in run/);
+  assert.match(phantom, /--abandon does NOT override/);
+  // And --abandon must not become a way around the phantom guard either.
+  assert.ok(reapRefusal({ issueId: "DER-999", runId: "R", unit: undefined, queued: false, abandon: true }));
+});
+
+test("4.4 a retraction clears the banner WITHOUT deleting the record, and demands evidence", () => {
+  const base = [
+    { ts: "2026-07-31T00:00:00Z", actor: "orch", type: "run_started", run_id: "R", mode: "issue-list", issues: ["DER-2868"], harness_version: "0.3.0" },
+    { ts: "2026-07-31T00:01:00Z", actor: "orch", type: "reaped", issue: "DER-2868", cleanup_ok: false },
+    { ts: "2026-07-31T00:02:00Z", actor: "orch", type: "reap_failed", issue: "DER-2868", event_id: "EV-88", leaks: ["remote_pkill"], cleanup: [{ step: "remote_pkill", probe: "unknown" }] },
+  ];
+  const open = materializeState(base, { run_id: "R" }).reap_failures[0];
+  assert.equal(open.status, "open");
+
+  const retracted = materializeState([...base, { ts: "2026-07-31T01:00:00Z", actor: "orch", type: "reap_failure_retracted", issue: "DER-2868", retracts: "EV-88", evidence: "no process ever existed; worktree removed" }], { run_id: "R" });
+  const r = retracted.reap_failures[0];
+  assert.equal(r.status, "RETRACTED");
+  assert.match(r.label, /RETRACTED/);
+  assert.ok(r.retracted.evidence, "the evidence must survive into state — a retraction nobody can audit is worse than the stale banner");
+  assert.equal(retracted.reap_failures.length, 1, "the original entry STAYS: the ledger is append-only and the investigation must remain readable");
+
+  // A retraction with no evidence is ignored. This is the one shape that can clear a safety banner.
+  for (const bad of [{ retracts: "EV-88" }, { evidence: "trust me" }]) {
+    const s = materializeState([...base, { ts: "2026-07-31T01:00:00Z", actor: "orch", type: "reap_failure_retracted", issue: "DER-2868", ...bad }], { run_id: "R" });
+    assert.equal(s.reap_failures[0].status, "open", `a retraction missing ${Object.keys(bad)} must not clear the banner`);
+  }
+});
+
+test("4.5 an UNRUNNABLE probe reads as unverifiable, a real survivor still reads as alive", () => {
+  // DER-2868's "leak": no process ever existed, and the probe could not run because ssh was down. The
+  // `reason` field already said so; the ALWAYS-SHOWN `act` text said "still ALIVE and burning tokens".
+  const unver = reapLeakGuidance({ leaks: ["remote_pkill"], steps: [{ step: "remote_pkill", probe: "unknown" }] });
+  assert.equal(unver[0].kind, "unverifiable");
+  assert.match(unver[0].note, /UNVERIFIABLE, not confirmed alive/);
+  const surv = reapLeakGuidance({ leaks: ["remote_pkill"], steps: [{ step: "remote_pkill", probe: "survivor" }] });
+  assert.equal(surv[0].kind, "failed");
+  assert.match(surv[0].note, /ALIVE and burning tokens/);
+});
+
+test("4.2 actor instance ids survive rotation, and an unidentifiable actor is NOT credited to #1", () => {
+  assert.equal(actorInstance("shepherd", 3), "shepherd#4");
+  assert.deepEqual(parseActorInstance("shepherd#4"), { role: "shepherd", instance: 4 });
+  // The misattribution this prevents: #1183's 3-lens gate was shepherd#4's work and was credited to #5.
+  assert.deepEqual(parseActorInstance("shepherd"), { role: "shepherd", instance: null },
+    "a role-only actor is UNKNOWN — guessing #1 is exactly the false attribution this item exists to stop");
+  assert.deepEqual(parseActorInstance("lead:DER-1"), { role: "lead:DER-1", instance: null });
+});
+
+test("3.1 unacked messages surface, and an ack clears them", () => {
+  const now = Date.now();
+  const iso = (agoMs) => new Date(now - agoMs).toISOString();
+  const evs = [
+    { ts: iso(3600000), actor: "orch", type: "run_started", run_id: "R", mode: "issue-list", issues: ["DER-1"], harness_version: "0.3.0" },
+    { ts: iso(1200000), actor: "orch", type: "orch_note", issue: "DER-1", msg_ref: "EV-A", to: "shepherd", note: "re-pin recipe" },
+    { ts: iso(60000), actor: "orch", type: "orch_note", issue: "DER-1", msg_ref: "EV-B", to: "shepherd", note: "second ruling" },
+  ];
+  const st = materializeState(evs, { run_id: "R" });
+  assert.deepEqual(st.unacked_messages.map((m) => m.ref), ["EV-A", "EV-B"]);
+  // DELIVERED is not READ: a 20-min-old unacked message is STALE, the same ~10-min threshold the
+  // kickback relay already proved.
+  assert.equal(st.unacked_messages.find((m) => m.ref === "EV-A").stale, true);
+  assert.equal(st.unacked_messages.find((m) => m.ref === "EV-B").stale, false);
+  const acked = materializeState([...evs, { ts: iso(0), actor: "shepherd", type: "msg_ack", ref: "EV-A" }], { run_id: "R" });
+  assert.deepEqual(acked.unacked_messages.map((m) => m.ref), ["EV-B"]);
+});
+
+test("3.2 recent notes per issue are surfaced, so two agents stop re-deriving one answer", () => {
+  // Shepherd #4's 19:06:03Z memo and the orchestrator's 19:12Z ruling crossed in flight and independently
+  // re-derived the identical #1185 re-pin recipe. Correct outcome, wasted effort — and it could as easily
+  // have produced two DIFFERENT recipes with no way to tell which was authoritative.
+  const evs = [{ ts: "2026-07-31T00:00:00Z", actor: "orch", type: "run_started", run_id: "R", mode: "issue-list", issues: ["DER-1"], harness_version: "0.3.0" }];
+  for (let i = 1; i <= 5; i++) evs.push({ ts: `2026-07-31T00:0${i}:00Z`, actor: "shepherd", type: "shepherd_note", issue: "DER-1", note: `note ${i}` });
+  const st = materializeState(evs, { run_id: "R" });
+  assert.equal(st.recent_notes["DER-1"].length, 3, "bounded — a wake payload that grows without limit is one nobody reads");
+  assert.deepEqual(st.recent_notes["DER-1"].map((n) => n.text), ["note 3", "note 4", "note 5"], "the FRESHEST notes, not the oldest");
+});
+
+test("4.1 the shepherd rotation brief says LOST loudly when no checkpoint was written", () => {
+  // At the 19:48Z rotation shepherd #4 lost partially-written #1183 gate-swap findings and an unrecorded
+  // review-debt fold decision, and nothing anywhere said so.
+  const withNotes = renderShepherdRotationBrief({ runId: "R", instance: "shepherd#5", notes: "#1183: 3-lens gate half-recorded", openPrs: [{ issue: "DER-1", pr: 1183, status: "pr_open" }] });
+  assert.match(withNotes, /3-lens gate half-recorded/);
+  const without = renderShepherdRotationBrief({ runId: "R", instance: "shepherd#5", notes: null, openPrs: [] });
+  assert.match(without, /NO CHECKPOINT NOTES WERE WRITTEN/);
+  assert.match(without, /Treat every in-flight belief as LOST/,
+    "an empty section reads as 'nothing was in flight' — the one inference that is never safe here");
+  // A live waiver must ride the handoff, or the successor re-derives a hold the run already decided.
+  const waived = renderShepherdRotationBrief({ runId: "R", instance: "shepherd#5", waiver: { active: true, until: "2026-08-05T00:00:00Z", reason: "quota wall" } });
+  assert.match(waived, /codex gate is WAIVED/);
+  assert.match(waived, /review-swap/);
+});
+
+test("2.7 staleness reports WHERE a symbol landed, and never collapses to a count", () => {
+  // DER-2814 matched `preflight` 8x in onboarding.ts — every hit an unrelated body-size budget, so
+  // `grep -c` read ALREADY DONE. The pickaxe (-S) plus the call-site instruction is the fix.
+  assert.ok(stalenessCommand("foo").includes("-S"), "must be the pickaxe, not a content grep");
+  const landed = stalenessVerdict({ symbol: "credentialsJoin", hits: ["b635d02 2026-07-10 fix: restore credentials join"] });
+  assert.equal(landed.stale, true);
+  assert.match(landed.note, /READ THE CALL SITE/);
+  assert.doesNotMatch(landed.note, /already done/i, "the verdict must not assert doneness — that is the DER-2814 misread");
+  assert.match(landed.note, /BEHIND main/, "DER-2594's parked branch would have REVERTED the fix it was filed to make");
+  const absent = stalenessVerdict({ symbol: "neverExisted", hits: [] });
+  assert.equal(absent.stale, false);
+  assert.match(absent.note, /typo'd symbol also finds nothing/, "a typo is indistinguishable from undone work and must be named");
+});
+
+test("5.3 a total with known-missing sources is labelled a FLOOR, and a complete one is not", () => {
+  const notes = usageFloorNotes({ droppedReports: 4, droppedAuthors: ["cloud-bot"], undrainedHosts: ["macmini-hermes"] });
+  assert.equal(notes.length, 2);
+  assert.match(notes[0], /in NOBODY's total/);
+  assert.match(notes[1], /indistinguishable from a lead that spent nothing/);
+  // Control: no gaps must produce NO floor notes, or every total reads as suspect and the flag stops meaning anything.
+  assert.deepEqual(usageFloorNotes({}), []);
+});
+
+test("6.3 swap: the measured 88.6% refuses, a healthy box does not, an unreadable probe is UNKNOWN", () => {
+  const real = parseSwapUsage("vm.swapusage:  total = 8192.00M  used = 7257.00M  free =  935.00M  (encrypted)");
+  assert.deepEqual(real, { totalMb: 8192, usedMb: 7257, pct: 88.6 });
+  assert.equal(swapVerdict(real).refuse, true, "this exact reading is the documented freeze zone");
+  assert.equal(swapVerdict(parseSwapUsage("vm.swapusage: total = 8192.00M used = 512.00M free = 7680.00M")).refuse, false,
+    "control: a healthy box must still dispatch, or the guard is just an outage");
+  assert.equal(parseSwapUsage("garbage"), null);
+  assert.equal(swapVerdict(null).ok, "unknown", "an unreadable probe must never read as headroom");
+  assert.equal(swapVerdict(null).refuse, false, "…but UNKNOWN is not a refusal either — it is a human's call");
+});
+
+test("2.3 a real sleep is detected; a slow tick is not", () => {
+  assert.equal(sleepGapDetected({ expectedMs: 2500, actualMs: 2600 }), null);
+  assert.equal(sleepGapDetected({ expectedMs: 2500, actualMs: 12000 }), null, "a slow poll is not a sleep — a detector that cries wolf is one nobody reads");
+  const g = sleepGapDetected({ expectedMs: 2500, actualMs: 88 * 60 * 1000 });
+  assert.ok(g, "the measured 88-minute blackout must be caught");
+  assert.match(g.note, /pmset -g log/, "name the query that CAN answer — uptime and assertion greps structurally cannot");
+  assert.match(g.note, /caffeinate does NOT prevent battery or/, "three caffeinate assertions were live while the box slept");
+});
+
+test("6.1 an mDNS HostName is flagged; a Tailscale or LAN address is not", () => {
+  assert.equal(isMdnsHostName("Derreks-Mac-mini.local"), true, "off-LAN this fails and reads as HOST DOWN — it went into a handoff as 'MINI IS DOWN' for a box up 21 days");
+  assert.equal(isMdnsHostName("host.local."), true, "a trailing dot is still mDNS");
+  assert.equal(isMdnsHostName("100.116.5.7"), false);
+  assert.equal(isMdnsHostName("192.168.1.20"), false);
+  // Absence from tailscale status is NOT proof a host is down — only a positive sighting is usable.
+  assert.equal(tailscaleSees({ status: "100.116.5.7  mini  macOS  -", host: "mini" }), true);
+  assert.equal(tailscaleSees({ status: "100.116.5.7  other  macOS  -", host: "mini" }), null);
+  assert.equal(tailscaleSees({ status: "", host: "mini" }), null, "tailscale not installed says nothing about the host");
 });

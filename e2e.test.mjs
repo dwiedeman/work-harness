@@ -439,7 +439,7 @@ test("FAULT a FORGED under-counted gate event that bypasses `append`: the READ s
   const st = await R.state();
   assert.deepEqual(st.gate_blocked.map((g) => [g.issue, g.blockers]), [["DER-1", "INCONSISTENT"]],
     "a forged under-counted gate event must reach the board as INCONSISTENT — it authorized a merge at c477ee9");
-  assert.match(st.issues["DER-1"].gate_blockers_inconsistent, /records 0 blocker\(s\) but its findings list holds 1/);
+  assert.match(st.issues["DER-1"].gate.blockers_inconsistent, /records 0 blocker\(s\) but its findings list holds 1/);
   assert.match(st.gate_blocked[0].note, /INCONSISTENT WITH ITSELF/, "the board must say what to do about it, not just flag it");
 });
 

@@ -39,6 +39,8 @@ export function parseArgs(argv) {
     // the final one would silently record a 3-lens gate as a 1-lens gate. That is the exact 1-of-3-reads-
     // as-a-full-swap failure the command refuses at every other layer.
     else if (a === "--lens") (o.lens ??= []).push(argv[++i]);
+    // `staleness-check --symbol X --symbol Y` (2.7) — repeatable for the same reason --lens is.
+    else if (a === "--symbol") (o.symbol ??= []).push(argv[++i]);
     else if (a === "--verdicts") o.verdicts = argv[++i];
     else if (a === "--engine") o.engine = argv[++i];
     else if (a === "--substitute-reason") o.substituteReason = argv[++i];
@@ -557,8 +559,13 @@ export function renderBrief({ issueId, title, worktree, branch, runId, runDir, r
     ``,
     `Append this to every subagent prompt, verbatim:`,
     ``,
+    `> **VERDICT FIRST.** Open your reply with your conclusion in one line — for a reviewer, \`refuted: true|false\` plus a one-line reason; for anything else, the answer itself. Detail comes AFTER, so a truncated return still carries a usable answer.`,
+    `>`,
+    `> **End with exactly one of \`COMPLETE\` / \`INCOMPLETE\` / \`REFUSED\` — never silence.** If you cannot finish, return \`INCOMPLETE\` naming what is missing. A subagent that returns nothing is indistinguishable from one still working.`,
+    `>`,
     `> Write your findings to \`${runDir ?? "<run-dir>"}/subagent-notes/${issueId}/<label>.md\` **as you go**, not at the end. Return **≤500 words + that path** — never a dump; cite \`file:line\` instead of pasting code. If you approach your context limit: finalize the file, then return \`done\` or \`partial\` plus exactly what remains.`,
     ``,
+    `**SILENT is not WEDGED, and they need OPPOSITE responses (2026-07-31).** Two of three reviewer subagents went silent TWICE, then delivered in full on an explicit ultimatum: *"send your findings now, or send INCOMPLETE."* They were not dead — 136k and 158k tokens each. Re-pinging did nothing; the ultimatum worked immediately. For a subagent that returned NOTHING, send the ultimatum FIRST; reserve close-and-respawn for one that is provably WEDGED (0% CPU, ignoring a delivered specific poke for ~8 min). Respawning a silent-but-working agent throws away everything it has done.`, ``,
     `**A subagent cannot rotate** — it never receives a user prompt, so no nudge can reach it, and when it dies it leaves NOTHING. The file is the handoff. Measured 2026-07-25: one \`implementer\` subagent hit 134% of the window and an \`Explore\` subagent DIED at 101% with its findings unrecoverable. The bigger win is your own context: a subagent's return value is injected verbatim into you, so a 20K-token report costs YOU 20K. When one returns \`partial\` or dies, read its notes file and **re-dispatch narrowed** — never re-run the same unbounded prompt.`,
     ``,
     `## Guardrails`,
@@ -764,7 +771,12 @@ export function renderCloudBrief({ issueId, title, branch, runId, acceptance, ki
     // were force-adding gitignored scratch into the PR — three such files reached `main` before anyone
     // noticed, and the leads were COMPLYING with the brief, not misbehaving. Notes are scratch: write
     // them, read them, never commit them.
+    `> **VERDICT FIRST.** Open your reply with your conclusion in one line — for a reviewer, \`refuted: true|false\` plus a one-line reason; for anything else, the answer itself. Detail comes AFTER, so a truncated return still carries a usable answer.`,
+    `>`,
+    `> **End with exactly one of \`COMPLETE\` / \`INCOMPLETE\` / \`REFUSED\` — never silence.** If you cannot finish, return \`INCOMPLETE\` naming what is missing. A subagent that returns nothing is indistinguishable from one still working.`,
+    `>`,
     `> Write your findings to \`tmp/subagent-notes/${issueId}/<label>.md\` **as you go**, not at the end. That path is gitignored scratch — **do NOT commit it** and never \`git add -f\` it. Return **≤500 words + that path** — never a dump; cite \`file:line\` instead of pasting code. If you approach your context limit: finalize the file, then return \`done\` or \`partial\` plus exactly what remains.`, ``,
+    `**SILENT is not WEDGED, and they need OPPOSITE responses (2026-07-31).** Two of three reviewer subagents went silent TWICE, then delivered in full on an explicit ultimatum: *"send your findings now, or send INCOMPLETE."* They were not dead — 136k and 158k tokens each. Re-pinging did nothing; the ultimatum worked immediately. For a subagent that returned NOTHING, send the ultimatum FIRST; reserve close-and-respawn for one that is provably WEDGED (0% CPU, ignoring a delivered specific poke for ~8 min). Respawning a silent-but-working agent throws away everything it has done.`, ``,
     `**A subagent cannot rotate** — it never receives a user prompt, so no nudge can reach it, and when it dies it leaves NOTHING. Measured 2026-07-25: one \`implementer\` subagent reached 134% of its window and an \`Explore\` subagent DIED at 101% with its findings unrecoverable. The bigger win is your own context: a subagent's return value is injected verbatim into you, so a 20K-token report costs YOU 20K. When one returns \`partial\` or dies, read its notes file and **re-dispatch narrowed** — never re-run the same unbounded prompt.`, ``);
   p(`## Guardrails`, ``, `Do NOT merge. Do NOT enumerate/report environment or session identifiers into comments (opening the draft PR is enough — its footer has your handle). Stage explicit paths only (never \`git add -A\`). No secrets anywhere; redact presigned-URL query strings. Never modify the /work harness.`);
   if (kickback) {
@@ -4777,6 +4789,38 @@ export function materializeState(rawEvents, meta = {}) {
   //   shape) still folds onto its own unit, but the RUN stays `completed`. It is COUNTED rather than
   //   silently absorbed, because "the ledger kept moving after the run was declared over" is a fact the
   //   next reader has to be told; absence read as fine is how this harness's blind spots have all started.
+  // 3.1 / 3.2 — message receipts and recent per-issue notes, folded in one pass over the events.
+  const MSG_ACK_STALE_MS = 10 * 60 * 1000; // the kickback relay's proven threshold, generalised
+  const NOTES_PER_ISSUE = 3;
+  const awaitingAck = new Map(); // ref -> {ref, to, ts, type}
+  const acked = new Set();
+  const notesByIssue = new Map();
+  for (const e of events) {
+    if (e?.type === "msg_ack" && e.ref) acked.add(e.ref);
+    // A message is "actionable and outstanding" when it declared a ledger ref for itself.
+    else if (e?.msg_ref) awaitingAck.set(e.msg_ref, { ref: e.msg_ref, to: e.to ?? null, from: e.actor ?? null, ts: e.ts ?? null, type: e.type });
+    if (typeof e?.type === "string" && e.type.endsWith("_note") && e.issue) {
+      const list = notesByIssue.get(e.issue) ?? [];
+      list.push({ ts: e.ts ?? null, by: e.actor ?? null, type: e.type, text: String(e.note ?? e.text ?? "").slice(0, 300) });
+      notesByIssue.set(e.issue, list);
+    }
+  }
+  const nowMs = Date.now();
+  const unackedMessages = [...awaitingAck.values()]
+    .filter((m) => !acked.has(m.ref))
+    .map((m) => {
+      const ageMs = m.ts ? nowMs - Date.parse(m.ts) : null;
+      return {
+        ...m,
+        age_s: Number.isFinite(ageMs) ? Math.round(ageMs / 1000) : null,
+        stale: Number.isFinite(ageMs) ? ageMs > MSG_ACK_STALE_MS : false,
+        act: "DELIVERED is not READ. Past ~10 min with no msg_ack, treat the message as NOT LANDED: stop re-poking and re-deliver (or respawn a wedged recipient), exactly as the kickback relay already does.",
+      };
+    });
+  const recentNotes = Object.fromEntries(
+    [...notesByIssue.entries()].map(([issue, list]) => [issue, list.slice(-NOTES_PER_ISSUE)]),
+  );
+
   let runCompleted = null;
   const runCompletionRejected = [];
   const postCompletion = [];
@@ -5121,6 +5165,11 @@ export function materializeState(rawEvents, meta = {}) {
         if (e.cleanup_ok === false) it.reap_cleanup_ok = false;
         else if (e.cleanup_ok === true) it.reap_cleanup_ok = true;
         break;
+      case "msg_ack":
+        // 3.1 — the READ receipt. Handled in the per-issue switch only when it names an issue; the
+        // run-level tracking below folds every one regardless, because most actionable messages are
+        // addressed to a ROLE (the shepherd) rather than to a unit.
+        break;
       case "reap_failed":
         // Separate from `reaped` on purpose: `reaped` is deduped per issue (first wins), so the failure
         // record must be its own event or a re-reap could never report a new leak.
@@ -5390,6 +5439,18 @@ export function materializeState(rawEvents, meta = {}) {
     // Scoped to handed-off units on purpose: the gate is a PRE-PR check, so an in-flight lead that has not
     // handed off yet is not late — listing every open draft would make this permanently non-empty, and a
     // banner that is always red is a banner nobody reads (the DER-2744 lesson, applied here).
+    // 3.1 — DELIVERED vs READ, as state. `cmux-say --ledger-ref <id>` refuses to send an actionable
+    // message without a ledger counterpart; the recipient appends `msg_ack {ref}`. Anything still
+    // unacked past the threshold surfaces here and on every watch wake. Without this, "I told the
+    // shepherd" and "the shepherd knows" were the same sentence — a mid-turn session reads its input
+    // queue only when the turn ends, and a ruling once sat ~4 minutes before it was seen.
+    unacked_messages: unackedMessages,
+    // 3.2 — the cheap half of the crossed-messages fix. Shepherd #4's 19:06:03Z memo and the
+    // orchestrator's 19:12Z ruling CROSSED IN FLIGHT: both independently re-derived the identical
+    // #1185 re-pin recipe. Correct outcome, wasted effort — and it could as easily have produced two
+    // DIFFERENT recipes, with no way to tell which was authoritative. Surfacing each unit's freshest
+    // notes means an agent sees a sibling's analysis before starting its own.
+    recent_notes: recentNotes,
     // 1.3 — the codex waiver, as STATE. It previously existed only as ledger prose, so every `ready`
     // call needed a human to remember it and a successor orchestrator had to be told out of band. An
     // expired waiver is reported too (`active:false, expired:true`) rather than vanishing: "the waiver
@@ -5695,6 +5756,8 @@ export function aggregateTokenUsage(events = []) {
 
   const by_model = {};
   const by_role = {};
+  // 4.2 — per-INSTANCE spend, so `shepherd#4` and `shepherd#5` are separable in the run report.
+  const by_instance = {};
   const total = zeroTokens();
   let reports = 0;
   let cost = 0;
@@ -5709,8 +5772,17 @@ export function aggregateTokenUsage(events = []) {
   const unpricedModels = new Set();
   for (const e of counted) {
     reports += 1;
-    const role = e.role ?? (String(e.actor ?? "").startsWith("lead") ? "lead" : e.actor || "unknown");
+    // 4.2 — an actor may name its INSTANCE (`shepherd#4`). Bucket by role as before so every existing
+    // reader is unchanged, and additionally by instance, so a run's five shepherds stop collapsing into
+    // one row. `by_instance` keys role-only actors as themselves rather than guessing `#1`: crediting an
+    // unidentifiable shepherd to the first one is exactly the misattribution this item exists to stop.
+    const rawActor = String(e.actor ?? "");
+    const parsed = parseActorInstance(rawActor);
+    const role = e.role ?? (rawActor.startsWith("lead") ? "lead" : parsed.role || rawActor || "unknown");
+    const instanceKey = parsed.instance != null ? rawActor : (e.instance ?? role);
     if (!by_role[role]) by_role[role] = { by_model: {}, total: zeroTokens() };
+    if (!by_instance[instanceKey]) by_instance[instanceKey] = { role, instance: parsed.instance ?? null, total: zeroTokens() };
+    addTokens(by_instance[instanceKey].total, Object.values(e.by_model).reduce((acc, u) => { addTokens(acc, u); return acc; }, zeroTokens()));
     for (const [m, u] of Object.entries(e.by_model)) {
       if (!by_model[m]) by_model[m] = zeroTokens();
       if (!by_role[role].by_model[m]) by_role[role].by_model[m] = zeroTokens();
@@ -5737,6 +5809,7 @@ export function aggregateTokenUsage(events = []) {
     total_tokens: sumTokens(total),
     by_model,
     by_role,
+    by_instance,
     // The PRICED subset — never null now, so a partially-unpriced run still reports the spend it can
     // account for. Read it together with cost_is_partial/unpriced_* below; alone it is a FLOOR.
     cost_usd_estimate: Math.round(cost * 10000) / 10000,
@@ -5748,13 +5821,37 @@ export function aggregateTokenUsage(events = []) {
 }
 
 // Markdown table for the end-of-run report: totals, by model, and role × model distribution.
-export function renderUsageMd(agg, { runId } = {}) {
+// 5.3 — a total must declare its FLOORS.
+//
+// `usage` already flagged unpriced spend (cost). It did not flag STRUCTURAL gaps — reports that were
+// never folded at all — and those move the TOKEN total, not just the dollar one. Two measured on
+// 2026-07-31: cloud reports before ~18:15Z were silently refused by the `trustedCommentAuthors`
+// deny-list, and a host whose ledger could not be pulled contributes nothing while reading as zero.
+//
+// The distinction that matters: a missing report makes the total a LOWER BOUND, and a lower bound
+// presented as a total is how a run gets compared against a baseline it never actually beat.
+export function usageFloorNotes({ droppedReports = 0, undrainedHosts = [], droppedAuthors = [] } = {}) {
+  const notes = [];
+  if (droppedReports > 0) {
+    notes.push(`${droppedReports} report(s) were REFUSED at ingestion${droppedAuthors.length ? ` (untrusted comment author: ${droppedAuthors.join(", ")})` : ""} — ` +
+      "their tokens are in NOBODY's total. Add the author to `repo.trustedCommentAuthors` and re-run `reconcile-pr-events`.");
+  }
+  if (undrainedHosts.length) {
+    notes.push(`${undrainedHosts.length} host ledger(s) could NOT be drained (${undrainedHosts.join(", ")}) — ` +
+      "every lead that ran there contributes ZERO here, which is indistinguishable from a lead that spent nothing. Run `pull-host --run <r> --host <h>` and re-read.");
+  }
+  return notes;
+}
+
+export function renderUsageMd(agg, { runId, droppedReports = 0, undrainedHosts = [], droppedAuthors = [] } = {}) {
   const fmt = (n) => n.toLocaleString("en-US");
+  const floors = usageFloorNotes({ droppedReports, undrainedHosts, droppedAuthors });
   const L = [
     `# Token usage — ${runId ?? "run"}`,
     ``,
     `- **Usage reports folded:** ${agg.reports}${agg.reports === 0 ? " _(no token_usage events — check that leads/shepherd emitted at end-of-session)_" : ""}`,
-    `- **Total tokens:** ${fmt(agg.total_tokens)}  (input ${fmt(agg.total.input)} · output ${fmt(agg.total.output)} · cache-write ${fmt(agg.total.cache_creation)} · cache-read ${fmt(agg.total.cache_read)})`,
+    `- **${floors.length ? `TOTAL (FLOOR — ${droppedReports + undrainedHosts.length} report source(s) known missing)` : "Total tokens"}:** ${fmt(agg.total_tokens)}  (input ${fmt(agg.total.input)} · output ${fmt(agg.total.output)} · cache-write ${fmt(agg.total.cache_creation)} · cache-read ${fmt(agg.total.cache_read)})`,
+    ...floors.map((n) => `  - ⚠ ${n}`),
     `- **Est. cost:** ${agg.cost_usd_estimate != null ? `$${agg.cost_usd_estimate.toFixed(2)}` : "n/a"}${agg.cost_is_partial ? ` — **FLOOR ONLY**` : ""} _(price-table estimate — never billing truth)_`,
     ...(agg.cost_is_partial
       ? [`- **Unpriced spend:** ${fmt(agg.unpriced_tokens)} tokens across ${agg.unpriced_reports} report(s) carry NO cost — models: ${agg.unpriced_models.join(", ") || "unknown"}. The figure above EXCLUDES them. Add rates to \`.claude/work.config.json\` \`modelPrices\` (USD per million), and check the provider's own billing dashboard for truth.`]
@@ -7361,6 +7458,122 @@ export async function measureHarnessDrift(dest) {
   return harnessDriftVerdict({ manifest, digests });
 }
 
+// ── 2.7 — staleness of queued work is unchecked, and the NAIVE check is blind ──────────────────
+// DER-2594 sat `Todo` for ~21h having been fixed weeks earlier (landed in #1082 / b635d0275). Worse:
+// its parked branch was BEHIND main, so merging it would have REMOVED a `credentials` join and reopened
+// the exact security drift it was filed to close. Only an empty cherry-pick caught it.
+//
+// And the obvious check is itself blind. DER-2814 matches `preflight` EIGHT TIMES in `onboarding.ts` —
+// every hit the unrelated body-size budget (`preflightCap`). `grep -c` reads ALREADY DONE. A symbol's
+// PRESENCE is not the feature's presence, so the check must report WHERE a symbol landed (commit,
+// subject, date) and leave the reading to a human, rather than collapsing it to a count.
+export function stalenessCommand(symbol, { since = null } = {}) {
+  // -S is the pickaxe: commits that CHANGED the number of occurrences, i.e. where it was introduced or
+  // removed — not every commit that happens to touch a line containing it (that is -G, which is noisier
+  // and would re-introduce the same false-positive problem in a different shape).
+  return ["log", "-S", symbol, "--oneline", "--date=short", "--pretty=format:%h %ad %s", ...(since ? [`${since}..HEAD`] : []), "--", "."];
+}
+
+export function stalenessVerdict({ symbol, hits = [] } = {}) {
+  if (!hits.length) {
+    return { symbol, state: "not-found", stale: false, note: "no commit on main ever added or removed this symbol — the work looks genuinely undone (or the symbol name is wrong; a typo'd symbol also finds nothing)" };
+  }
+  return {
+    symbol,
+    state: "landed",
+    stale: true,
+    hits,
+    // Deliberately does NOT say "already done". That was the DER-2814 failure: a count read as done when
+    // all eight hits were an unrelated identifier.
+    note: `this symbol was ADDED OR REMOVED by ${hits.length} commit(s) on main — READ THE CALL SITE before dispatching. ` +
+      "A symbol's presence is not the feature's presence (DER-2814 matched `preflight` 8x, every hit an unrelated " +
+      "body-size budget). If the work HAS landed, also check whether any parked branch is BEHIND main: DER-2594's " +
+      "branch would have REVERTED the fix it was filed to make.",
+  };
+}
+
+// ── 4.1 — `rotate-shepherd` (shepherd #4's top ask) ────────────────────────────────────────────
+// Leads have `handoffs/<ID>.rot<n>.md` and a `rotate-lead` that checkpoints, renders a successor brief,
+// respawns and verifies. THE SHEPHERD HAD NO EQUIVALENT, and `spawn-shepherd` has no handoff step at
+// all — so a successor re-derived state from the ledger + `gh` and SILENTLY LOST every belief that had
+// not yet become an event. At the 19:48Z rotation on 2026-07-31 shepherd #4 lost partially-written
+// #1183 gate-swap findings and an unrecorded review-debt fold decision, and nothing anywhere said so.
+//
+// The re-derive-don't-remember discipline is right and stays: the successor's per-PR beliefs still come
+// from `gh` + the ledger. What it never covered is IN-FLIGHT REASONING — an analysis half-finished, a
+// decision made but not yet recorded. That is exactly what a handoff is for.
+export function renderShepherdRotationBrief({ runId, instance, notes = null, openPrs = [], pending = {}, waiver = null } = {}) {
+  const lines = [];
+  lines.push(`# Shepherd rotation brief — run ${runId} → ${instance}`);
+  lines.push("");
+  lines.push("You are the INCOMING shepherd. Your predecessor stood down; this brief is the only record of");
+  lines.push("what it had not yet turned into a ledger event.");
+  lines.push("");
+  lines.push("**Re-derive everything else.** Per-PR state comes from `gh` + the ledger on every wake, never");
+  lines.push("from this file. What is below is in-flight REASONING, which the ledger cannot hold.");
+  lines.push("");
+  lines.push("## Predecessor's checkpoint");
+  lines.push("");
+  if (notes && String(notes).trim()) {
+    lines.push(String(notes).trim());
+  } else {
+    // Say it loudly rather than rendering an empty section that reads like "nothing was in flight".
+    lines.push("⚠ **NO CHECKPOINT NOTES WERE WRITTEN.** `tmp/work/<run-id>/shepherd-notes.md` was absent or empty.");
+    lines.push("");
+    lines.push("Treat every in-flight belief as LOST, not as absent: your predecessor may have had a");
+    lines.push("half-finished analysis or an unrecorded decision, and you cannot tell which. Re-derive each");
+    lines.push("open PR from scratch and re-check anything that looks half-done (a composed-but-unsent");
+    lines.push("kickback, an unresolved thread with no reason recorded, a gate with no review_findings).");
+  }
+  lines.push("");
+  lines.push("## Open PRs at rotation (re-verify each with `gh`, do not trust this list)");
+  lines.push("");
+  lines.push(openPrs.length ? openPrs.map((p) => `- ${p.issue} — PR #${p.pr} (${p.status})`).join("\n") : "- none recorded");
+  lines.push("");
+  if (waiver?.active) {
+    lines.push("## ⚠ codex gate is WAIVED");
+    lines.push("");
+    lines.push(`Until ${waiver.until} — ${waiver.reason}`);
+    lines.push("");
+    lines.push("`ready` will NOT hold on `codex not on head`. It STILL blocks any PR with no review_findings");
+    lines.push("covering its head: record substitute reviews with `review-swap` (3 distinct lenses). See the");
+    lines.push("posture-C section of your SKILL.");
+    lines.push("");
+  }
+  const pendingLines = Object.entries(pending)
+    .filter(([, v]) => Array.isArray(v) ? v.length : Boolean(v))
+    .map(([k, v]) => `- **${k}**: ${Array.isArray(v) ? v.join(", ") : v}`);
+  if (pendingLines.length) {
+    lines.push("## Unactioned at rotation — act on these BEFORE new work");
+    lines.push("");
+    lines.push(...pendingLines);
+    lines.push("");
+  }
+  return lines.join("\n");
+}
+
+// ── 4.2 — attribution must survive rotation ────────────────────────────────────────────────────
+// Shepherd #5 had to correct the record: the 3-lens gate and the repro-vs-security disagreement on
+// #1183 were shepherd #4's work — #1183 merged at 19:42Z, six minutes before #5 booted — and the
+// misattribution had already propagated into a run report and a learnings entry.
+//
+// Events were stamped with a ROLE (`actor: "orch"`, `actor: "shepherd"`), so every shepherd across a
+// run collapsed into one bucket and `work-metrics`' `by_role` fold could not tell them apart even in
+// principle. The instance number is derived from how many of that role have already been spawned into
+// THIS ledger, so it needs no coordination and is stable on replay.
+export function actorInstance(role, priorSpawns = 0) {
+  return `${role}#${Number(priorSpawns) + 1}`;
+}
+
+// Split `shepherd#4` back into its parts. Role-only actors (every pre-4.2 event, and `lead:DER-1`)
+// return instance null — UNKNOWN, never silently folded into #1, because "the first shepherd" and "a
+// shepherd we cannot identify" are different claims and only one of them can be credited.
+export function parseActorInstance(actor) {
+  const m = /^([a-z-]+)#(\d+)$/i.exec(String(actor ?? "").trim());
+  if (!m) return { role: String(actor ?? "").trim() || null, instance: null };
+  return { role: m[1], instance: Number(m[2]) };
+}
+
 // ── 6.3 — memory/swap guard, MECHANICAL rather than remembered ─────────────────────────────────
 // Local swap hit 7,257 MB / 8,192 MB (88.6%) on 2026-07-31 — the documented freeze zone that once
 // pinned an orchestrator and a shepherd at 0% CPU for ~40 minutes. That dispatch was declined only
@@ -8114,9 +8327,123 @@ export async function runSubcommand(argv) {
         const outcome = spawnOutcome(res);
         if (!outcome.ok) await refuseUnprovenSpawn({ runDir, role: "shepherd", label: "spawn-shepherd", outcome });
         ref = outcome.ref;
-        await appendEvent(runDir, { actor: "orch", type: "shepherd_spawned", workspace_ref: ref, transcripts_forced: launchForcesTranscripts(launch) });
+        // 4.2 — name WHICH shepherd this is. Counted from the ledger, so it needs no coordination
+        // between the outgoing and incoming instance and stays stable on replay.
+        const priorShepherds = (await readEvents(runDir)).filter((e) => e?.type === "shepherd_spawned").length;
+        await appendEvent(runDir, {
+          actor: "orch", type: "shepherd_spawned", workspace_ref: ref,
+          instance: actorInstance("shepherd", priorShepherds),
+          transcripts_forced: launchForcesTranscripts(launch),
+        });
       }
       return { stdout: line, workspace_ref: ref, dryRun: !!o.dryRun };
+    }
+    case "staleness-check": {
+      // 2.7 — run at DISPATCH time, per queued unit, against current main.
+      if (!runDir) throw new Error("staleness-check needs --run <id>");
+      const st = materializeState(await readEvents(runDir), { run_id: o.runId });
+      const repoRootSC = o.repoRoot ?? process.cwd();
+      // Symbols come from --symbol (repeatable, reusing --lens's accumulate shape is wrong here, so its
+      // own flag) or from each queued unit's recorded fileScope basenames as a weak fallback.
+      const queued = o.issueId ? [o.issueId] : (st.queue ?? []);
+      if (!queued.length) return { stdout: "staleness-check: nothing queued — no unit to check." };
+      const out = [];
+      const results = [];
+      for (const id of queued) {
+        const symbols = (o.symbol ?? []).length ? o.symbol : [id];
+        out.push(`${id}:`);
+        for (const sym of symbols) {
+          const res = await runCommand({ command: "git", args: stalenessCommand(sym), cwd: repoRootSC, timeoutMs: 30000 }).catch(() => ({ exitCode: 1, stdout: "" }));
+          if (res.exitCode !== 0) {
+            // UNKNOWN, not clean. A git that could not answer must never read as "no prior work".
+            out.push(`  ⚠️  ${sym} — UNKNOWN: git log -S failed. This is NOT evidence the work is undone.`);
+            results.push({ issue: id, symbol: sym, state: "unknown" });
+            continue;
+          }
+          const hits = String(res.stdout ?? "").trim().split("\n").filter(Boolean).slice(0, 10);
+          const v = stalenessVerdict({ symbol: sym, hits });
+          results.push({ issue: id, ...v });
+          out.push(`  ${v.stale ? "🔴" : "✅"} ${sym} — ${v.note}`);
+          for (const h of hits) out.push(`      ${h}`);
+        }
+      }
+      const stale = results.filter((r) => r.stale);
+      out.push("", stale.length
+        ? `⚠ ${stale.length} symbol(s) already landed on main. Read the call site / action list before dispatching — a symbol's presence is not the feature's presence.`
+        : "no queued symbol has landed on main.");
+      return { results, stdout: out.join("\n") };
+    }
+    case "rotate-shepherd": {
+      // 4.1 — checkpoint → render successor brief → spawn (which VERIFIES) → confirm the event landed.
+      // Mirrors rotate-lead. Without it, `spawn-shepherd` alone silently drops in-flight reasoning.
+      assertNotRoot("rotate the shepherd");
+      if (!runDir) throw new Error("rotate-shepherd needs --run <id>");
+      const events = await readEvents(runDir);
+      const st = materializeState(events, { run_id: o.runId });
+      const priorShepherds = events.filter((e) => e?.type === "shepherd_spawned").length;
+      const instance = actorInstance("shepherd", priorShepherds);
+
+      // 1. Checkpoint. The notes file is the shepherd's own convention; read it rather than requiring
+      // the outgoing instance to pass its state through argv (it is usually mid-turn when it rotates).
+      const notesPath = join(runDir, "shepherd-notes.md");
+      let notes = null;
+      try { notes = await readFile(notesPath, "utf8"); } catch { /* absent — the brief says so LOUDLY */ }
+
+      // 2. Render the successor brief. Written to disk BEFORE the spawn, so a spawn that fails still
+      // leaves the handoff on record — the predecessor is already standing down either way.
+      const openPrs = Object.entries(st.issues)
+        .filter(([, v]) => v.pr != null && ACTIVE_STATUSES.has(v.status))
+        .map(([issue, v]) => ({ issue, pr: v.pr, status: v.status }));
+      const brief = renderShepherdRotationBrief({
+        runId: o.runId, instance, notes, openPrs,
+        waiver: st.codex_waiver,
+        pending: {
+          kickbacks_pending: st.kickbacks_pending ?? [],
+          gate_missing: (st.gate_missing ?? []).map((g) => `${g.issue} (PR #${g.pr})`),
+          gate_blocked: (st.gate_blocked ?? []).map((g) => `${g.issue} (PR #${g.pr}, blockers ${g.blockers})`),
+          reap_failures: (st.reap_failures ?? []).filter((f) => !f.retracted).map((f) => f.label),
+        },
+      });
+      const briefPath = join(runDir, "briefs", `shepherd.rot${priorShepherds}.md`);
+      if (!o.dryRun) {
+        await mkdir(dirname(briefPath), { recursive: true });
+        await writeFile(briefPath, brief, "utf8");
+        await appendEvent(runDir, {
+          actor: "orch", type: "shepherd_rotated", instance, brief: briefPath,
+          notes_present: Boolean(notes && notes.trim()),
+          open_prs: openPrs.length, ts: new Date().toISOString(),
+        });
+      }
+
+      // 3. Spawn — reusing spawn-shepherd so the DER-2739 unproven-spawn refusal applies unchanged. A
+      // rotation that recorded a phantom successor would leave the run with NO shepherd and a ledger
+      // saying it has one, which is strictly worse than not rotating.
+      const spawned = await runSubcommand([
+        "spawn-shepherd", "--run", o.runId, "--runs-root", runsRoot,
+        ...(o.repoRoot ? ["--repo-root", o.repoRoot] : []),
+        ...(o.project ? ["--project", o.project] : []),
+        ...(o.model ? ["--model", o.model] : []),
+        ...(o.dryRun ? ["--dry-run"] : []),
+      ]);
+
+      // 4. Verify the event actually landed, rather than trusting step 3's return.
+      let confirmed = o.dryRun;
+      if (!o.dryRun) {
+        confirmed = (await readEvents(runDir)).filter((e) => e?.type === "shepherd_spawned").length > priorShepherds;
+        if (!confirmed) {
+          throw new Error(`rotate-shepherd: spawn-shepherd returned but NO new shepherd_spawned event is in the ledger — ` +
+            `the run may now have no shepherd. The successor brief IS written (${briefPath}); re-run spawn-shepherd and check cmux.`);
+        }
+      }
+      return {
+        instance, brief: briefPath, confirmed,
+        stdout: [
+          `rotate-shepherd → ${instance}${o.dryRun ? " [dry-run]" : ""}`,
+          `  brief: ${briefPath}${notes && notes.trim() ? "" : "   ⚠ NO checkpoint notes were found — the brief tells the successor to treat in-flight beliefs as LOST"}`,
+          `  carried: ${openPrs.length} open PR(s)`,
+          `  ${spawned.stdout ?? ""}`.trimEnd(),
+        ].join("\n"),
+      };
     }
     case "spawn-orch": {
       assertNotRoot("spawn a successor orchestrator");
@@ -8356,7 +8683,18 @@ export async function runSubcommand(argv) {
       }
       const events = await readEvents(runDir);
       const agg = aggregateTokenUsage(events);
-      const md = renderUsageMd(agg, { runId: o.runId });
+      // 5.3 — derive the STRUCTURAL gaps from the ledger itself, so the floor is measured rather than
+      // remembered. `comment_rejected` is what reconcile-pr-events appends when an untrusted author's
+      // report is refused; `pull_failed` (latched, cleared by the next good pull) names a host whose
+      // leads are contributing zero because nothing could be read, not because they spent nothing.
+      const st = materializeState(events, { run_id: o.runId });
+      const rejected = events.filter((e) => e?.type === "comment_rejected" || e?.type === "report_rejected");
+      const md = renderUsageMd(agg, {
+        runId: o.runId,
+        droppedReports: rejected.length,
+        droppedAuthors: [...new Set(rejected.map((e) => e.author).filter(Boolean))],
+        undrainedHosts: (st.pull_failed ?? []).map((p) => (typeof p === "string" ? p : p.host)).filter(Boolean),
+      });
       await writeFile(join(runDir, "usage.json"), `${JSON.stringify(agg, null, 2)}\n`, "utf8");
       await writeFile(join(runDir, "usage.md"), md, "utf8");
       return { stdout: md, aggregate: agg };
@@ -9532,6 +9870,10 @@ export async function runSubcommand(argv) {
               // 1.3 — every wake carries the waiver, so a successor orchestrator learns it from the
               // ledger instead of from a predecessor remembering to mention it. An EXPIRED waiver is
               // surfaced too: "it ran out" and "there never was one" oblige different actions.
+              // 3.1 — surfaced every wake so an unread ruling cannot sit unnoticed.
+              unacked_messages: (st.unacked_messages ?? []).map((m) => `${m.ref}${m.stale ? " (STALE)" : ""}`),
+              // 3.2 — a sibling's freshest analysis, so two agents stop re-deriving the same answer.
+              recent_notes: st.recent_notes ?? {},
               codex_waiver: st.codex_waiver?.active
                 ? { until: st.codex_waiver.until, reason: st.codex_waiver.reason }
                 : (st.codex_waiver?.expired ? { expired: true, until: st.codex_waiver.until } : null),
@@ -9766,6 +10108,18 @@ Design: the README's context-rotation section.
                                               construction). IT DOES NOT WAIVE EVIDENCE: 'ready' still blocks any
                                               PR with no review_findings covering its head — it converts
                                               "must be codex" into "must be SOME recorded adversarial review".
+  rotate-shepherd --run <r> [--model m]       respawn the shepherd WITH a handoff (4.1). Checkpoints
+                                              shepherd-notes.md, renders briefs/shepherd.rot<n>.md, spawns
+                                              via spawn-shepherd (so the unproven-spawn refusal applies),
+                                              then VERIFIES a new shepherd_spawned landed. spawn-shepherd
+                                              alone silently loses in-flight reasoning.
+  staleness-check --run <r> [--issue ID] [--symbol S ...]
+                                              at dispatch time, 'git log -S<symbol>' each queued unit's
+                                              symbols against current main and print WHERE each landed
+                                              (commit + subject + date) -- never a count. A symbol's
+                                              presence is NOT the feature's presence: DER-2814 matched
+                                              'preflight' 8x on an unrelated body-size budget and read
+                                              ALREADY DONE, while DER-2594 sat Todo ~21h already fixed.
   nudge --run <r>                             wake a blocking watch immediately (freed slot / operator change)
 
 Multi-host: create-worktree/spawn-lead/reap accept --host <local|mini|cloud>; hosts are configured in
