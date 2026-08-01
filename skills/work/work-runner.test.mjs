@@ -10051,6 +10051,21 @@ test("DER-3019: preflight's codex-probe leg BINDS to classifyCodexProbe — the 
   assert.equal(v.ok, false);
 });
 
+test("DER-3008: preflight never re-enters runSubcommand in-process — a smoke leg's --repo-root must not clobber the loaded config", async () => {
+  // The watch-prints smoke legs once called runSubcommand([...]) in-process with --repo-root <tempdir>;
+  // runSubcommand re-runs applyRepoConfig, so the module-global host config was replaced mid-preflight
+  // and every later cross-host leg saw an unconfigured repo — from the CORRECT working directory. That
+  // is the mechanism behind the original "no :mini lines from a ROST-repo run" observation. The legs
+  // now spawn child processes (matching the kill leg). Source pin, same style as the binding tests.
+  const src = await readFile(new URL("./work-runner.mjs", import.meta.url), "utf8");
+  const start = src.indexOf('case "preflight": {');
+  const end = src.indexOf("PREFLIGHT RED", start);
+  assert.ok(start > 0 && end > start, "control: the preflight case and its summary must be located");
+  const preflight = src.slice(start, end);
+  assert.doesNotMatch(preflight, /await runSubcommand\(/,
+    "an in-process runSubcommand inside preflight re-applies the config from the callee's --repo-root and clobbers the host set for every later leg");
+});
+
 test("DER-3008: getConfigSource records WHICH work.config.json answered, and whether it parsed", async () => {
   // The fact that would have made the missing `:mini` lines self-explaining in one read: preflight can
   // now print the resolved path instead of silently keeping the built-in defaults.

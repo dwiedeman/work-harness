@@ -11599,12 +11599,25 @@ export async function runSubcommand(argv) {
             `${JSON.stringify({ ts: "2026-01-01T00:00:00.000Z", actor: "orch", type: "run_started", run_id: "SMOKE", event_id: "0".repeat(39) + "1", source_id: "preflight:0:0", seq: 1, schema_version: 1 })}\n`, "utf8");
           const base = ["watch", "--run", "SMOKE", "--runs-root", join(dir, "runs"), "--repo-root", dir, "--nudge-since", "0"];
           const parse = (s) => { try { return JSON.parse(String(s ?? "").trim().split("\n").pop()); } catch { return null; } };
+          // CHILD processes, never an in-process runSubcommand: runSubcommand re-runs applyRepoConfig
+          // with THIS smoke leg's --repo-root (a temp dir), clobbering the module-global host config
+          // for every leg that follows — which is how a preflight run from the correct repo still
+          // reported "config did NOT load" and skipped every cross-host check. The kill leg below
+          // always spawned; these two now match it.
+          const runWatchChild = (args) => new Promise((res) => {
+            const ch = spawn(process.execPath, [join(skillsDir, "work-runner.mjs"), ...args], { cwd: dir, stdio: ["ignore", "pipe", "ignore"] });
+            let buf = "";
+            ch.stdout.on("data", (d) => { buf += d; });
+            const t = setTimeout(() => ch.kill("SIGKILL"), 45000);
+            ch.on("exit", () => { clearTimeout(t); res(buf); });
+            ch.on("error", () => { clearTimeout(t); res(""); });
+          });
 
-          const ev = parse((await runSubcommand([...base, "--since", "0", "--timeout", "30"])).stdout);
+          const ev = parse(await runWatchChild([...base, "--since", "0", "--timeout", "30"]));
           add("watch-prints:event", ev?.wake === "event", ev?.wake === "event" ? "--since 0 → event record immediately" : `--since 0 returned ${JSON.stringify(ev)} — expected wake:"event"`);
 
           const t0 = Date.now();
-          const to = parse((await runSubcommand([...base, "--since", "99", "--timeout", "1"])).stdout);
+          const to = parse(await runWatchChild([...base, "--since", "99", "--timeout", "1"]));
           add("watch-prints:timeout", to?.wake === "timeout", to?.wake === "timeout" ? `--timeout 1 → timeout record at ${Math.round((Date.now() - t0) / 100) / 10}s` : `--timeout 1 returned ${JSON.stringify(to)} — expected wake:"timeout"`);
 
           // The kill leg. A watch that dies silently is indistinguishable from a quiet wake, which is

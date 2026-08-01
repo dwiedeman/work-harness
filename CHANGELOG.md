@@ -15,6 +15,19 @@ run materially different harness code against **one shared ledger** with no way 
 gate itself gained the missing half below — attesting the *acting* process's own version, not only
 versions already recorded in the ledger — in DER-2779.
 
+## [0.5.1] — 2026-08-01
+
+### Fixed
+
+- **DER-3008 (the actual root cause) — preflight was clobbering its own host config.** The two
+  watch-prints smoke legs called `runSubcommand([...])` **in-process** with `--repo-root <tempdir>`;
+  `runSubcommand` re-runs `applyRepoConfig`, so from that leg onward the module-global host set was
+  the temp dir's built-in `{local:{cap:2}}` — which is why a preflight run from the CORRECT repo
+  still printed no `:mini` line (0.4.0, silently) and "config did NOT load" (0.5.0, loudly — the
+  DER-3008 visibility fix is what exposed this). Both legs now spawn child processes, exactly like
+  the kill leg beside them always did; a source pin refuses any in-process `runSubcommand` inside
+  the preflight case (mutation-proven).
+
 ## [0.5.0] — 2026-08-01
 
 **`codex exec` returns as the DEFAULT gate of the first complete diff; the Claude panel becomes the
