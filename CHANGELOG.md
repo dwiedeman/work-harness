@@ -15,6 +15,23 @@ run materially different harness code against **one shared ledger** with no way 
 gate itself gained the missing half below — attesting the *acting* process's own version, not only
 versions already recorded in the ledger — in DER-2779.
 
+## [0.5.2] — 2026-08-10
+
+### Fixed
+
+- **`write-brief` refuses a plan-budgeted unit with no `--acceptance`.** Leads cannot read Linear
+  (Claude headless leads have no Linear MCP; only the Codex CLI does), yet a brief written without
+  `--acceptance` rendered the literal fallback "(see the Linear issue)" — a pointer the lead cannot
+  follow, observed as leads reporting "no Linear access" on the 2026-08-09 run. A unit with a
+  plan-assigned budget now refuses to brief until the orchestrator inlines the full groomed scope;
+  kickback re-briefs stay exempt (their scope is the findings dossier plus the original brief on disk).
+- **prep-for-work: plan-review output schema made codex-strict-mode valid.** Codex began enforcing
+  strict output schemas server-side (~2026-08-10): `required` must list EVERY key in `properties` at
+  every nesting level, or the request 400s (`invalid_json_schema`) before the model runs — under
+  `codex exec` that reads as `turn.failed`, killing the mandatory plan-review gate at startup (7/7
+  reviews died identically). `PLAN_REVIEW_SCHEMA` now lists all keys as required and expresses
+  optionality as nullable types (`evidence`, `size_challenge`).
+
 ## [0.5.1] — 2026-08-01
 
 ### Fixed

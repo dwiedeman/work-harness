@@ -532,10 +532,17 @@ test("applyPlanReview: watch-outs land in `notes`, which is the field the brief 
 });
 
 test("PLAN_REVIEW_SCHEMA: forces a verdict and watch-outs, and forbids free-form extras", () => {
-  assert.deepEqual(PLAN_REVIEW_SCHEMA.required, ["verdict", "watch_outs"]);
+  // Codex strict mode (server-enforced ~2026-08-10) demands `required` list EVERY key in `properties`
+  // at every level — a shorter list is a 400 (invalid_json_schema) before the model runs, which killed
+  // the mandatory plan-review gate at startup, 7/7. Optionality is expressed as nullable types.
+  assert.deepEqual(PLAN_REVIEW_SCHEMA.required, Object.keys(PLAN_REVIEW_SCHEMA.properties));
   assert.equal(PLAN_REVIEW_SCHEMA.additionalProperties, false);
   assert.deepEqual(PLAN_REVIEW_SCHEMA.properties.verdict.enum, ["plan is sound", "plan has gaps", "plan is wrong"]);
-  assert.deepEqual(PLAN_REVIEW_SCHEMA.properties.watch_outs.items.required, ["class", "instruction"]);
+  const items = PLAN_REVIEW_SCHEMA.properties.watch_outs.items;
+  assert.deepEqual(items.required, Object.keys(items.properties));
+  // The two optional-by-meaning fields are nullable, never absent — that is the strict-mode contract.
+  assert.deepEqual(items.properties.evidence.type, ["string", "null"]);
+  assert.deepEqual(PLAN_REVIEW_SCHEMA.properties.size_challenge.type, ["string", "null"]);
 });
 
 test("calibrate: a measurement cannot CONFIRM ITSELF — the two-run rule is enforced, not just stated", () => {

@@ -9615,6 +9615,14 @@ export async function runSubcommand(argv) {
       // DER-2749: refuse rather than quietly drop the line. A cloud brief is the only instruction the lead
       // gets, so a misconfigured identity has to surface here, where it is actionable.
       if (isCloud && getCommitAuthorError()) throw new Error(`write-brief --cloud: ${getCommitAuthorError()}`);
+      // 2026-08-10: a planned unit briefed without --acceptance renders "(see the Linear issue)" — a
+      // pointer the lead CANNOT follow (Claude headless leads have no Linear MCP; only the Codex CLI
+      // does). The groomed scope lives in the Linear description; the ORCHESTRATOR has Linear access
+      // and must inline it here. Refuse rather than hand a lead an unreadable pointer. Kickback
+      // re-briefs are exempt: their scope is the findings dossier plus the original brief on disk.
+      if (!o.kickback && assignedBudget && !String(o.acceptance ?? "").trim()) {
+        throw new Error(`write-brief ${o.issueId}: unit has a plan-assigned budget but no --acceptance. Leads cannot read Linear — inline the FULL groomed scope (the issue description incl. watch-outs), e.g. --acceptance "$(cat tmp/work/plans/<wave>-scope/${o.issueId}.md)". The "(see the Linear issue)" fallback is exactly the reliance this refuses.`);
+      }
       const brief = isCloud
         ? renderCloudBrief({
             issueId: o.issueId, title: o.title, branch: o.branch, runId: o.runId,

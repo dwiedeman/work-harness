@@ -759,10 +759,14 @@ const round2 = (n) => Math.round(n * 100) / 100;
 //   (b) the prompt must MANDATE searching — grep the real call sites and enumerate the family;
 //   (c) run it in a checkout with `node_modules` present, or it goes blind;
 //   (d) it obeys `## Code Review Rules` in AGENTS.md, so the repo's own corpus steers it for free.
+// Codex strict output schemas (enforced server-side since ~2026-08-10) demand that `required` list
+// EVERY key in `properties`, at every nesting level — a violation is a 400 before the model runs
+// (invalid_json_schema), which under `codex exec` reads as turn.failed, not a review. Optionality is
+// expressed as a nullable type instead of an absent key.
 export const PLAN_REVIEW_SCHEMA = {
   type: "object",
   additionalProperties: false,
-  required: ["verdict", "watch_outs"],
+  required: ["verdict", "watch_outs", "missing_from_plan", "size_challenge"],
   properties: {
     verdict: { type: "string", enum: ["plan is sound", "plan has gaps", "plan is wrong"] },
     watch_outs: {
@@ -770,17 +774,17 @@ export const PLAN_REVIEW_SCHEMA = {
       items: {
         type: "object",
         additionalProperties: false,
-        required: ["class", "instruction"],
+        required: ["class", "instruction", "severity", "evidence"],
         properties: {
           class: { type: "string", description: "the review-rule defect class this plan shape invites" },
           instruction: { type: "string", description: "a concrete instruction for THIS issue, phrased as an AC" },
           severity: { type: "string", enum: ["blocker", "major", "minor"] },
-          evidence: { type: "string", description: "the file:line or call site that grounds it" },
+          evidence: { type: ["string", "null"], description: "the file:line or call site that grounds it; null when none" },
         },
       },
     },
     missing_from_plan: { type: "array", items: { type: "string" } },
-    size_challenge: { type: "string", description: "why the assigned budget is or is not achievable" },
+    size_challenge: { type: ["string", "null"], description: "null when the assigned budget is achievable; otherwise why it is not" },
   },
 };
 
