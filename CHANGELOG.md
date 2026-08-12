@@ -15,6 +15,16 @@ run materially different harness code against **one shared ledger** with no way 
 gate itself gained the missing half below — attesting the *acting* process's own version, not only
 versions already recorded in the ledger — in DER-2779.
 
+## [0.6.1] — 2026-08-12
+
+### Fixed — `run-gate.sh` scratch is no longer a fixed absolute path
+
+`WORK_GATE_SCRATCH` overrides the default `/tmp/rost-gate-pr<N>r<R>`. Two gates on the same pr+round (a
+re-run, or a shepherd and an orchestrator racing) shared one directory, and the second `rm -rf` deleted
+the first's evidence mid-flight. It also made the script untestable in parallel — which is exactly how
+0.6.0's first CI run failed: green in the runner-suite step, red inside the installer smoke, where
+several installs run the same suite against that one path.
+
 ## [0.6.0] — 2026-08-12
 
 **The pre-PR gate is now `codex exec` alone, and the launcher exists as a file.** Both changes come out

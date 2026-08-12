@@ -69,9 +69,18 @@ async function scenario(opts = {}) {
     encoding: "utf8",
     // MEMGATE off: its default is a 15-minute block PER LENS on a memory-starved box, which made the
     // first version of this file hang for 45 minutes without emitting one assertion.
-    env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, WORK_CODEX_BIN: "", WORK_GATE_MEMGATE_TRIES: "0" },
+    env: {
+      ...process.env,
+      PATH: `${bin}:${process.env.PATH}`,
+      WORK_CODEX_BIN: "",
+      WORK_GATE_MEMGATE_TRIES: "0",
+      // Per-scenario scratch. The first CI run of this file failed only inside the installer smoke,
+      // where several installs run the same suite against one fixed /tmp path — a collision the
+      // script now makes impossible rather than one the test tiptoes around.
+      WORK_GATE_SCRATCH: join(dir, "gate-scratch"),
+    },
   });
-  const D = "/tmp/rost-gate-pr1293r1";
+  const D = join(dir, "gate-scratch");
   let verdict = null;
   if (existsSync(join(D, "gate-verdict.json"))) {
     verdict = JSON.parse(await readFile(join(D, "gate-verdict.json"), "utf8"));

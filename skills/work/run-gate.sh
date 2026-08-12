@@ -79,7 +79,12 @@ esac
 # Per-ROUND scratch, not per-lens. Measured: 15 files matching one lens's own `__zzz_security_*`
 # convention in /tmp belonged to a DIFFERENT PR's lens, resolvable only by reading mtimes. Both failure
 # directions are silent — cite a sibling's artifact as your evidence, or `rm` a live sibling's files.
-D="/tmp/rost-gate-pr${PR}r${ROUND}"
+#
+# WORK_GATE_SCRATCH overrides the location. Two reasons it exists: two gates on the SAME pr+round (a
+# re-run, or a shepherd and an orchestrator racing) would otherwise share one directory and the second
+# `rm -rf` would delete the first's evidence mid-flight; and a fixed absolute path makes the script
+# untestable in parallel, which is how its first CI run failed.
+D="${WORK_GATE_SCRATCH:-/tmp/rost-gate-pr${PR}r${ROUND}}"
 rm -rf "$D"; mkdir -p "$D" || exit 1
 
 # The tree name lies: lens trees were POOLED across PRs, so a review of #1292 ran in `shep-1283-*`.
