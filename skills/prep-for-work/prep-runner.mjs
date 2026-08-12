@@ -170,8 +170,38 @@ export const CORE_UNIT = { files: 2, additions: 300 };
 // reports the ratio alongside its raw number, so the planner sizes with the miss in view rather than
 // discovering it at 3am.
 //
+// ── 2026-08-12: the second run is IN, and it splits the two axes apart ────────────────────────────
+// `calibrate` was finally run against run 20260810T194109Z's five merged PRs (its own output, not a
+// hand summary):
+//
+//   run 20260727T004346Z (n=21): additions 4.79× · files 1.44×
+//   run 20260810T194109Z (n=5):  additions 2.49× · files 1.70×
+//
+// Read those two columns separately, because they say opposite things:
+//
+//   * FILES REPLICATE. 1.44× then 1.70× — the same bias, twice, from independent runs. That meets the
+//     two-run rule, so the file multiplier is APPLIED at 1.57 (their midpoint).
+//   * ADDITIONS DO NOT. 4.79× then 2.49× — a factor of ~2 apart. The tool's own verdict on that pair is
+//     "two runs disagree — do NOT move the table on either; find out what differed first", and that is
+//     respected here: the additions multiplier stays at 1 and the raw ratio is reported instead.
+//
+// 🔴 This CORRECTS a claim that was circulating in the session notes — that file counts "transfer
+// EXACTLY" while only additions drift. They do not: files ran 0.86×/2.29×/1.70×/1.00×/2.80× on the
+// second run. The claim came from PR #1293 (11 files delivered against 12 assigned), which was never
+// merged and so was never in the sample. One un-merged PR is not the run.
+//
+// The useful conclusion is not "files are accurate" but "files are RELIABLY WRONG" — a stable bias is
+// correctable, an unstable one is not, which is why the split arithmetic below is driven by files.
+//
 // Override per-repo with `sizingCalibration` in the plan file, or via CALIBRATION below.
-export const CALIBRATION = { additions: 1, files: 1, n: 0, measured: { additions: 4.79, files: 1.44, n: 21, run: "20260727T004346Z" } };
+export const CALIBRATION = {
+  additions: 1,
+  files: 1.57,
+  n: 2,
+  applied: "2026-08-12",
+  measured: { additions: 4.79, files: 1.44, n: 21, run: "20260727T004346Z" },
+  measuredSecond: { additions: 2.49, files: 1.7, n: 5, run: "20260810T194109Z" },
+};
 
 export function applyCalibration(est, cal = CALIBRATION) {
   const a = Number(cal?.additions) || 1;
@@ -235,7 +265,18 @@ export function sizeIssue(input = {}) {
 
   const overBy = { files: files - budget.files, additions: additions - budget.additions };
   const overBudget = overBy.files > 0 || overBy.additions > 0;
-  const splitInto = Math.max(1, Math.ceil(Math.max(files / budget.files, additions / budget.additions)));
+  // ── Which axis BINDS (2026-08-12) ───────────────────────────────────────────────────────────────
+  // Both axes still gate `overBudget`, but the split ARITHMETIC is driven by files alone. Not because
+  // files are accurate — they are not, they run ~1.5–1.7× over — but because that bias REPLICATES
+  // across runs (1.44×, then 1.70×) while the additions bias does not (4.79×, then 2.49×). A stable
+  // bias can be divided out; an unstable one cannot. Sizing a split from the additions axis divides by
+  // a number the estimator has twice failed to predict, and an over-split plan pays the full per-PR
+  // review overhead N times for one unit of work. `splitBoundBy` is reported so a planner sees which
+  // axis drove the number rather than inferring it.
+  const splitByFiles = files / budget.files;
+  const splitByAdditions = additions / budget.additions;
+  const splitInto = Math.max(1, Math.ceil(splitByFiles));
+  const splitBoundBy = splitByAdditions > splitByFiles ? "files (additions axis is advisory — it is the unreliable one)" : "files";
   return {
     surfaces,
     coreUnits,
@@ -247,6 +288,7 @@ export function sizeIssue(input = {}) {
     overBudget,
     overBy,
     splitInto,
+    splitBoundBy,
     ...(overBudget ? { split: suggestSplit(surfaces, splitInto) } : {}),
     // The empirical dose-response, applied to THIS estimate — the number that makes the case to a
     // human deciding whether the split is worth the effort.

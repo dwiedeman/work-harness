@@ -37,6 +37,7 @@ jobs:
             skills/work/work-runner.test.mjs \
             skills/work/work-metrics.test.mjs \
             skills/work/session-end-telemetry.test.mjs \
+            skills/work/run-gate.test.mjs \
             skills/prep-for-work/prep-runner.test.mjs \
             hooks/context-wrap-nudge.test.mjs
 

@@ -20,6 +20,7 @@ import {
   hostsToPull, mergedReconcileEvents, parseWakeOn, ACTIONABLE_EVENT_TYPES,
   reapCleanupCommands, reapCleanupOutcome, renderCloudBrief, parsePrEventComments, deriveCloudPrEvents,
   codexReviewCommand, codexTokensFromLog, parseCodexReview, reviewFindingsEvent, scoreReviewFidelity, codexRunCompleted,
+  codexFalseGreenRefusal,
   dedupeTerminalEvents, escalateKickbackModel, getShepherdModel, getDefaultPreferHosts,
   getLeadTypes, proxyEnvPairs, modelFamily, hasExternalReviewer, reviewUsageEvent, reviewShellCommand,
   renderLinksMd, derivedEventSeen, deriveKickbackFixEvents, kickbackDossier,
@@ -37,7 +38,8 @@ import {
   panelReviewCommands, panelCrossVendorPrompt, crossVendorPassCommands, crossVendorAttestation,
   latestCrossVendorAttestation, crossVendorLabel, classifyCodexProbe, parseCodexRun,
   priorAttestationByDigest, harnessVersionAgreementVerdict, readRunningHarnessVersion,
-  CROSS_VENDOR_LENS, CROSS_VENDOR_HEADING, CROSS_VENDOR_ROUND,
+  CROSS_VENDOR_LENS, CROSS_VENDOR_HEADING, CROSS_VENDOR_ROUND, CROSS_VENDOR_MODEL, CROSS_VENDOR_EFFORT,
+  PANEL_GATE_HEADING,
   reapRefusal, reapLeakGuidance, actorInstance, parseActorInstance, renderShepherdRotationBrief,
   stalenessCommand, stalenessVerdict, usageFloorNotes, parseSwapUsage, swapVerdict, sleepGapDetected,
   isMdnsHostName, tailscaleSees,
@@ -59,6 +61,12 @@ import {
 // SyntaxError that takes all 363 tests down with it, which is a useless way to observe a must-fail
 // control. Through the namespace, an absent seam is `undefined` and its own assertion can report it.
 import * as WR from "./work-runner.mjs";
+
+// Derived from the exported constant, never from a copy of its text. These assertions used to match the
+// literal "Mandatory adversarial review panel"; when the 2026-08-12 policy renamed the heading, four of
+// them went red at once — which is the correct outcome, but only because the string happened to change.
+// Deriving the pattern means a future rename can never leave an assertion silently matching nothing.
+const PANEL_GATE_HEADING_RE = new RegExp(PANEL_GATE_HEADING.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
 
 // ---- Task 1: arg parsing + ids ----
 
@@ -271,6 +279,58 @@ test("materializeState folds lifecycle into per-issue status", () => {
   assert.equal(s.issues["DER-1"].kickback_count, 0);
   assert.deepEqual(s.issues["DER-1"].fileScope, ["apps/web/x.ts"]);
   assert.equal(s.issues["DER-1"].workspace_ref, "workspace:5");
+});
+
+test("2026-08-12: blocker-bearing GATES set a round floor no dispatch path can bypass", () => {
+  const gate = (sha, blockers) => ({
+    type: "review_findings", issue: "DER-1", sha, blockers, round: 1,
+    findings: Array.from({ length: blockers }, (_, i) => ({ title: `b${i}`, priority: 1 })),
+  });
+
+  // THE REGRESSION. On run 20260810 the orchestrator both GATED #1293 and DISPATCHED its fixer, so no
+  // shepherd `kickback` event ever existed. `kickback_count` read 0 while the PR was in its third
+  // blocker-bearing round, and the 3-round hard cap — the only control that stops a non-converging PR
+  // from grinding forever — never saw it.
+  const orchGated = materializeState([
+    { type: "lead_spawned", issue: "DER-1" },
+    { type: "pr_opened", issue: "DER-1", pr: 1293 },
+    gate("a".repeat(40), 2),
+    gate("b".repeat(40), 1),
+    gate("c".repeat(40), 3),
+  ], { run_id: "r1" });
+  const it = orchGated.issues["DER-1"];
+  assert.equal(it.kickback_count, 0, "no kickback event was ever emitted — that part is unchanged");
+  assert.equal(it.rounds_effective, 3, "but three blocker-bearing gates ARE three rounds");
+  assert.equal(it.rounds_uncounted, 3, "and the board must say which axis it counted, or it reads as a bug");
+  assert.equal(it.budget, "tripped", "the hard cap must now see this PR; before this change it read 'ok'");
+
+  // Re-gating the SAME sha is one round, not two — otherwise a lead who re-runs the gate to check its
+  // own fix would burn the cap without changing anything.
+  const reGated = materializeState([
+    { type: "lead_spawned", issue: "DER-1" },
+    gate("a".repeat(40), 2),
+    gate("a".repeat(40), 2),
+  ], { run_id: "r1" });
+  assert.equal(reGated.issues["DER-1"].rounds_effective, 1, "same sha re-gated is the same round");
+
+  // CONTROL — CLEAN gates must not count at all. Without this the floor would trip every PR that was
+  // ever gated, which is indistinguishable from the cap being broken in the other direction.
+  const clean = materializeState([
+    { type: "lead_spawned", issue: "DER-1" },
+    { type: "review_findings", issue: "DER-1", sha: "a".repeat(40), blockers: 0, findings: [] },
+    { type: "review_findings", issue: "DER-1", sha: "b".repeat(40), blockers: 0, findings: [] },
+  ], { run_id: "r1" });
+  assert.equal(clean.issues["DER-1"].rounds_effective, 0, "a clean gate is not a round");
+  assert.equal(clean.issues["DER-1"].budget, "ok");
+
+  // The floor never LOWERS a real kickback count.
+  const both = materializeState([
+    { type: "lead_spawned", issue: "DER-1" },
+    { type: "kickback", issue: "DER-1", pr: 42, sha: "aaa" },
+    { type: "kickback_relayed", issue: "DER-1", pr: 42 },
+    { type: "review_findings", issue: "DER-1", sha: "a".repeat(40), blockers: 0, findings: [] },
+  ], { run_id: "r1" });
+  assert.equal(both.issues["DER-1"].rounds_effective, 1, "max(kickbacks, blocker-gates), never min");
 });
 
 test("materializeState DER-2491: kickback rounds count on DELIVERY (relay / respawn), never on append", () => {
@@ -729,7 +789,7 @@ test("write-brief --lead-type dsv4: renders the adversarial panel + concrete slo
     const { runId } = await runSubcommand(["init-run", "--project", "cmp", "--runs-root", root, "--repo-root", root]);
     const { briefPath } = await runSubcommand(["write-brief", "--run", runId, "DER-9", "--runs-root", root, "--repo-root", root, "--worktree", "/wt/DER-9", "--title", "cmp", "--lead-type", "dsv4"]);
     const brief = await readFile(briefPath, "utf8");
-    assert.match(brief, /Mandatory adversarial review panel/);
+    assert.match(brief, PANEL_GATE_HEADING_RE);
     assert.match(brief, /Adversarial panel: correctness\/security\/repro, <model>, round N, 0 open blockers/, "PR-body evidence line the shepherd audits");
     assert.match(brief, /env -u ANTHROPIC_BASE_URL -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_API_KEY claude -p --output-format json --model opus/, "the panel runs on the subscription, in its own process");
     assert.match(brief, /review-panel --run .* --issue DER-9 .* --round 1/, "the gate self-records into the ledger");
@@ -751,12 +811,12 @@ test("write-brief --lead-type dsv4: renders the adversarial panel + concrete slo
     // the control: before DER-2360 they rendered self-review language and no shell-out at all.
     const { briefPath: kimiBrief } = await runSubcommand(["write-brief", "--run", runId, "DER-8", "--runs-root", root, "--repo-root", root, "--worktree", "/wt/DER-8", "--title", "cmp", "--lead-type", "kimi"]);
     const kb = await readFile(kimiBrief, "utf8");
-    assert.match(kb, /Mandatory adversarial review panel/, "the panel is the gate on a same-vendor lead type too");
+    assert.match(kb, PANEL_GATE_HEADING_RE, "the panel is the gate on a same-vendor lead type too");
     assert.match(kb, /claude -p --output-format json --model opus/, "a kimi lead's panel still shells out to the Claude subscription");
     assert.doesNotMatch(kb, /Final adversarial self-review/, "self-review language is retired — the same model grading its own work is what this replaced");
     const { briefPath: claudeBrief } = await runSubcommand(["write-brief", "--run", runId, "DER-7", "--runs-root", root, "--repo-root", root, "--worktree", "/wt/DER-7", "--title", "cmp"]);
     const cb = await readFile(claudeBrief, "utf8");
-    assert.match(cb, /Mandatory adversarial review panel/, "a Claude lead gets the external gate too — DER-2360's whole premise");
+    assert.match(cb, PANEL_GATE_HEADING_RE, "a Claude lead gets the external gate too — DER-2360's whole premise");
     assert.doesNotMatch(cb, /\*\*Lead type:\*\*/, "default claude brief still omits the lead-type banner");
   } finally {
     await applyRepoConfig("/nonexistent-reset");
@@ -2558,7 +2618,8 @@ test("write-brief: reads the run's plan, stamps the budget, and records budget_a
     const planPath = join(root, "plan.json");
     await writeFile(planPath, JSON.stringify(planWith([pIssue("DER-1", { budget: { files: 7, additions: 420 } })])), "utf8");
     const { runId } = await runSubcommand(["init-run", "--issues", "DER-1", "--runs-root", root, "--plan", planPath]);
-    const res = await runSubcommand(["write-brief", "--run", runId, "DER-1", "--runs-root", root, "--worktree", "/wt/DER-1"]);
+    const res = await runSubcommand(["write-brief", "--run", runId, "DER-1", "--runs-root", root, "--worktree", "/wt/DER-1",
+      "--acceptance", "Inlined groomed scope for DER-1."]);
     assert.equal(res.assignedBudget.files, 7);
     assert.match(await readFile(res.briefPath, "utf8"), /Assigned budget — 7 files \/ ~420 additions/);
 
@@ -2586,6 +2647,38 @@ test("write-brief: an issue missing from the plan is LOUD, not silently un-budge
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
+test("write-brief: a planned unit with NO --acceptance is refused; a kickback re-brief is exempt", async () => {
+  // The guard shipped in 0.5.2 with no test of its own: the only two cases that reached it were
+  // budget tests, so satisfying them would have silently retired it. A lead cannot follow
+  // "(see the Linear issue)" — headless Claude leads have no Linear MCP — so this pins BOTH limbs.
+  const root = await mkdtemp(join(tmpdir(), "work-plan-acceptance-"));
+  try {
+    const planPath = join(root, "plan.json");
+    await writeFile(planPath, JSON.stringify(planWith([pIssue("DER-1", { budget: { files: 3, additions: 90 } })])), "utf8");
+    const { runId } = await runSubcommand(["init-run", "--issues", "DER-1", "--runs-root", root, "--plan", planPath]);
+
+    // Round 0 with no inlined scope: REFUSED.
+    await assert.rejects(
+      runSubcommand(["write-brief", "--run", runId, "DER-1", "--runs-root", root, "--worktree", "/wt/DER-1"]),
+      /no --acceptance/,
+    );
+    // Whitespace is not scope.
+    await assert.rejects(
+      runSubcommand(["write-brief", "--run", runId, "DER-1", "--runs-root", root, "--worktree", "/wt/DER-1", "--acceptance", "   "]),
+      /no --acceptance/,
+    );
+    // Control: the SAME call with real scope succeeds, so the refusal above is the guard and not a
+    // broken invocation.
+    const ok = await runSubcommand(["write-brief", "--run", runId, "DER-1", "--runs-root", root, "--worktree", "/wt/DER-1",
+      "--acceptance", "Inlined groomed scope for DER-1."]);
+    assert.equal(ok.assignedBudget.files, 3);
+    // A kickback re-brief carries the findings dossier + the brief already on disk, so it is exempt.
+    const kb = await runSubcommand(["write-brief", "--run", runId, "DER-1", "--runs-root", root, "--worktree", "/wt/DER-1",
+      "--kickback", "1", "--findings", "fix the thing"]);
+    assert.ok(kb.briefPath);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test("write-brief: explicit --budget-files/--budget-additions override the plan (mid-run split)", async () => {
   const root = await mkdtemp(join(tmpdir(), "work-plan-override-"));
   try {
@@ -2593,6 +2686,7 @@ test("write-brief: explicit --budget-files/--budget-additions override the plan 
     await writeFile(planPath, JSON.stringify(planWith([pIssue("DER-1")])), "utf8");
     const { runId } = await runSubcommand(["init-run", "--issues", "DER-1", "--runs-root", root, "--plan", planPath]);
     const res = await runSubcommand(["write-brief", "--run", runId, "DER-1", "--runs-root", root, "--worktree", "/wt/DER-1",
+      "--acceptance", "Inlined groomed scope for DER-1.",
       "--budget-files", "4", "--budget-additions", "200"]);
     assert.equal(res.assignedBudget.files, 4);
     assert.match(await readFile(res.briefPath, "utf8"), /Assigned budget — 4 files \/ ~200 additions/);
@@ -3126,6 +3220,60 @@ test("codexTokensFromLog: scrapes the trailing total, and returns null rather th
   assert.equal(codexTokensFromLog(undefined), null);
 });
 
+test("codexFalseGreenRefusal is DIRECTIONAL — a denial kills a CLEAN verdict, never a finding-bearing one", () => {
+  // The verbatim explanation from the PR #1293 run that carried the panel's ONLY P1. It hits the
+  // denial pattern AND returned findings. The naive rule ("grep for `could not run`, discard") would
+  // have thrown this away — that is the whole reason this function exists rather than a grep.
+  const REAL = "Vitest could not collect in the read-only sandbox because it attempted a temporary-directory write, but direct executable counterexamples confirmed the principal failures";
+
+  // ── MUST NOT FIRE: a denial-bearing run that produced findings is valid evidence ────────────────
+  assert.equal(
+    codexFalseGreenRefusal({ verdict: "patch is incorrect", explanation: REAL, findings: [{ title: "dead confirmations counted", priority: 1 }] }),
+    null,
+    "the #1293 run — denial string AND findings — must be RECORDED; discarding it loses the round's only P1",
+  );
+  // Even a "patch is correct" verdict is kept when findings exist: the findings are the work.
+  assert.equal(
+    codexFalseGreenRefusal({ verdict: "patch is correct", explanation: REAL, findings: [{ title: "a P3 nit" }] }),
+    null,
+    "findings are positive evidence a denial cannot manufacture",
+  );
+  // A clean verdict from a run that executed fine is a real clean verdict.
+  assert.equal(
+    codexFalseGreenRefusal({ verdict: "patch is correct", explanation: "Ran the full suite; 436 tests green. No issues found.", findings: [] }),
+    null,
+    "a genuine clean verdict must pass, or the gate blocks every good PR",
+  );
+
+  // ── MUST FIRE: clean + zero findings + a denial is the false green ──────────────────────────────
+  const refusal = codexFalseGreenRefusal({ verdict: "patch is correct", explanation: REAL, findings: [] });
+  assert.ok(refusal, "clean + no findings + a sandbox denial is indistinguishable from a review that never looked");
+  assert.match(refusal, /REFUSING to record a CLEAN verdict/);
+  assert.match(refusal, /could not collect/, "the refusal must QUOTE the denial it matched, not just assert one exists");
+
+  // Each denial phrasing is its own control — a pattern proven on one string says nothing about the rest.
+  for (const phrasing of [
+    "Could not run the test suite in this environment.",
+    "Unable to execute vitest: permission denied writing to /tmp.",
+    "The read-only filesystem prevented installing dependencies.",
+    "Test execution was denied by the sandbox.",
+  ]) {
+    assert.ok(
+      codexFalseGreenRefusal({ verdict: "patch is correct", explanation: phrasing, findings: [] }),
+      `denial phrasing not matched: ${phrasing}`,
+    );
+  }
+
+  // NEGATIVE CONTROL — the bare word "sandbox" in innocuous prose must NOT trip it. Without this the
+  // rule would refuse every clean verdict that merely mentions where it ran, and a gate that refuses
+  // everything gets waived by habit, which is worse than no gate.
+  assert.equal(
+    codexFalseGreenRefusal({ verdict: "patch is correct", explanation: "Reviewed in a read-only sandbox workspace. Executed the changed function directly; behaviour matches the spec.", findings: [] }),
+    null,
+    "mentioning the sandbox is not reporting a denial by it",
+  );
+});
+
 test("parseCodexReview: normalizes findings and relativizes the worktree-absolute path", () => {
   const payload = {
     overall_correctness: "patch is incorrect",
@@ -3310,16 +3458,17 @@ test("scoreReviewFidelity: preempt_rate is null on an empty cloud set (0/0 is no
   assert.equal(s.novel, 1);
 });
 
-test("DER-2360: the adversarial PANEL is the gate rendered for EVERY lead type, as a shell-out", () => {
-  // The panel REPLACED the codex gate here (auto-review off, 2026-08-01). Every property below is one
-  // the codex block had to have too — they are properties of a pre-PR gate, not of which model runs it.
+test("DER-2360: the FALLBACK panel is rendered for EVERY lead type, as a shell-out", () => {
+  // Since 2026-08-12 the panel is the fallback, not the gate — but it must still be RENDERED for every
+  // lead type, because "codex is unavailable" is reachable from all of them. Every property below is a
+  // property of a pre-PR reviewer, not of which model runs it.
   const CFG = {
     claude: {}, gpt: { proxy: true, leadModel: "gpt-5.6-sol", reviewerModel: "gpt-5.6-sol" },
     dsv4: { proxy: true, leadModel: "deepseek/deepseek-v4-pro", reviewerModel: "opus", reviewerBilling: "subscription" },
   };
   for (const leadType of [undefined, "claude", "gpt", "dsv4"]) {
     const brief = renderBrief({ issueId: "DER-7", title: "t", worktree: "/w", branch: "b", runId: "R", runDir: "/rd", leadType, leadTypeCfg: CFG[leadType ?? "claude"] });
-    assert.match(brief, /Mandatory adversarial review panel/, `panel gate missing for leadType=${leadType}`);
+    assert.match(brief, PANEL_GATE_HEADING_RE, `panel gate missing for leadType=${leadType}`);
     // A SHELL-OUT, never an Agent subagent. This is the property that decides whether the gate is real:
     // a subagent inherits the lead's aliases and was measured reviewing on the flash tier.
     assert.match(brief, /env -u ANTHROPIC_BASE_URL -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_API_KEY claude -p/, `panel is not a shell-out for leadType=${leadType}`);
@@ -10806,13 +10955,14 @@ test("DER-2360 review-panel (CLI): records the gate, and REFUSES a panel that di
       () => runSubcommand(["review-panel", "--run", runId, "--runs-root", root, "--issue", "DER-1", "--sha", "abc123def", ...lensArgs(good)]),
       /40-char/,
     );
-    // MUST-FAIL 5 (DER-3011) — a ROUND-1 receipt that is SILENT about the cross-vendor pass. Round 1 is
-    // the only round where a second vendor pays, so a receipt that says neither "codex ran" nor "codex
-    // was walled, here is the probe output" is the one shape nobody can audit after the fact.
+    // MUST-FAIL 5 — a receipt that is SILENT about the codex gate. Since 2026-08-12 codex is THE
+    // reviewer on every round, so recording a PANEL at all implies codex was unavailable — which makes
+    // the waiver the expected companion to this command, not an exception. A receipt saying neither
+    // "codex ran" nor "codex was walled, here is the probe output" is the one shape nobody can audit.
     await assert.rejects(
       () => runSubcommand(["review-panel", "--run", runId, "--runs-root", root, "--issue", "DER-1", "--sha", SHA, ...lensArgs(good)]),
-      /round 1 is the FIRST complete diff/,
-      "a round-1 receipt must attest the cross-vendor pass, one way or the other",
+      /the `codex exec` gate is THE reviewer on every round/,
+      "a panel receipt must attest the codex gate, one way or the other",
     );
     // Nothing above may have left a trace: a refused gate that still appends is worse than no gate.
     assert.equal((await readEvents(join(root, runId))).filter((e) => e.type === "review_findings").length, 0, "a refused panel must append NOTHING");
@@ -11080,7 +11230,7 @@ test("DER-3011 crossVendorAttestation: findings WITHOUT the JSONL are refused; a
   // ever looked, which is the only outcome that cannot be audited after the fact.
   const silent = crossVendorAttestation({ round: 1 });
   assert.equal(silent.ok, false);
-  assert.match(silent.refusal, /round 1 is the FIRST complete diff/);
+  assert.match(silent.refusal, /the `codex exec` gate is THE reviewer on every round/);
   assert.match(silent.refusal, /--codex-waived/, "the refusal must name the escape hatch, or it is a wedge");
 
   // CONTROL — a real completed run records what it found AND how hard it searched.
@@ -11250,19 +11400,22 @@ test("DER-3011 ready: the cross-vendor answer is REPORTED on the ready line and 
   }
 });
 
-test("DER-3011 the brief renders the codex gate on ROUND 1 ONLY, with the exact measured command form", () => {
+test("2026-08-12 the brief renders the codex gate on EVERY round, pinned to model+effort, with the exact measured command form", () => {
   const round1 = renderBrief({ issueId: "DER-9", worktree: "/wt", runId: "R", runsRoot: "/rr", runnerCmd: "node /abs/work-runner.mjs" });
 
-  assert.ok(round1.includes(CROSS_VENDOR_HEADING), "round 1 must carry the codex-gate block");
-  // The DIVISION OF LABOUR must be stated, not implied: on round 1 codex is the default reviewer and
-  // the panel runs beside it as the backup. A brief that renders both blocks without saying which is
-  // which invites a lead to treat either as optional.
-  assert.match(round1, /codex is the DEFAULT reviewer/i, "round 1 must name codex as the default gate");
-  assert.match(round1, /BACKUP|backup/, "…and the panel as the backup that also covers revisions and codex-down");
+  assert.ok(round1.includes(CROSS_VENDOR_HEADING), "every round must carry the codex-gate block");
+  // The DIVISION OF LABOUR must be stated, not implied: codex is THE reviewer and the 3-lens panel is
+  // the fallback for codex-unavailable only. A brief that renders both blocks without saying which is
+  // which invites a lead to run both — which is the $17.25/36.5-min cost this policy exists to delete.
+  assert.match(round1, /This is the review gate\. It is the ONLY reviewer you run/i, "codex must be named as the sole gate");
+  assert.match(round1, /Do not also run the 3-lens Claude panel/i, "…and the brief must say NOT to also run the panel");
+  // The model and effort are PINNED on the command, never inherited from ~/.codex/config.toml (medium).
+  assert.match(round1, new RegExp(`-m ${CROSS_VENDOR_MODEL} -c model_reasoning_effort="${CROSS_VENDOR_EFFORT}"`), "model + effort pinned on the command itself");
+  assert.match(round1, /never inherited from `~\/\.codex\/config\.toml`/i, "and the brief must say WHY it is pinned");
   // (a) The exact command form. Every flag here is load-bearing and was measured: plain `codex exec`
   // (never `codex exec review --base`, which is diff-local and refuses a custom prompt), `--json` for
   // the completion evidence, the prompt on STDIN, stdout PURE JSONL, stderr SEPARATE.
-  assert.match(round1, /exec --json --sandbox read-only --output-schema \S+ --output-last-message \S+ - < \S+ > \S+ 2> \S+/, "the exact codex exec form");
+  assert.match(round1, /exec --json --sandbox read-only -m \S+ -c model_reasoning_effort="\w+" --output-schema \S+ --output-last-message \S+ - < \S+ > \S+ 2> \S+/, "the exact codex exec form");
   assert.match(round1, /NEVER `codex exec review --base`/, "the diff-local form refuses a custom prompt and finds nothing — the brief must say so");
   assert.match(round1, /--lens codex --diff/, "the prompt is RENDERED by the runner, never pasted as prose into a brief");
   // No RUNNABLE line may invoke a bare `codex` — a cmux shim ahead of it on PATH hangs at 0% CPU
@@ -11283,14 +11436,15 @@ test("DER-3011 the brief renders the codex gate on ROUND 1 ONLY, with the exact 
   // The recording flags ride the SAME review-panel call — one gate, one receipt.
   assert.match(round1, /review-panel .*--round 1[\s\S]*--codex-review \S+ --codex-log \S+/);
 
-  // A KICKBACK brief is panel-only: the codex gate is spent on the first complete diff (P1 yield
-  // 53% → 0%), and a lead handed the block would run it again.
+  // A KICKBACK brief carries the codex gate TOO. This inverts the pre-2026-08-12 policy: codex used to
+  // be round-1-only because it was a companion to a Claude panel that cost real budget. Now it IS the
+  // gate, it rides a separate subscription, and a verdict on a tree the lead has since changed is not a
+  // gate at all — so a revision round re-runs it rather than inheriting a stale answer.
   const round2 = renderBrief({ issueId: "DER-9", worktree: "/wt", runId: "R", runsRoot: "/rr", kickback: 1, findings: "F" });
-  assert.ok(!round2.includes(CROSS_VENDOR_HEADING), "a revision round must NOT carry the codex-gate block");
-  assert.doesNotMatch(round2, /--codex-review/);
-  assert.match(round2, /review-panel .*--round 2/, "and its receipt must record the round it actually is — `--round 1` on every brief would make 'round 1 only' mean 'every round'");
-  assert.match(round2, /PANEL ALONE/i, "on a revision the panel is the whole gate — the brief must say so, not leave it inferred");
-  assert.match(round2, /Do NOT re-run the round-1 `codex exec` gate/i);
+  assert.ok(round2.includes(CROSS_VENDOR_HEADING), "a revision round must ALSO carry the codex-gate block");
+  assert.match(round2, /review-panel .*--round 2/, "and its receipt must record the round it actually is");
+  assert.match(round2, /codex runs on every round/i, "the revision brief must say the gate re-runs, not that it is inherited");
+  assert.match(round2, /Do NOT also run the 3-lens Claude panel/i, "…and must still steer the lead away from the fallback");
 
   // Neither brief may claim which way codex is pointing TODAY. Availability swings; a hardcoded
   // "walled until <date>" is stale the day after it is written, and a lead reading it would skip a

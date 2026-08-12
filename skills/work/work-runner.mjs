@@ -562,9 +562,11 @@ export function renderBrief({ issueId, title, worktree, branch, runId, runDir, r
       ? `3. **Build by DELEGATING — on this lead type that is an instruction, not a style preference.** (Measured 2026-07-24: a lead on this tier made 220 model calls and ZERO Agent calls, implementing every line itself — and a lead that never dispatches a subagent also never runs step 5's review gate.) Decompose into 2–4 chunks and dispatch each with the **Agent tool**, \`model: "sonnet"\` (routes to ${ltCfg.subagentModel ?? "your subagent tier"}); research/codebase-mapping goes to \`"haiku"\` (${ltCfg.researchModel ?? ltCfg.subagentModel ?? "same"}). You plan, adversarially review each returned diff, and integrate — you do not write the bulk of the implementation yourself. Run subagents in the FOREGROUND. Read-only work fans out freely; parallel EDITS only on disjoint files via Agent \`isolation:"worktree"\`, then integrate onto the issue branch. NEVER dispatch model-less (it inherits YOUR tier); reserve \`opus\` for step 5's single final reviewer.`
       : `3. Build in bite-size chunks with in-process subagents (Sonnet 5 / Haiku). **Model discipline:** dispatch EVERY subagent with an explicit model alias — \`sonnet\` for implementation, \`haiku\` for research; NEVER model-less (a model-less subagent inherits your lead-tier model) and reserve \`opus\` for step 5's single final reviewer. Run subagents in the FOREGROUND (background task handles are unreliable on proxy-backed leads). Read-only work fans out freely; parallel EDITS only on disjoint files via Agent \`isolation:"worktree"\`, then integrate diffs onto the issue branch.`,
     `4. Targeted local verify: typecheck + lint the changed package + touched test files (+ one \`*.db.test.ts\` if you touched DB/RLS). NOT full remote CI. **EXCEPTION — deterministic guards are YOUR gate:** if the diff adds/changes a command, MCP tool, or reference guide, or touches \`packages/commands\`/\`packages/reference\`/\`apps/cli\`, also run \`pnpm check:manifest && pnpm check:cli-version && pnpm check:docs-version && pnpm docs:check\` + the registry tests (ui-surface-parity, command-tools, inventory, agent-how-tos) before handing off — seconds each; every skipped one is a guaranteed kickback round.`,
-    firstReviewRound
-      ? `5. **Review gate — this is ROUND 1, so it is TWO reviewers running together: the \`codex exec\` gate (the DEFAULT on a first complete diff, see "${CROSS_VENDOR_HEADING}") and the 3-lens adversarial panel beside it (the BACKUP, see "${PANEL_GATE_HEADING}").** Each panel lens is a **shell-out on a fresh context**, never an Agent subagent (a subagent inherits your endpoint and aliases and silently reviews on your own tier). The cloud bot's auto-review is OFF, so NOTHING reviews this PR after you hand it off — run both blocks VERBATIM, address every finding, and re-run the panel on the new head BEFORE hand-off. If \`codex-probe\` says codex is unavailable, waive it with the reason the probe prints and let the panel stand alone; it must never block you.`
-      : `5. **Review gate — this is round ${panelRound}, so it is the adversarial PANEL ALONE, see "${PANEL_GATE_HEADING}" below.** Three lenses, each a **shell-out on a fresh context**, never an Agent subagent (a subagent inherits your endpoint and aliases and silently reviews on your own tier). The cloud bot's auto-review is OFF, so NOTHING reviews this PR after you hand it off — run the block VERBATIM, address its findings, and re-run it on the new head BEFORE hand-off. **Do NOT re-run the round-1 \`codex exec\` gate** — its value is spent on the first complete diff, and the receipt carries round 1's answer forward on its own.`,
+    // ONE branch on purpose. Before 2026-08-12 this was a ternary on `firstReviewRound` because the
+    // reviewer genuinely differed by round (codex on 1, panel afterwards). Now codex runs on every
+    // round, so `firstReviewRound` is true for every reachable round and a second branch would be
+    // unreachable text asserting a policy that no longer exists.
+    `5. **Review gate — ONE reviewer: \`codex exec\` on ${CROSS_VENDOR_MODEL} at ${CROSS_VENDOR_EFFORT} effort (see "${CROSS_VENDOR_HEADING}").** This is round ${panelRound}, and **codex runs on every round** — it rides a separate subscription, so a re-run costs no Claude budget and a verdict on a tree you have since changed is not a gate. **Do NOT also run the 3-lens Claude panel** — that is the FALLBACK, and it runs only when \`codex-probe\` says codex is unavailable. The cloud bot's auto-review is OFF, so NOTHING reviews this PR after you hand it off: run the block VERBATIM, address every finding, and re-run it on the new head BEFORE hand-off.`,
     `6. Open the PR (Linear \`gitBranchName\`, mention ${allIds.join(" + ")}); record it, then move Linear → In Review${bundleRest.length ? " (ALL bundled issues)" : ""} and hand off:`,
     `   \`${ledger(`{"actor":"lead:${issueId}","type":"pr_opened","issue":"${issueId}","pr":123${bundleRest.length ? `,"bundle":${JSON.stringify(allIds)}` : ""}}`)}\``,
     `   **Token telemetry (at hand-off, from the worktree):** \`${runner} append --run ${runId ?? "<run>"} --runs-root ${appendRunsRoot} "$(node scripts/session-token-report.mjs --role lead --issues ${allIds.join(",")}${kickback ? ` --kickback ${kickback}` : ""} --format event)"\` — reads your own session transcripts, reports tokens by model for fleet analysis.`,
@@ -602,15 +604,21 @@ export function renderBrief({ issueId, title, worktree, branch, runId, runDir, r
     `- **The ONLY runner is the one this brief's commands name.** If an append is rejected with a schema error, YOUR COPY of the runner is stale (side-copies exist in \`scripts/codex-work/\` and \`~/.codex/work/bin/\` — never use them, and never conclude "the harness is broken" from one). NEVER write to \`events.jsonl\` directly — with concurrent leads a torn line corrupts state for everyone.`,
     `- **CI failure you cannot reproduce locally? Check how far behind main you are FIRST:** \`git fetch origin main && git rev-list --count HEAD..origin/main\`. **CI tests the MERGE tree** (\`refs/pull/<n>/merge\`), so a branch behind main can fail on a file your branch has never contained — local greens are then meaningless. Merge \`origin/main\` into the branch before debugging any CI-only failure, and name the ref you probed in any evidence you cite (branch-only probes are blind instruments — H11).`,
   );
-  lines.push(
+  // The panel is rendered into its own array and appended AFTER the codex block, so the brief reads in
+  // policy order: the gate you run, then the fallback you run only if the gate is unavailable. A lead
+  // reading top-to-bottom must hit the mandatory reviewer first.
+  const panelLines = [];
+  panelLines.push(
     ``,
     `## ${PANEL_GATE_HEADING}`,
     ``,
-    firstReviewRound
-      ? `**Both this panel and the round-1 \`codex exec\` gate below are mandatory, and they run together.** On your first complete diff codex is the DEFAULT reviewer; this panel runs alongside it and is the BACKUP — it becomes the sole gate on every revision round, and on round 1 too if the codex probe comes back unavailable. The GitHub Codex bot's per-PR AUTO-review is OFF (operator decision, 2026-08-01), so nothing downstream catches what these two miss — a PR with zero bot reviews is normal now.`
-      : `**This is THE review gate for this PR, not a warm-up for one.** The GitHub Codex bot's per-PR AUTO-review is OFF (operator decision, 2026-08-01), so nothing downstream catches what this panel misses — a PR with zero bot reviews is normal now.`,
+    `🔴 **DO NOT RUN THIS unless \`codex-probe\` came back UNAVAILABLE.** The pre-PR gate is the \`codex exec\` block above, alone. This panel is the fallback for exactly one situation: codex is walled, 401'd, or unresolvable, and the change still needs a reviewer.`,
     ``,
-    `The panel's place here is measured, not stylistic: across PRs #1074–#1197, 65.4% of commits on bot-reviewed PRs landed AFTER the first bot review, size-matched cohorts merged 1.4–2.7× FASTER without the bot at near-identical churn, and head-to-head on #1185 this panel found 12 of the 15 findings while the bot added 2 unique ones.`,
+    `**Why it is no longer the default (measured 2026-08-10, PR #1293):** codex found the panel's ONLY P1 — a filter that excludes \`actionable === false\` while its sole production caller passes items carrying liveness in a different field, so an expired row was counted as live. All three Claude lenses examined that exact function, all three reported the same line number, and none reached the production shape. The three lenses cost **$17.25 and 36.5 minutes**; the leg that found the defect cost 5.4 minutes on a separate subscription. In the same round, 22 findings from 4 reviewers collapsed to ~10 distinct defects — the panel's marginal yield was breadth, not depth.`,
+    ``,
+    `The GitHub Codex bot's per-PR AUTO-review is OFF (operator decision, 2026-08-01), so nothing downstream catches what the gate misses — a PR with zero bot reviews is normal now.`,
+    ``,
+    `Its history is still good — across PRs #1074–#1197 it found 12 of 15 findings head-to-head with the GitHub bot on #1185 — which is why it remains the fallback rather than being deleted.`,
     ``,
     `**Three lenses, three SEPARATE processes, each prompted to REFUTE your change** — \`${PANEL_LENS_IDS.join("\` / \`")}\`. They are distinct on purpose: redundant reviewers CONCUR, and concurrence is not corroboration. On #1183 the repro lens refuted the security lens and was RIGHT; three copies of one lens would have agreed and deleted live code.`,
     ``,
@@ -624,41 +632,52 @@ export function renderBrief({ issueId, title, worktree, branch, runId, runDir, r
     ``,
     `1. **The diff SEEDS the search; it does not BOUND it.** The prompts are rendered by \`panel-prompt\`, which path-routes this repo's own checklists (tenant isolation, authorization precedence, command-surface parity, prompt/schema drift, SQL-vs-Zod divergence) onto the lenses by what your diff actually touches — and every lens is told to grep call sites, siblings, specs and dependent prose the diff does NOT touch. That instruction is the whole gate: measured 2026-07-25, a diff-local reviewer ran 2 commands and found 0 issues on a PR where a searching reviewer ran 21 and found 6, including two P1s the bot never posted.`,
     `2. **Union, then verify — and the verification pass cannot erase.** Step 2 unions every unique finding across the lenses (a 1-of-3 finding is the NORMAL shape of what makes a panel worth running, never a weak signal to be voted down) and then attacks each one by EXECUTION on a fresh context. Majority prioritizes; it never erases. A blocker-class finding (P0/P1, auth, tenant isolation, secrets, money) dies only by **positive falsification** — a command that was run and what it returned, which \`review-panel\` checks rather than trusts — or by an explicit \`gate_adjudication\`. Dissent between lenses is recorded in the receipt, not resolved by vote.`,
-    ...(firstReviewRound
-      ? [`3a. **Re-running at a new head (the pre-PR fix loop): re-run the PANEL only.** Fixing findings moves your head, and the codex artifacts in \`/tmp\` reviewed the OLD tree. Do NOT pass \`--codex-review\`/\`--codex-log\` again — re-submitting them records \`xvendor=CODEX STALE\` naming the sha they really covered, never RAN. **Just drop those two flags:** the receipt inherits round 1's answer and carries it forward (as STALE if codex's run predates this head). That is the expected, accepted outcome — carrying stale forward is fine; claiming RAN on a tree codex never saw is not. Re-run codex only if the change since it looked is substantial enough to be worth another 8 minutes.`]
-      : []),
+    `2a. **Dedupe before you verify.** Fold every reviewer's findings on \`file:line_start\` first. Measured on #1293: 22 findings from 4 reviewers were ~10 distinct defects, and the top two were reported by 3–4 of 4. **Convergence of ≥3 reviewers on one \`file:line_start\` is CONFIRMED — skip the adversarial verify round for it entirely** and spend the whole verify budget on the findings only ONE reviewer raised. Those uniques are where a panel earns its cost.`,
     `3. **Address, don't relay.** Fix every blocker and major, then **RE-RUN the panel on the new head**. \`ready\` blocks a PR whose latest gate covers its head and still records \`blockers > 0\`, and the recorded count must EXACTLY equal the number of priority-≤1 entries in that same event's findings list (DER-2837) — so hand-writing the event buys nothing; \`review-panel\` derives the count from the findings. If you believe a blocker is WRONG, either falsify it with an executed counterexample (step 2) or say so in the PR body and ask the orchestrator to record a \`gate_adjudication\`: ${GATE_ADJUDICATION_AUTHORITY} Appending one yourself is the offense, not a shortcut.`,
     `4. **Round cap — 3, then stop.** Re-run the panel after substantial fixes. If **blocker-class findings are still unresolved after round 3**, the PR is not converging: STOP, say so in a note to the orchestrator, and re-scope or split it rather than grinding a fourth round. Only NON-blocking residue may be deferred — list it in the PR body under "Deferred minors" (finding + file:line) for the shepherd's review-debt pass; do NOT file your own Linear issue.`,
     `5. **Evidence in the PR body (the shepherd checks this):** a line reading \`Adversarial panel: ${PANEL_LENS_IDS.join("/")}, <model>, round N, 0 open blockers\`. The prose line alone is not evidence — the \`review_findings\` event \`review-panel\` appends is, and a missing event or an unresolved blocker list is an automatic kickback.`,
     ``,
-    `⚠ It takes ~5–10 minutes wall-clock (the three lenses run in parallel). **Do not ask for \`@codex review\`** — the shepherd decides whether this PR's lane warrants that backstop.`,
+    `⚠ It takes ~30–40 minutes wall-clock on a 16 GB box — the lenses run SEQUENTIALLY behind a memory gate, not in parallel (measured 2026-08-10: 36.5 min, three lenses, 57 MB free RAM at the worst moment). Budget for that before choosing this path. **Do not ask for \`@codex review\`** — the shepherd decides whether this PR's lane warrants that backstop.`,
   );
-  // DER-3011 — the cross-vendor pass, rendered ONLY on the first review round. A kickback brief must not
-  // carry it: a lead handed the block would run it, and the whole finding is that a second vendor's P1
-  // yield is spent on the first complete diff.
-  if (firstReviewRound) {
+  // The cross-vendor pass. Since 2026-08-12 this is THE gate, on every round, and it is rendered
+  // unconditionally — the old `firstReviewRound` guard existed when codex was a round-1-only companion
+  // to the panel. Ordering matters: this block is pushed BEFORE `panelLines`, so a lead reading the
+  // brief top-to-bottom meets the reviewer it must run before the one it must not.
+  {
     lines.push(
       ``,
       `## ${CROSS_VENDOR_HEADING}`,
       ``,
-      `**This is the DEFAULT reviewer of your first complete diff. Run it ONCE, alongside the panel above — and never again on a revision round.** The panel is the backup: it runs beside codex here, and it is the SOLE gate on every later round and on this one if the probe says codex is unavailable. Codex earns the default slot by disagreeing: it overlaps the Claude lenses by only ~33%, so the two together are a genuinely different pair of instruments rather than four opinions. But its P1 yield decays by round (53% → 24% → 31% → 11% → 0%), so all of its value is in the first pass. It rides a SEPARATE subscription pool — no Claude budget, zero CI rounds — and takes ~8 minutes, which is why it runs in PARALLEL with the three lenses rather than after them.`,
+      `**This is the review gate. It is the ONLY reviewer you run, and you run it on EVERY round.** Do not also run the 3-lens Claude panel — see the fallback section below for the one case that calls for it.`,
+      ``,
+      `It is pinned to **${CROSS_VENDOR_MODEL}** at **${CROSS_VENDOR_EFFORT}** reasoning effort on the command itself, never inherited from \`~/.codex/config.toml\` (whose default is \`medium\`). A gate that silently reviewed at a lower effort because someone edited a personal config would still produce a receipt saying the gate ran.`,
+      ``,
+      `**Why it is the gate, measured on PR #1293:** it found the round's ONLY P1 in 5.4 minutes while three Opus lenses spent $17.25 and 36.5 minutes and read past it — all three examined the same function and reported the same line without reaching the production item shape. It overlaps the Claude lenses by only ~33%, and it rides a SEPARATE subscription pool: no Claude budget, no Claude weekly quota, zero CI rounds.`,
       ``,
       "```bash",
       crossVendorPassCommands({ issueId, runner }),
       "```",
       ``,
-      `1. **Its findings join the panel's union, as the \`${CROSS_VENDOR_LENS}\` lens.** There is no second command and no second event: a codex P0/P1 is a PANEL blocker, so \`ready\` holds the PR until you fix it or the verification pass falsifies it with an executed counterexample — exactly like a finding from any other lens.`,
+      `1. **Record it with \`review-usage --reviewer codex --file <review.json> --log <review.jsonl>\`.** One gate, one sha, one blocker count. A codex P0/P1 is a blocker: \`ready\` holds the PR until you fix it or falsify it with an executed counterexample. Never hand-write the event — the recorder derives the blocker count from the findings.`,
       `2. **Four measured conditions decide whether it works at all.** (a) plain \`codex exec\`, NEVER \`codex exec review --base\` — that form is diff-local (2 shell commands, 0 findings where a searching pass found 6) and it REFUSES a custom prompt outright; (b) the prompt MUST mandate searching, which is why \`panel-prompt\` renders it rather than you writing one; (c) run it from the WORKTREE, because without \`node_modules\` it cannot execute anything and goes blind; (d) it obeys the \`## Code Review Rules\` in AGENTS.md, so the repo's own defect corpus steers it for free.`,
-      `3. **Walled, 401'd, or unresolvable? Waive it and keep going — it must NEVER block you.** Codex availability swings: this harness has watched it die for a day and a half, sit behind a usage wall, and come back live inside one week. So a probe that comes back unavailable is an expected path, not an incident — **the panel above then stands as the sole gate**, and \`codex-probe\` prints the exact \`--codex-waived "<reason>"\` line to paste onto the \`review-panel\` command so the waiver lands on the receipt (\`ready\` prints it). What is NOT acceptable is a round-1 receipt that is SILENT about whether codex ever looked — \`review-panel\` refuses one.`,
-      `4. **Judge the probe by its TEXT, never by CPU% and never by \`codex login status\`.** \`login status\` reports "Logged in using ChatGPT" while every call 401s. A real wall SAYS so and names a date; ~0% CPU with ~0 bytes is a wall or a broken wrapper, never work in progress; and no output at all is UNKNOWN, not "codex is down". Closed stdin is load-bearing in the probe — without \`< /dev/null\` codex waits on "Reading additional input from stdin..." forever, at 0% CPU.`,
-      `5. **On every LATER round: panel only.** Do not re-run this gate on a kickback unless the shepherd explicitly asks; the receipt carries round 1's answer forward on its own.`,
-      `6. **Re-running the panel at a NEW head while still on round 1? Drop \`--codex-review\`/\`--codex-log\`.** Those artifacts reviewed the tree you have since changed, so re-submitting them records \`xvendor=CODEX STALE\` (naming the sha they really covered), never RAN — the attestation is bound to the JSONL's sha256 and the tree, not to the filename. Dropping the flags inherits round 1's answer instead, which is the correct and accepted shape. **Carrying it forward as stale is fine; claiming RAN on a tree codex never saw is not.**`,
+      `3. **A sandbox denial is NOT a failed run — read the verdict, not the excuse.** Codex under \`--sandbox read-only\` often reports it could not run the test suite (a temp-directory write is denied) and then proves its findings with direct executable counterexamples anyway. That exact run carried the only P1 on #1293. The rule is **directional**: a denial-bearing run returning \`"patch is correct"\` is a FALSE GREEN and is refused; the same run returning findings with executed counterexamples is valid evidence and is recorded. \`review-usage\` enforces this — do not second-guess it by grepping the explanation yourself.`,
+      `4. **Walled, 401'd, or unresolvable? Waive it and fall back to the panel — it must NEVER block you.** Codex availability swings: this harness has watched it die for a day and a half, sit behind a usage wall, and come back live inside one week. A probe that comes back unavailable is an expected path, not an incident — \`codex-probe\` prints the exact \`--codex-waived "<reason>"\` line, and the 3-lens panel below then becomes the gate for this round. What is NOT acceptable is a receipt SILENT about whether codex ever looked.`,
+      `5. **Judge the probe by its TEXT, never by CPU% and never by \`codex login status\`.** \`login status\` reports "Logged in using ChatGPT" while every call 401s. A real wall SAYS so and names a date; ~0% CPU with ~0 bytes is a wall or a broken wrapper, never work in progress; and no output at all is UNKNOWN, not "codex is down". Closed stdin is load-bearing in the probe — without \`< /dev/null\` codex waits on "Reading additional input from stdin..." forever, at 0% CPU.`,
+      `6. **Re-run it on the NEW head after every fix round.** Codex is cheap and unwalled, so there is no reason to carry a stale answer forward: a verdict on a tree you have since changed is not a gate. Re-running produces a fresh receipt bound to the current sha, which is what \`ready\` checks.`,
+      `7. **If you are a CLOUD lead, \`which codex\` will come back empty** — cloud sessions have no codex binary. Say so in your hand-off note immediately; the orchestrator supplies the gate leg locally. Do NOT substitute the panel silently and do NOT hand off ungated.`,
+      ``,
+      `### 🔴 QUIESCE — stop pushing once you mark ready`,
+      ``,
+      `**Push the whole round, THEN mark ready, THEN stop touching the branch until the gate reports.** A gate reviews one sha; a push during it produces a verdict that covers a tree nobody reviewed. This is not hypothetical and it is not rare: **four head-moves under a running gate in a single night** (#1292 twice, #1282 twice), and on #1292 r2 the push landed **102 seconds** into a 12-minute, $6.11 review, touching the exact file under review. The one lead that did quiesce had its gate come back valid on the first try — that contrast is the whole evidence.`,
+      ``,
+      `If you MUST push during a gate (a genuine emergency, not a nicer comment), say so in the hand-off note naming the new sha. The launcher re-reads \`headRefOid\` before it accepts any verdict and stamps \`{"verdict":"stale"}\` on a mismatch, so a silent push does not sneak a stale gate through — it just burns the round and you pay for it twice.`,
     );
   }
+  lines.push(...panelLines);
   if (externalReviewer && !subscriptionReview) {
     lines.push(
       ``,
-      `Note for this lead type: your in-process \`opus\` slot resolves to **${reviewerModel}**. That slot is for step 3's integration review of a subagent's diff — it is NOT this gate, and it cannot be: an in-process reviewer inherits your aliases. The panel above is the gate.`,
+      `Note for this lead type: your in-process \`opus\` slot resolves to **${reviewerModel}**. That slot is for step 3's integration review of a subagent's diff — it is NOT this gate, and it cannot be: an in-process reviewer inherits your aliases. The \`codex exec\` block above is the gate.`,
     );
   }
 
@@ -932,7 +951,7 @@ export function reviewShellCommand({ model = "opus", promptFile = "<prompt.md>",
 //     manufacture 0-finding "proof" of a clean PR.
 //   * DISTINCT lenses. On #1183 the repro lens REFUTED the security lens and was right — three
 //     redundant reviewers would have concurred and deleted live code.
-export const PANEL_GATE_HEADING = "⚑ Mandatory adversarial review panel (pre-PR gate — every lead type)";
+export const PANEL_GATE_HEADING = "⚑ FALLBACK reviewer — the 3-lens adversarial panel (run ONLY if the codex gate is unavailable)";
 
 // The advisory PR size ceiling, surfaced in every brief next to `plan_scope` (DER-2360 scope 4).
 // ADVISORY on purpose: nothing refuses a PR for crossing it. Round count tracks additions rather than
@@ -1725,12 +1744,23 @@ export function resolveCodexBin({ pathEnv = process.env.PATH ?? "", override = p
   return resolveCodexBinFrom({ pathEnv, override, home, exists: (p) => existsSync(p) });
 }
 
-export function codexReviewCommand({ promptFile = "<prompt.md>", outFile = "<review.json>", logFile = "<review.jsonl>", errorFile = "<review.stderr.log>", schemaFile = "~/.claude/skills/work/codex-review-schema.json", bin = null } = {}) {
+// The reviewer model and reasoning effort are PINNED on the command, never inherited from
+// `~/.codex/config.toml`. Two reasons, both measured:
+//   * The host config is `model_reasoning_effort = "medium"`. A gate that silently reviews at medium
+//     because someone edited their personal config is the "green from an adjacent question" shape —
+//     the receipt would say the gate ran, and it did, at an effort nobody chose.
+//   * The receipt records what was pinned, so a later archaeology can tell a high-effort verdict from
+//     a medium-effort one. An unpinned run is unattributable after the fact.
+// Overridable for hosts on a different codex build: WORK_CODEX_MODEL / WORK_CODEX_EFFORT.
+export const CROSS_VENDOR_MODEL = process.env.WORK_CODEX_MODEL || "gpt-5.6-sol";
+export const CROSS_VENDOR_EFFORT = process.env.WORK_CODEX_EFFORT || "high";
+
+export function codexReviewCommand({ promptFile = "<prompt.md>", outFile = "<review.json>", logFile = "<review.jsonl>", errorFile = "<review.stderr.log>", schemaFile = "~/.claude/skills/work/codex-review-schema.json", bin = null, model = CROSS_VENDOR_MODEL, effort = CROSS_VENDOR_EFFORT } = {}) {
   // Resolved, never bare. Falling back to the literal `codex` when nothing resolves keeps the command
   // renderable for briefs and tests; the PROBE is what refuses to turn an unresolvable binary into a
   // verdict, and it runs before any gate depends on this.
   const codex = bin ?? resolveCodexBin().bin ?? "codex";
-  return `${codex} exec --json --sandbox read-only --output-schema ${schemaFile} --output-last-message ${outFile} - < ${promptFile} > ${logFile} 2> ${errorFile}`;
+  return `${codex} exec --json --sandbox read-only -m ${model} -c model_reasoning_effort="${effort}" --output-schema ${schemaFile} --output-last-message ${outFile} - < ${promptFile} > ${logFile} 2> ${errorFile}`;
 }
 
 // Token total for the gate run. Two log shapes, because the flag above changed which one we get:
@@ -1760,6 +1790,55 @@ export function codexTokensFromLog(logText) {
   if (!m) return null;
   const n = Number.parseInt(m[1].replace(/,/g, ""), 10);
   return Number.isFinite(n) ? n : null;
+}
+
+// ── The codex false-green refusal, and why the obvious version of this rule is WRONG ──────────────
+//
+// Under `--sandbox read-only` codex routinely reports it could not run the test suite: vitest attempts
+// a temp-directory write and is denied. The tempting rule — "grep the explanation for `could not run`
+// and treat the review as failed" — was written into this harness's learnings file as bullet 11, and it
+// is BACKWARDS. Measured on PR #1293: the codex run whose own `overall_explanation` reads
+//
+//   "Vitest could not collect in the read-only sandbox because it attempted a temporary-directory
+//    write, but direct executable counterexamples confirmed the principal failures"
+//
+// is the run that carried the panel's ONLY P1 — a defect all three Claude lenses read past. Discarding
+// it on the denial string would have thrown away the single most valuable finding of the round.
+//
+// The rule is DIRECTIONAL. A sandbox denial only invalidates a verdict in the direction the denial can
+// manufacture, which is CLEAN:
+//   * verdict "patch is correct" + a denial  ⇒ FALSE GREEN. Codex is reporting no problems partly
+//     because it could not execute the thing that would have shown them. Refuse it.
+//   * verdict "patch is correct" + no denial ⇒ a real clean verdict. Record it.
+//   * ANY findings returned                  ⇒ VALID regardless of the denial. Findings are positive
+//     evidence; a run that produced them demonstrably did work, and codex proves them with direct
+//     executable counterexamples precisely because the suite was unavailable.
+//
+// Deliberately narrow: it matches denial phrasings tied to the SANDBOX, not the word "sandbox" alone
+// (which appears in innocuous prose like "run in a sandbox"), and never fires when findings exist.
+// Every alternative requires a DENIAL VERB. An earlier draft accepted bare "read-only sandbox", and its
+// own negative control caught it: "Reviewed in a read-only sandbox workspace. Executed the changed
+// function directly" would have been refused as a false green — i.e. the guard would have rejected a
+// genuine, thorough clean verdict for describing where it ran. A gate that refuses good input gets
+// waived by habit, which is worse than no gate.
+const CODEX_SANDBOX_DENIAL = /((could ?n[o']t|could not|unable to|failed to)\s+(run|collect|execute|install|start|spawn|write)|permission denied|(denied|blocked|prevented)\s+by\s+the\s+sandbox|sandbox\s+(denied|blocked|prevented)|read-only[^.\n]{0,30}(prevented|blocked|denied))/i;
+
+export function codexFalseGreenRefusal({ verdict, explanation, findings } = {}) {
+  const n = Array.isArray(findings) ? findings.length : 0;
+  // Findings are positive evidence of work. A denial cannot manufacture them, so it cannot invalidate them.
+  if (n > 0) return null;
+  if (String(verdict ?? "") !== "patch is correct") return null;
+  const text = String(explanation ?? "");
+  const hit = CODEX_SANDBOX_DENIAL.exec(text);
+  if (!hit) return null;
+  return (
+    `codex gate: REFUSING to record a CLEAN verdict from a run that also reports a sandbox denial (${JSON.stringify(hit[0])}). ` +
+    `"patch is correct" with zero findings, from a run that could not execute, is indistinguishable from a review that never looked — ` +
+    `which is the 0-finding-reads-as-CLEAN shape every other refusal in this gate exists to prevent. ` +
+    `Re-run the gate from the WORKTREE (with node_modules present) so codex can execute, or record the round as waived with the reason. ` +
+    `NOTE the asymmetry, and do not "fix" it by loosening: the SAME denial string on a run that RETURNED FINDINGS is valid evidence and is recorded — ` +
+    `measured on #1293, that exact run carried the only P1 of the round.`
+  );
 }
 
 // Normalize the schema'd codex payload into the shape the ledger and the fidelity scorer both use.
@@ -1972,14 +2051,26 @@ export const CROSS_VENDOR_REVIEWER = "codex";
 // not a ranking: a second event would become `latestGateEvent`, and two blocker counts for one sha with
 // nothing saying which `ready` must believe is how an unaddressed P1 ships. One gate, one sha, one count.
 export const CROSS_VENDOR_LENS = "codex";
-// The last round on which the codex gate is mandatory. Later rounds are panel-only by policy.
-export const CROSS_VENDOR_ROUND = 1;
+// The last round on which the codex gate is mandatory.
+//
+// ── 2026-08-12: codex is now the gate on EVERY round, and the 3-lens Claude panel is the FALLBACK ──
+// This was `1` (codex on round 1, panel-only afterward). The measurement that flipped it, from the
+// 2026-08-10 run's own panel on PR #1293: codex found the panel's ONLY P1 — `projectActionableDecisions`
+// filters `actionable === false`, but its sole production caller passes `ApprovalsItem[]`, which carries
+// liveness in `status`/`implementationRunLive`, so a DEAD confirmation still counts. All three Claude
+// lenses examined that exact function, all three reported the same line, and none reached the production
+// item shape. Cost of the leg that found it: 5.4 min on a separate subscription. Cost of the three that
+// did not: $17.25 and 36.5 min. Panel redundancy was measured in the same round — 22 findings from 4
+// reviewers collapsed to ~10 distinct defects on a `file:line_start` key.
+// Codex is free of the Claude weekly quota (it wound the 2026-08-10 run down mid-panel) and cheap enough
+// to run every round, which is what makes "every round" affordable where three Opus lenses were not.
+export const CROSS_VENDOR_ROUND = 99;
 // A waiver reason must NAME something. The floor is the crudest possible check that "n/a", "skip" and
 // "-" do not pass — the same shape as FALSIFY_MIN_EVIDENCE, and for the same reason: an unexplained
 // waiver is indistinguishable from a forgotten one (`waive-codex-gate` learned this first).
 export const CROSS_VENDOR_WAIVER_MIN_REASON = 12;
 
-export const CROSS_VENDOR_HEADING = "⚑ Round-1 `codex exec` gate (the DEFAULT reviewer of your first complete diff)";
+export const CROSS_VENDOR_HEADING = `⚑ The pre-PR review gate — \`codex exec\` on ${CROSS_VENDOR_MODEL} at ${CROSS_VENDOR_EFFORT} effort`;
 
 // The probe verdict, as a pure function over what the probe printed.
 //
@@ -2336,12 +2427,19 @@ export function crossVendorAttestation({
       },
     };
   }
-  if (requireAttestation && r <= CROSS_VENDOR_ROUND) {
+  // Round 1 gets the "you never ran it" message; a revision round gets the sharper "nothing has EVER
+  // attested this unit" one below. The selector is `r <= 1`, NOT `r <= CROSS_VENDOR_ROUND`: since
+  // CROSS_VENDOR_ROUND became 99 (codex on every round) that comparison is true for every reachable
+  // round, which would have made the revision-round branch dead code and silently deleted the more
+  // informative refusal. A message that can never be emitted is the documentation equivalent of a
+  // check that cannot fail.
+  if (requireAttestation && r <= 1) {
     return bad(
-      `review-panel: round ${r} is the FIRST complete diff, where the \`codex exec\` gate is the DEFAULT reviewer and is mandatory (DER-3011), and this receipt attests neither. ` +
+      `review-panel: round ${r} — the \`codex exec\` gate is THE reviewer on every round (2026-08-12), and this receipt attests neither a run nor a waiver. ` +
       "Pass BOTH --codex-review <out.json> and --codex-log <run.jsonl>, or --codex-waived \"<why not>\". " +
       "Run `codex-probe` first: it prints the ready-to-paste waiver line whenever codex is walled, 401'd or unresolvable. " +
-      "The waiver never blocks and the panel then stands as the sole gate — what is refused here is a receipt that is SILENT about whether codex ever looked.",
+      "Recording a PANEL at all implies codex was unavailable — so the waiver is the expected companion to this command, not an exception. " +
+      "What is refused here is a receipt that is SILENT about whether codex ever looked.",
     );
   }
   if (requireAttestation) {
@@ -6498,6 +6596,21 @@ export function materializeState(rawEvents, meta = {}) {
             // answer instead of its own — a reader would then see an attestation the receipt disclaims.
             cross_vendor: e.cross_vendor ?? null,
           };
+          // ── Round-count FLOOR from the gates themselves (2026-08-12) ───────────────────────────
+          // `kickback_count` increments only on a `kickback` event that is then DELIVERED. That is
+          // correct for the shepherd's path and blind to the orchestrator's: on run 20260810 the orch
+          // both GATED #1293 and DISPATCHED its fixer, so no shepherd `kickback` event ever existed,
+          // `kickback_count` read 0, and the round was invisible to the 3-round hard cap — the one
+          // control that stops a non-converging PR from grinding forever. The orchestrator noticed and
+          // hand-appended the missing events, which is exactly the manual repair a fold should not need.
+          //
+          // A gate that found blockers IS a review round, regardless of who dispatched the fix. Counting
+          // distinct blocker-bearing gate SHAs gives a floor that no dispatch path can bypass: re-gating
+          // the same sha does not inflate it, and a clean gate does not count at all.
+          if ((count.recorded ?? 0) > 0 || count.kind === "unreadable") {
+            it._blocker_gate_shas = it._blocker_gate_shas ?? new Set();
+            it._blocker_gate_shas.add(e.sha ?? `round:${e.round ?? "?"}`);
+          }
         }
         // DER-2782 — the WHOLE event, because an adjudication is checked against this event's findings
         // list, not against the blocker COUNT. Kept private and dropped in the finalize pass below.
@@ -6712,7 +6825,16 @@ export function materializeState(rawEvents, meta = {}) {
     }
     const verdict = (n, warn, trip) => (n >= trip ? "tripped" : n >= warn ? "warn" : "ok");
     const byTokens = verdict(v.tokens, BUDGET.warnTokens, BUDGET.tripTokens);
-    const byRounds = verdict(v.kickback_count, BUDGET.warnRounds, BUDGET.tripRounds);
+    // The round count the CAP reads is the greater of the delivered-kickback count and the number of
+    // distinct blocker-bearing gates. See the fold: an orchestrator that gates AND dispatches produces
+    // no `kickback` event at all, and the pre-2026-08-12 cap read 0 rounds on a PR in its third.
+    // `rounds_uncounted` is surfaced rather than silently folded in — a board that says "3 rounds" where
+    // the ledger shows 0 kickbacks looks like a bug unless it says which axis it counted.
+    const blockerGates = v._blocker_gate_shas ? v._blocker_gate_shas.size : 0;
+    delete v._blocker_gate_shas;
+    v.rounds_uncounted = Math.max(0, blockerGates - v.kickback_count);
+    v.rounds_effective = Math.max(v.kickback_count, blockerGates);
+    const byRounds = verdict(v.rounds_effective, BUDGET.warnRounds, BUDGET.tripRounds);
     // Rotation cap (2026-07-25). A rotation is NOT a kickback round — the lead ran out of context, not
     // out of correctness — so it rides its own axis and never inflates the review metrics. But an
     // UNCAPPED rotation is an infinite-life machine: DER-2160 burned ~922M tokens across 9 respawns
@@ -9886,6 +10008,12 @@ export async function runSubcommand(argv) {
             `a bare checkout with no node_modules, or the run being killed under memory pressure.`,
           );
         }
+        // A clean verdict from a run that could not execute is a false green (see the rule's own
+        // comment for why the inverse — discarding a denial-bearing run WITH findings — is wrong).
+        {
+          const falseGreen = codexFalseGreenRefusal({ verdict: review.verdict, explanation: review.explanation, findings: review.findings });
+          if (falseGreen) throw new Error(`review-usage: ${falseGreen}`);
+        }
         // The sha the review actually covered. --sha wins; otherwise read the worktree's HEAD, which
         // is the tree codex just looked at. Never guessed from the PR — the gate reviews the WORKING
         // TREE, which may not equal any pushed commit.
@@ -10150,6 +10278,13 @@ export async function runSubcommand(argv) {
         // falsified or adjudicated by reference, so it would be a blocker nobody can act on.
         if (codexFindings.some((f) => !f.title)) {
           throw new Error("review-panel --codex-review: a finding has no `title`. Every finding must be referenceable by title — that is how it is later falsified or adjudicated.");
+        }
+        // Same directional rule the standalone codex gate enforces. It is applied HERE too because the
+        // panel path can carry a codex leg, and a false green entering the union as the `codex` lens
+        // would read as cross-vendor corroboration of a clean PR.
+        {
+          const falseGreen = codexFalseGreenRefusal({ verdict: codexReview.verdict, explanation: codexReview.explanation, findings: codexReview.findings });
+          if (falseGreen) throw new Error(`review-panel: ${falseGreen}`);
         }
         if (requested.includes(CROSS_VENDOR_LENS)) {
           throw new Error(`review-panel: lens ${JSON.stringify(CROSS_VENDOR_LENS)} was supplied BOTH as --lens-file and as --codex-review. Pick one: recording the same reviewer twice would double its findings in the union and make its agreement count read as corroboration.`);
