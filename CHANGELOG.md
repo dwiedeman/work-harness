@@ -15,6 +15,102 @@ run materially different harness code against **one shared ledger** with no way 
 gate itself gained the missing half below — attesting the *acting* process's own version, not only
 versions already recorded in the ledger — in DER-2779.
 
+## [0.6.2] — 2026-08-12
+
+### Fixed — a report mixing priced and unpriced models no longer reads as fully priced
+
+Found by the new codex gate reviewing its own enabling change. `estimateCostFromPrices` answers one
+number, so a report carrying both a priced and an unpriced model returned non-null and the caller
+skipped the unpriced accounting for the WHOLE report. Executed counterexample: 1M `claude-opus-5`
+input tokens + 1M `kimi-k3` input tokens reported `cost_is_partial:false, unpriced_tokens:0,
+unpriced_models:[]` — the kimi spend vanished, while the config comment promises those models stay
+visible. New `priceBreakdown()` reports what it could price AND what it could not;
+`estimateCostFromPrices` stays as the number-only wrapper. Same case now: partial=true, 1,000,000
+unpriced tokens, `[kimi-k3]`, $5.
+
+## [0.6.1] — 2026-08-12
+
+### Fixed — `run-gate.sh` scratch is no longer a fixed absolute path
+
+`WORK_GATE_SCRATCH` overrides the default `/tmp/rost-gate-pr<N>r<R>`. Two gates on the same pr+round (a
+re-run, or a shepherd and an orchestrator racing) shared one directory, and the second `rm -rf` deleted
+the first's evidence mid-flight. It also made the script untestable in parallel — which is exactly how
+0.6.0's first CI run failed: green in the runner-suite step, red inside the installer smoke, where
+several installs run the same suite against that one path.
+
+## [0.6.0] — 2026-08-12
+
+**The pre-PR gate is now `codex exec` alone, and the launcher exists as a file.** Both changes come out
+of run `20260810T194109Z` (28 units planned, 5 merged, wound down on the Claude weekly quota wall).
+
+### Changed — the review gate is codex, not a 3-lens Claude panel (BREAKING, policy)
+
+- `codexReviewCommand` pins **`-m gpt-5.6-sol -c model_reasoning_effort="high"`** on the command rather
+  than inheriting `~/.codex/config.toml` (whose default is `medium`). A gate that silently reviewed at a
+  lower effort would still produce a receipt saying the gate ran.
+- `CROSS_VENDOR_ROUND` 1 → 99: codex runs on **every** round, not just the first. It rides a separate
+  subscription, so re-running costs no Claude budget — and a verdict on a tree the lead has since
+  changed is not a gate.
+- The 3-lens panel is now the **FALLBACK**, rendered but explicitly gated on "codex came back
+  unavailable". Measured on PR #1293: codex found the round's **only** P1 in 5.4 minutes while three
+  Opus lenses spent **$17.25 and 36.5 minutes** and read past it — all three examined the same function
+  and reported the same line without reaching the production item shape. 22 findings from 4 reviewers
+  deduped to ~10 distinct defects on a `file:line_start` key.
+- Briefs now carry a **QUIESCE** section. Four head-moves under a running gate in one night (#1292 ×2,
+  #1282 ×2); on #1292 r2 the push landed 102 seconds into a 12-minute $6.11 review, on the file under
+  review. The word `quiesce` previously appeared **zero** times in the harness.
+
+### Added — `skills/work/run-gate.sh`, the launcher that did not exist
+
+Every orchestrator hand-wrote one per run, and the same three defects recurred across seven documented
+sessions — each written down after each occurrence, each re-introduced by the next copy:
+
+- **Completeness is now non-empty AND parseable** (`test -s` + `jq -e '.result'`), reported as
+  `OUTS_NONEMPTY` / `OUTS_PARSEABLE` separately from `PROMPTS`. `> "$out"` creates the file empty before
+  the agent runs, so the old `ls | wc -l` reported 3-of-3 against a real roster of 2-of-3.
+- **The head is re-read from GitHub before any verdict is accepted**, and a mismatch stamps
+  `{"verdict":"stale"}`. The lens's own `git rev-parse HEAD` runs in a detached clone whose `origin` is a
+  local path — it cannot observe a push, so it was a check that could not fail. Six stale verdicts.
+- **`panel-manifest.json`** records the lenses actually started. A brief asserting three lenses when one
+  ran is undetectable from inside a lens.
+- Quota-corpse detection (`is_error` + a byte floor — walled lenses returned 833–1377 B against 9–15 KB),
+  `MEMGATE … clear|TIMEOUT` printed from the loop's exit condition, per-round scratch at
+  `/tmp/rost-gate-pr<N>r<R>/`, and a `REVIEW-TARGET` file per tree (lens trees were pooled across PRs, so
+  the tree name lied). `WORK_GATE_MEMGATE_TRIES=0` disables the memory wait, whose default is a
+  15-minute silent block per lens.
+- It runs codex FIRST and **refuses to spend the panel** unless codex could not deliver.
+
+### Added — the codex false-green refusal is DIRECTIONAL
+
+`codexFalseGreenRefusal` refuses `overall_correctness == "patch is correct"` **only when** the run also
+reports a sandbox denial **and** returned zero findings. The naive rule — grep for "could not run" and
+discard — is backwards: on #1293 the run whose own explanation says *"Vitest could not collect in the
+read-only sandbox … but direct executable counterexamples confirmed the principal failures"* is the run
+that carried the only P1. Findings are positive evidence a denial cannot manufacture. Enforced in both
+`review-usage` and `review-panel`, and verified through the real CLI in both directions.
+
+### Fixed — a blocker-bearing gate is a round the hard cap can see
+
+`kickback_count` incremented only on a *delivered* `kickback` event. An orchestrator that both GATED and
+DISPATCHED produced no such event, so on run 20260810 a PR in its third blocker-bearing round read
+**0 rounds** and the 3-round cap never saw it. `rounds_effective` is now
+`max(kickback_count, distinct blocker-bearing gate shas)`, with `rounds_uncounted` surfaced so the board
+says which axis it counted. Re-gating the same sha is one round; a clean gate is not a round.
+
+### Changed — `prep-for-work` calibration, finally run against actuals
+
+`calibrate` was run against run 20260810's five merged PRs (its own output, not a hand summary):
+**additions 2.49× · files 1.70×**, against the stored 4.79× / 1.44×.
+
+- **Files replicate** (1.44×, then 1.70×) → the file multiplier is APPLIED at **1.57**.
+- **Additions do not** (4.79×, then 2.49× — a factor of two apart) → stays at 1, per the tool's own
+  "two runs disagree, do NOT move the table" verdict.
+- Split arithmetic is now driven by the **files** axis — not because files are accurate, but because
+  their bias is *stable*, and a stable bias can be divided out while an unstable one cannot.
+- 🔴 This **corrects** a claim circulating in the session notes that file counts "transfer exactly". They
+  do not (0.86×/2.29×/1.70×/1.00×/2.80×). That claim came from PR #1293 — which never merged and was
+  therefore never in the sample.
+
 ## [0.5.2] — 2026-08-10
 
 ### Fixed

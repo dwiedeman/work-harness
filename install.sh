@@ -180,10 +180,11 @@ run_suite() {
 # and the context-wrap-nudge suites into ~/.claude for a while without ever running them, so a broken
 # hook would have installed "clean". An unverified shipped file is the same silent-success shape as the
 # `|| true` this function replaced.
-run_suite "skills/work — work-runner + work-metrics + session-end-telemetry" \
+run_suite "skills/work — work-runner + work-metrics + session-end-telemetry + run-gate" \
   "$DEST/skills/work/work-runner.test.mjs" \
   "$DEST/skills/work/work-metrics.test.mjs" \
-  "$DEST/skills/work/session-end-telemetry.test.mjs"
+  "$DEST/skills/work/session-end-telemetry.test.mjs" \
+  "$DEST/skills/work/run-gate.test.mjs"
 run_suite "skills/prep-for-work — prep-runner.test.mjs" \
   "$DEST/skills/prep-for-work/prep-runner.test.mjs"
 run_suite "hooks — context-wrap-nudge.test.mjs" \

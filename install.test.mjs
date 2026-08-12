@@ -25,7 +25,7 @@ const RED = 'import { test } from "node:test";\nimport assert from "node:assert/
 // A fixture SRC tree shaped the way install.sh expects: its `find` line names every skill dir and the
 // hook, and under `set -euo pipefail` a missing path is fatal — so the fixture ships them all, and a
 // failure here is about the self-test, not about a missing fixture file.
-async function fixture({ runner = GREEN, metrics = GREEN, prep = GREEN, telemetry = GREEN, hook = GREEN, version = "9.9.9\n" } = {}) {
+async function fixture({ runner = GREEN, metrics = GREEN, prep = GREEN, telemetry = GREEN, hook = GREEN, gate = GREEN, version = "9.9.9\n" } = {}) {
   const dir = await mkdtemp(join(tmpdir(), "wh-install-"));
   const src = join(dir, "src");
   for (const d of ["skills/work", "skills/work-lead", "skills/work-shepherd", "skills/prep-for-work", "hooks"]) {
@@ -38,6 +38,12 @@ async function fixture({ runner = GREEN, metrics = GREEN, prep = GREEN, telemetr
   // The fixture must model every suite install.sh verifies, or the all-green control fails on a missing
   // fixture file rather than on installer behaviour. repo-contract.test.mjs keeps the two lists aligned.
   await writeFile(join(src, "skills/work/session-end-telemetry.test.mjs"), telemetry, "utf8");
+  // run-gate.test.mjs + run-gate.sh (0.6.0). Adding the suite to install.sh's verify list without
+  // adding it here is what reddened 0.6.0's installer smoke: `Could not find …/run-gate.test.mjs`.
+  // The .sh ships too — the suite drives the real script, so a fixture with only the test would pass
+  // for the wrong reason.
+  await writeFile(join(src, "skills/work/run-gate.test.mjs"), gate, "utf8");
+  await writeFile(join(src, "skills/work/run-gate.sh"), "#!/bin/bash\nexit 0\n", "utf8");
   await writeFile(join(src, "hooks/context-wrap-nudge.test.mjs"), hook, "utf8");
   await writeFile(join(src, "skills/work-lead/SKILL.md"), "# lead\n", "utf8");
   await writeFile(join(src, "skills/work-shepherd/SKILL.md"), "# shepherd\n", "utf8");

@@ -95,6 +95,22 @@ reads as recon and gets refused). Instead the orchestrator derives everything fr
 {"type":"handed_off","issues":["<DER-id>"],"pr":<PR>,"host":"cloud","sha":"'"$SHA"'"}'` — the runner's
 fold now reads that `sha` as deterministic evidence of a real pushed fix, so include it.)
 
+### 🔴 QUIESCE after ready — this is the rule cloud leads break most
+
+**Push the whole round, THEN mark ready, THEN stop touching the branch.** Once you are ready the
+shepherd may start a gate at that instant, and a gate reviews ONE sha — a later push produces a verdict
+covering a tree nobody read. Measured: **four head-moves under a running gate in one night** (#1292 ×2,
+#1282 ×2); on #1292 r2 the push landed **102 seconds** into a 12-minute, $6.11 review and touched the
+exact file under review. The single lead that quiesced had its gate valid first try.
+
+The launcher re-reads `headRefOid` before accepting any verdict and stamps `stale` on a mismatch, so a
+quiet push cannot slip a stale gate through — it just burns the round and it gets paid for twice. If a
+push is genuinely unavoidable, say so in a hand-off comment naming the new sha.
+
+**You have NO `codex` binary.** `which codex` returns nothing in a cloud session, and the pre-PR gate is
+`codex exec`. Say so explicitly in your hand-off note so the orchestrator supplies the gate leg locally.
+Do NOT quietly substitute the Claude panel, and do NOT hand off ungated while implying it was gated.
+
 **Kickback re-spawn (item 1):** if this brief has a "⚠ Kickback" block, the PR already exists and the
 shepherd **converted it back to draft** when kicking it back (so your fix pushes run no CI). Skip the
 PR-open in step 1 (don't open a new PR) but DO post your own fresh telemetry comment at boot (you are a

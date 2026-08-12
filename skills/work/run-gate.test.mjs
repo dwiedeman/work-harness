@@ -1,0 +1,204 @@
+// Controls for run-gate.sh — the launcher whose three recurring defects were all "checks that could not
+// fail". Each test below drives the REAL script with a stubbed `gh`/`codex`/`claude` on PATH, so what is
+// asserted is the script's behaviour, not a re-implementation of its logic in the test.
+//
+// The three defects, each with a control that must return the FAILING answer:
+//   1. completeness by file existence  -> a 0-byte lens output must NOT count as a verdict
+//   2. no head re-bind                 -> a head that moves mid-gate must produce verdict=stale
+//   3. no manifest                     -> the lenses actually started must be recorded
+
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { mkdtemp, mkdir, writeFile, readFile, chmod, rm } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+import { spawnSync } from "node:child_process";
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const GATE = join(HERE, "run-gate.sh");
+const SHA_A = "a".repeat(40);
+const SHA_B = "b".repeat(40);
+
+// A fake bin dir placed FIRST on PATH. `gh` prints whatever head the scenario wants; `codex` and
+// `claude` are scripted per test.
+async function fakeBin(dir, { ghHeads = [SHA_A], codex = null, claude = null } = {}) {
+  const bin = join(dir, "bin");
+  await mkdir(bin, { recursive: true });
+  // `gh` walks a list of heads, one per invocation, so a test can make the head MOVE between the
+  // start-bind and the end-bind. A single fixed value could never exercise the stale path.
+  await writeFile(join(bin, "gh"), [
+    "#!/bin/bash",
+    `HEADS=(${ghHeads.join(" ")})`,
+    `N_FILE="${join(dir, "gh.calls")}"`,
+    'n=$(cat "$N_FILE" 2>/dev/null || echo 0)',
+    'echo $((n+1)) > "$N_FILE"',
+    'idx=$n; last=$(( ${#HEADS[@]} - 1 )); [ "$idx" -gt "$last" ] && idx=$last',
+    'echo "${HEADS[$idx]}"',
+  ].join("\n"), "utf8");
+  await chmod(join(bin, "gh"), 0o755);
+
+  await writeFile(join(bin, "codex"), codex ?? ["#!/bin/bash", "exit 127"].join("\n"), "utf8");
+  await chmod(join(bin, "codex"), 0o755);
+
+  await writeFile(join(bin, "claude"), claude ?? ["#!/bin/bash", "exit 127"].join("\n"), "utf8");
+  await chmod(join(bin, "claude"), 0o755);
+  return bin;
+}
+
+// A stub runner that emits a non-empty prompt for any lens, so prompt rendering is never the reason a
+// scenario fails. `node <runner> panel-prompt --issue X --lens L --diff D`
+async function fakeRunner(dir) {
+  const p = join(dir, "runner.mjs");
+  await writeFile(p, `console.log("PROMPT for lens " + process.argv[process.argv.indexOf("--lens")+1]);`, "utf8");
+  return p;
+}
+
+async function scenario(opts = {}) {
+  const dir = await mkdtemp(join(tmpdir(), "run-gate-"));
+  const tree = join(dir, "tree");
+  await mkdir(tree, { recursive: true });
+  const bin = await fakeBin(dir, opts);
+  const runner = await fakeRunner(dir);
+  const res = spawnSync("bash", [GATE,
+    "--pr", "1293", "--repo", "o/r", "--sha", opts.sha ?? SHA_A, "--tree", tree,
+    "--round", "1", "--issue", "DER-1", "--runner", runner,
+    ...(opts.extraArgs ?? []),
+  ], {
+    encoding: "utf8",
+    // MEMGATE off: its default is a 15-minute block PER LENS on a memory-starved box, which made the
+    // first version of this file hang for 45 minutes without emitting one assertion.
+    env: {
+      ...process.env,
+      PATH: `${bin}:${process.env.PATH}`,
+      WORK_CODEX_BIN: "",
+      WORK_GATE_MEMGATE_TRIES: "0",
+      // Per-scenario scratch. The first CI run of this file failed only inside the installer smoke,
+      // where several installs run the same suite against one fixed /tmp path — a collision the
+      // script now makes impossible rather than one the test tiptoes around.
+      WORK_GATE_SCRATCH: join(dir, "gate-scratch"),
+    },
+  });
+  const D = join(dir, "gate-scratch");
+  let verdict = null;
+  if (existsSync(join(D, "gate-verdict.json"))) {
+    verdict = JSON.parse(await readFile(join(D, "gate-verdict.json"), "utf8"));
+  }
+  let manifest = null;
+  if (existsSync(join(D, "panel-manifest.json"))) {
+    manifest = JSON.parse(await readFile(join(D, "panel-manifest.json"), "utf8"));
+  }
+  return { res, verdict, manifest, D, dir };
+}
+
+const CODEX_LIVE = [
+  "#!/bin/bash",
+  // Mimic the real invocation: --output-last-message <file>, JSONL on stdout.
+  'out=""; while [ $# -gt 0 ]; do [ "$1" = "--output-last-message" ] && out="$2"; shift; done',
+  'echo \'{"type":"item.completed","item":{"type":"command_execution","command":"rg -n x"}}\'',
+  'echo \'{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5}}\'',
+  '[ -n "$out" ] && echo \'{"overall_correctness":"patch is incorrect","findings":[{"title":"t"}]}\' > "$out"',
+  "exit 0",
+].join("\n");
+
+// A codex that DIES: exits 0 with no turn.completed. This is the shape the whole gate is written
+// against — "a gate that dies exits 0".
+const CODEX_DEAD = [
+  "#!/bin/bash",
+  "echo '{\"type\":\"thread.started\"}'",
+  "exit 0",
+].join("\n");
+
+test("run-gate: codex produces the verdict and the panel is NOT run", async () => {
+  const { res, verdict } = await scenario({ codex: CODEX_LIVE });
+  assert.equal(res.status, 0, res.stderr);
+  assert.equal(verdict.gate, "codex");
+  assert.equal(verdict.verdict, "ok");
+  assert.match(res.stdout, /Panel NOT run/, "the whole point of the 2026-08-12 policy is that the panel does not also run");
+  assert.doesNotMatch(res.stdout, /LENS_START/, "no lens may start when codex delivered");
+});
+
+test("run-gate: a codex run that EXITS 0 with no turn.completed is DEAD, not clean", async () => {
+  // Panel also unavailable (claude exits 127), so the run must end unusable rather than pretend.
+  const { res, verdict } = await scenario({ codex: CODEX_DEAD });
+  assert.notEqual(res.status, 0, "a dead gate must NEVER exit 0 — that is the failure this file exists against");
+  assert.match(res.stdout, /CODEX_DEAD/);
+  assert.match(res.stdout, /it is NOT a clean PR/);
+  assert.equal(verdict?.verdict, "incomplete");
+});
+
+test("run-gate: a 0-byte lens output does NOT count as a delivered verdict", async () => {
+  // THE defect. `> $D/$L.out.json` creates the file before the agent runs; a file-existence count
+  // reports 3-of-3 against a real roster of 0-of-3. This claude stub writes NOTHING and exits 0.
+  const CLAUDE_SILENT = ["#!/bin/bash", "exit 0"].join("\n");
+  const { res, verdict } = await scenario({ codex: CODEX_DEAD, claude: CLAUDE_SILENT });
+  assert.notEqual(res.status, 0);
+  assert.match(res.stdout, /OUTS_NONEMPTY=0/, "empty outputs must be counted as empty, not as delivered");
+  assert.match(res.stdout, /PROMPTS=3/, "…while the prompts really were rendered — the two counts must be reported SEPARATELY");
+  assert.equal(verdict.verdict, "incomplete");
+});
+
+test("run-gate: a QUOTA-WALLED lens (is_error, subtype success) is refused despite being well-formed", async () => {
+  // The dangerous shape: a limit-killed lens returns a well-formed envelope with top-level
+  // subtype:"success". Only is_error and the byte count separate it from a real verdict.
+  const CLAUDE_WALLED = [
+    "#!/bin/bash",
+    `echo '{"subtype":"success","is_error":true,"result":"You have hit your weekly limit"}'`,
+    "exit 0",
+  ].join("\n");
+  const { res, verdict } = await scenario({ codex: CODEX_DEAD, claude: CLAUDE_WALLED });
+  assert.notEqual(res.status, 0, "a walled panel must not read as a clean one");
+  assert.match(res.stdout, /WALLED=3/);
+  assert.match(res.stdout, /is_error/);
+  assert.equal(verdict.verdict, "incomplete");
+});
+
+test("run-gate: a head that MOVES during the gate produces verdict=stale, not a verdict", async () => {
+  // Six verdicts shipped stale because the lens's own `git rev-parse HEAD` ran in a detached clone
+  // whose origin is a local path — a check that cannot fail. The launcher reads GitHub, so it can.
+  const { res, verdict } = await scenario({ codex: CODEX_LIVE, ghHeads: [SHA_A, SHA_B] });
+  assert.notEqual(res.status, 0);
+  assert.equal(verdict.verdict, "stale");
+  assert.equal(verdict.reviewed, SHA_A);
+  assert.equal(verdict.head, SHA_B);
+  assert.equal(verdict.phase, "end", "the move must be caught at the END bind — binding only at the start is what failed 6 times");
+});
+
+test("run-gate: CONTROL — an unmoved head does NOT produce stale", async () => {
+  // Without this the stale check might simply fire always, which would be indistinguishable from
+  // working and would block every good gate.
+  const { verdict } = await scenario({ codex: CODEX_LIVE, ghHeads: [SHA_A, SHA_A] });
+  assert.equal(verdict.verdict, "ok", "a stationary head must pass — a check that always fails is not a check");
+});
+
+test("run-gate: refuses to START on a sha that is already not the head", async () => {
+  const { res, verdict } = await scenario({ codex: CODEX_LIVE, ghHeads: [SHA_B] });
+  assert.notEqual(res.status, 0);
+  assert.equal(verdict.phase, "start");
+});
+
+test("run-gate: writes a panel-manifest of the lenses actually STARTED", async () => {
+  const CLAUDE_OK = [
+    "#!/bin/bash",
+    `printf '{"subtype":"success","is_error":false,"result":"%s"}' "$(head -c 3000 /dev/zero | tr '\\0' 'x')"`,
+    "exit 0",
+  ].join("\n");
+  const { manifest } = await scenario({ codex: CODEX_DEAD, claude: CLAUDE_OK, extraArgs: ["--lenses", "correctness security"] });
+  assert.deepEqual(manifest.lenses_started, ["correctness", "security"],
+    "a brief that claims 3 lenses when 1 ran is undetectable from inside a lens — the manifest is the only fix");
+});
+
+test("run-gate: --sha shorter than 40 chars is refused", async () => {
+  const { res } = await scenario({ codex: CODEX_LIVE, sha: "abc123def" });
+  assert.notEqual(res.status, 0);
+  assert.match(res.stderr, /40-char/);
+});
+
+test("run-gate: drops a REVIEW-TARGET identity file in the tree", async () => {
+  const { dir } = await scenario({ codex: CODEX_LIVE });
+  const rt = await readFile(join(dir, "tree", "REVIEW-TARGET"), "utf8");
+  assert.match(rt, /pr=1293/);
+  assert.match(rt, new RegExp(`reviewed_sha=${SHA_A}`), "lens trees were POOLED across PRs; the tree name lies, so the identity must be IN the tree");
+  await rm(dir, { recursive: true, force: true });
+});

@@ -577,13 +577,27 @@ test("calibrate: a measurement cannot CONFIRM ITSELF — the two-run rule is enf
   assert.match(diverging.confirmsPrior.note, /do NOT move the table/);
 });
 
-test("applyCalibration: identity by default; scales both axes when set", () => {
+test("applyCalibration: a CONFIRMED axis scales, an UNCONFIRMED axis stays identity", () => {
   const est = { expectedFiles: 10, expectedAdditions: 500 };
-  assert.deepEqual(applyCalibration(est), est, "an unconfirmed calibration must not silently resize anything");
+
+  // The default is no longer identity on BOTH axes, and the asymmetry is the point (2026-08-12).
+  // Two independent runs put the file bias at 1.44× and 1.70× — that replicates, so it is applied.
+  // The same two runs put the additions bias at 4.79× and 2.49× — a factor of two apart, so it is NOT
+  // applied, and `calibrate`'s own verdict on that pair is "do NOT move the table on either".
+  const dflt = applyCalibration(est);
+  assert.equal(dflt.expectedAdditions, 500, "an UNCONFIRMED axis must not silently resize anything");
+  assert.equal(dflt.expectedFiles, 16, "a REPLICATED axis is applied — 10 × 1.57, rounded");
+  assert.equal(CALIBRATION.additions, 1, "the additions multiplier stays 1 until two runs agree on it");
+  assert.ok(CALIBRATION.files > 1, "the files multiplier is live");
+
+  // An explicit calibration still scales both axes — the caller may know better than the default.
   const scaled = applyCalibration(est, { additions: 4.79, files: 1.44 });
   assert.equal(scaled.expectedAdditions, 2395);
   assert.equal(scaled.expectedFiles, 14);
   assert.deepEqual(scaled.calibrated, { additions: 4.79, files: 1.44 });
+
+  // CONTROL — an all-ones calibration is still a true identity, so the early return is not dead code.
+  assert.deepEqual(applyCalibration(est, { additions: 1, files: 1 }), est);
 });
 
 // ---- Spec mode (2026-07-29): one spec, one tracking issue, units carved in the plan ----
