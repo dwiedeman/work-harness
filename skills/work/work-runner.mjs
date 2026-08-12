@@ -4896,15 +4896,28 @@ export function getModelPrices() { return MODEL_PRICES; }
 // USD for one report's by_model block, using MODEL_PRICES (per-million rates). Returns null when NO
 // constituent model has a configured price — the caller then counts the whole report as unpriced.
 // Longest-substring match so "deepseek/deepseek-v4-pro" can be priced by a "deepseek-v4-pro" key.
-export function estimateCostFromPrices(by_model = {}, prices = MODEL_PRICES) {
+// ── #7 (codex gate, 2026-08-12): PARTIAL pricing must stay visible ───────────────────────────────
+// `estimateCostFromPrices` answers one number, so a report mixing a priced and an unpriced model
+// returned a non-null cost — and the caller's `if (derived != null) continue;` then skipped the
+// unpriced accounting for that WHOLE report. Executed counterexample: 1M claude-opus-5 input tokens
+// plus 1M kimi-k3 input tokens reported `cost_is_partial:false, unpriced_tokens:0, unpriced_models:[]`.
+// The kimi spend disappeared — while `.claude/work.config.json`'s own comment promises those models
+// stay VISIBLE in `unpriced_models`. A cost meter that silently drops a model is the exact defect the
+// price table was added to fix, one layer up.
+//
+// `priceBreakdown` is the honest primitive: it reports what it could price AND what it could not.
+// `estimateCostFromPrices` stays as the number-only wrapper its existing callers expect.
+export function priceBreakdown(by_model = {}, prices = MODEL_PRICES) {
   const keys = Object.keys(prices ?? {});
-  if (!keys.length) return null;
   let cost = 0;
-  let matched = false;
+  const priced = [];
+  const unpriced = [];
   for (const [model, u] of Object.entries(by_model ?? {})) {
-    const key = keys.filter((k) => String(model).includes(k)).sort((a, b) => b.length - a.length)[0];
-    if (!key) continue;
-    matched = true;
+    const key = keys.length
+      ? keys.filter((k) => String(model).includes(k)).sort((a, b) => b.length - a.length)[0]
+      : undefined;
+    if (!key) { unpriced.push(model); continue; }
+    priced.push(model);
     const p = prices[key] ?? {};
     cost +=
       ((Number(u?.input) || 0) * (Number(p.input) || 0) +
@@ -4912,7 +4925,12 @@ export function estimateCostFromPrices(by_model = {}, prices = MODEL_PRICES) {
         (Number(u?.cache_creation) || 0) * (Number(p.cache_creation) || 0) +
         (Number(u?.cache_read) || 0) * (Number(p.cache_read) || 0)) / 1_000_000;
   }
-  return matched ? Math.round(cost * 10000) / 10000 : null;
+  return { cost: Math.round(cost * 10000) / 10000, priced, unpriced };
+}
+
+export function estimateCostFromPrices(by_model = {}, prices = MODEL_PRICES) {
+  const b = priceBreakdown(by_model, prices);
+  return b.priced.length ? b.cost : null;
 }
 
 // True when an issue's file-scope requires a Docker-capable host — real Postgres for *.db.test.ts,
@@ -7410,13 +7428,18 @@ export function aggregateTokenUsage(events = []) {
       cost += Number(e.cost_usd_estimate) || 0;
       continue;
     }
-    // Unpriced report: try the configured per-model rates, else book it to the visible gap.
-    const derived = estimateCostFromPrices(e.by_model);
-    if (derived != null) { cost += derived; continue; }
-    costKnown = false;
-    unpricedReports += 1;
-    unpricedTokens += Object.values(e.by_model).reduce((s, u) => s + sumTokens(u), 0);
-    for (const m of Object.keys(e.by_model)) unpricedModels.add(m);
+    // Unpriced report: price what we can, and book the REST to the visible gap. #7 — this used to be
+    // all-or-nothing per report, so one priced model made a mixed report read as fully priced.
+    const b = priceBreakdown(e.by_model);
+    cost += b.cost;
+    if (b.unpriced.length) {
+      costKnown = false;
+      unpricedReports += 1;
+      for (const m of b.unpriced) {
+        unpricedModels.add(m);
+        unpricedTokens += sumTokens(e.by_model[m]);
+      }
+    }
   }
   return {
     reports,

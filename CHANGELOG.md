@@ -15,6 +15,19 @@ run materially different harness code against **one shared ledger** with no way 
 gate itself gained the missing half below — attesting the *acting* process's own version, not only
 versions already recorded in the ledger — in DER-2779.
 
+## [0.6.2] — 2026-08-12
+
+### Fixed — a report mixing priced and unpriced models no longer reads as fully priced
+
+Found by the new codex gate reviewing its own enabling change. `estimateCostFromPrices` answers one
+number, so a report carrying both a priced and an unpriced model returned non-null and the caller
+skipped the unpriced accounting for the WHOLE report. Executed counterexample: 1M `claude-opus-5`
+input tokens + 1M `kimi-k3` input tokens reported `cost_is_partial:false, unpriced_tokens:0,
+unpriced_models:[]` — the kimi spend vanished, while the config comment promises those models stay
+visible. New `priceBreakdown()` reports what it could price AND what it could not;
+`estimateCostFromPrices` stays as the number-only wrapper. Same case now: partial=true, 1,000,000
+unpriced tokens, `[kimi-k3]`, $5.
+
 ## [0.6.1] — 2026-08-12
 
 ### Fixed — `run-gate.sh` scratch is no longer a fixed absolute path
