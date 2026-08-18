@@ -50,9 +50,12 @@ logged in as; a legacy `environmentId` is inert history.
 
 Also in this release:
 
-- The brief's boot step confirms the branch with `checkout -B` instead of creating it with `checkout -b`
-  (the session already starts on the issue branch), and the cloud kickback ack instruction points at a
-  WORK-EVENT PR comment — a cloud lead has no ledger access, so the shared `append` form named a command
+- The brief's boot step BINDS to the issue branch (`git fetch origin <b>:refs/remotes/origin/<b> &&
+  git checkout -B <b> origin/<b>`) instead of creating it with `checkout -b`. Measured 2026-08-18: the
+  session starts at the COMMIT checked out in the orchestrator's worktree (its HEAD was a scratch commit
+  that was not on main) but on its OWN `claude/<title-slug>` branch — so the bind is required, and on a
+  kickback round it is what loads the prior round's work. Do not read the `claude/…` branch name as "it
+  cloned main"; check the sha. The cloud kickback ack instruction points at a WORK-EVENT PR comment — a cloud lead has no ledger access, so the shared `append` form named a command
   that did not exist in its brief.
 - `state.transcripts_unverified` excludes cloud lanes by `host_kind`, not by the literal host name
   `"cloud"`: a run whose leads went to the second or third cloud account recorded `host:"cloud2"` and sat

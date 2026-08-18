@@ -42,9 +42,11 @@
     "cloud": {
       "kind": "cloud",
       "os": "linux",
-      "environmentId": "env_...",
       "credProfile": "$HOME/.claude-<account>",
-      "cap": 99,
+      "//credProfile": "MANDATORY for a cloud host: it selects the ACCOUNT, and that account's server-side default cloud environment is where the session runs. Initialize the profile interactively ONCE (`CLAUDE_CONFIG_DIR=<path> claude`) or `claude --cloud` hangs forever on the onboarding theme picker behind the pty.",
+      "//environmentId": "No longer read by anything (the CLI's --environment takes only ccpool_ ids). Keep an env_... id here only as a note about which environment that account's default points at.",
+      "cap": 4,
+      "//cap": "Set from a MEASURED concurrency, not a guess. 4 concurrent cloud sessions on one account ran clean on 2026-08-15; the real ceiling is unknown, so this is a floor that has been observed, not a discovered limit.",
       "enabled": false
     }
   },
