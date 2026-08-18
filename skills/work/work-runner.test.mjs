@@ -12280,7 +12280,14 @@ test("steer-cloud: a pre-2026-08-18 cloud lead has no recorded session id — re
     await appendEvent(s.runDir, { actor: "orch", type: "lead_spawned", issue: "DER-9", host: "cloud" });
     await assert.rejects(
       () => runSubcommand(["steer-cloud", "--run", s.runId, "DER-9", "--runs-root", s.runsRoot, "--repo-root", s.repo, "--dry-run"]),
-      /no cloud session id.*--session session_.*spawn-cloud --kickback/s,
+      (err) => {
+        const m = String(err.message);
+        assert.match(m, /no cloud session id/);
+        assert.match(m, /--session session_/, "recovery 1: steer an id the ledger never recorded");
+        assert.match(m, /spawn-cloud .*--host cloud .*--kickback/s,
+          "recovery 2: a replacement spawn, and it must carry --host — a cloud host is normally enabled:false, so a hostless command refuses");
+        return true;
+      },
     );
     // CONTROL — an explicit --session makes the same call work, so the refusal is about the missing id.
     await writeFile(join(s.runDir, "briefs", "DER-9.md"), "brief\n", "utf8");
@@ -12348,4 +12355,42 @@ test("spawn-cloud: an explicitly NAMED host is the operator opt-in, exactly as p
     await assert.rejects(() => runSubcommand(base), /enabled:false.*re-enable CONDITION/s,
       "a defaulted host that is disabled must still refuse — no deliberate choice was made");
   } finally { await rm(s.dir, { recursive: true, force: true }); }
+});
+
+test("rotate-lead REFUSES to auto-spawn onto a DISABLED cloud host — a manufactured --host is not an operator opt-in", async () => {
+  // spawn-cloud reads an explicitly named host as the operator's opt-in, which is right when a human types
+  // it. rotate-lead SYNTHESIZES that flag from ledger state, so without this guard an operator who disabled
+  // a cloud host mid-run (429s, a walled account, a repointed environment) would still get rotation spawns
+  // sent there — the machine authorizing itself with the human's own syntax.
+  const s = await mkCloudSandbox();
+  try {
+    s.push();
+    for (const ev of [
+      { actor: "orch", type: "worktree_created", issue: "DER-9", worktree: s.wt, branch: s.branch },
+      { actor: "orch", type: "lead_spawned", issue: "DER-9", host: "cloudoff", host_kind: "cloud", worktree: s.wt, cloudSessionId: "session_01Old" },
+      { actor: "lead", type: "pr_opened", issue: "DER-9", pr: 5 },
+    ]) await appendEvent(s.runDir, ev);
+    const out = await runSubcommand(["rotate-lead", "--run", s.runId, "DER-9", "--runs-root", s.runsRoot, "--repo-root", s.repo]);
+    assert.equal(out.spawned, false, "a disabled host must not receive an automatic rotation spawn");
+    assert.match(out.stdout, /REFUSING to spawn it automatically/);
+    assert.match(out.stdout, /spawn-cloud .*--host cloudoff .*--rotation 1 --push/s, "…and it must hand back the exact command a human would run");
+    const evs = await readEvents(s.runDir);
+    assert.equal(evs.filter((e) => e.type === "lead_spawned").length, 1, "no second spawn was recorded");
+    assert.equal(evs.filter((e) => e.type === "rotation_prepared" && e.blocked === "host_disabled").length, 1,
+      "the block is recorded, so the next wake can see the rotation is waiting on a human");
+  } finally { await rm(s.dir, { recursive: true, force: true }); }
+});
+
+test("deriveCloudPrEvents: create-worktree's OWN default branch shape still matches, for both id families", () => {
+  // Regression control for the whole-token fix: `create-worktree` names a branch `${id.toLowerCase()}-work`,
+  // so a SPEC unit lives on `spec-demo-u1-work` — a word that no `<letters>-<digits>` rule can find. The
+  // first version of the token fix returned null for it, silently unhooking spec units from lead_online /
+  // handed_off. The trailing `-` in the prefix rule is what keeps the DER-403/DER-4036 collision refused.
+  const o = { trustedPrAuthors: ["dwiedeman"], repoOwner: "acme" };
+  const pr = (t, h) => ({ number: 1, title: t, headRefName: h, isDraft: true, body: "", author: { login: "dwiedeman" }, headRepositoryOwner: { login: "acme" }, isCrossRepository: false });
+  const f = (p, ids) => deriveCloudPrEvents({ pr: p, runIssues: ids, ...o })[0]?.issue ?? null;
+  assert.equal(f(pr("feat: work", "spec-demo-u1-work"), ["SPEC-demo-U1"]), "SPEC-demo-U1", "spec default branch");
+  assert.equal(f(pr("feat: work", "der-4036-work"), ["DER-4036"]), "DER-4036", "linear default branch");
+  assert.equal(f(pr("feat: work", "derrekwiedeman/der-4036-slug"), ["DER-4036"]), "DER-4036", "linear gitBranchName form");
+  assert.equal(f(pr("feat: work", "der-4036-work"), ["DER-403"]), null, "the collision stays refused through the prefix rule");
 });

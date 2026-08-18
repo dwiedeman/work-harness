@@ -15,6 +15,32 @@ run materially different harness code against **one shared ledger** with no way 
 gate itself gained the missing half below — attesting the *acting* process's own version, not only
 versions already recorded in the ledger — in DER-2779.
 
+## [0.8.4] — 2026-08-18
+
+Round 3 of the pre-PR gate, which reviewed the forced-only change itself. Three of these are defects the
+previous round's fixes CREATED — the reason a round reviews the current head rather than the original diff:
+
+- **`rotate-lead` could auto-spawn onto a DISABLED cloud host.** 0.8.2 made "an explicitly named host is
+  the operator's opt-in" the rule; `rotate-lead` synthesizes `--host <host>` from ledger state, so a
+  machine was authorizing itself with the human's syntax. An operator who disables a host mid-run (429s, a
+  walled account, a repointed environment) means "no more work here", and a rotation is more work — so it
+  now stops at `rotation_prepared` (with `blocked:"host_disabled"` on the event) and prints the exact
+  command a human would run.
+- **Whole-token id matching broke `create-worktree`'s own default branch for SPEC units.** That branch is
+  `${id.toLowerCase()}-work`, so a spec unit lives on `spec-demo-u1-work` — a word no `<letters>-<digits>`
+  rule can find, which silently unhooked spec units from `lead_online`/`handed_off`. An id now matches a
+  word exactly OR as its leading `<id>-` segment; the trailing `-` is what keeps `der-403` from claiming
+  `der-4036-work`. Both id families and the collision are pinned by tests.
+- **`steer-cloud`'s "no session id" refusal threw a ReferenceError** instead of explaining itself: the new
+  message named `hostName` above its declaration. A refusal path is exactly where nobody looks until it
+  fires.
+- **Every cloud replacement command now carries `--host <the unit's own host>`** — in `steer-cloud`'s
+  fallback text and in SKILL's failed-to-start and kickback recoveries. Without it the command defaults to
+  `cloud`, which is `enabled:false`, so the documented recovery refused itself; on a multi-account fleet it
+  would also silently move the unit to another account's environment.
+- SKILL's routing paragraph still described cloud-first filling in its tail after its head had been
+  corrected to say cloud is not the default.
+
 ## [0.8.3] — 2026-08-18
 
 Two stale claims in the deployed skill, both found by the pre-PR gate reviewing the config change that

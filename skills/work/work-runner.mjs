@@ -8640,20 +8640,25 @@ export function deriveCloudPrEvents({ pr, runIssues = null, bundles = {}, status
   // CLI-dispatched cloud lead is system-bound to a `claude/…` branch (DER-4036) and the PR TITLE becomes
   // the only place the id appears. Tokenising on non-alphanumerics keeps the old branch-or-title reach
   // (`derrekwiedeman/der-4036-…` still matches) while making a longer id stop matching a shorter one.
-  const hayTokens = new Set(
-    `${pr.headRefName || ""} ${pr.title || ""}`.toLowerCase().split(/[^a-z0-9-]+/).flatMap((word) => {
-      // A branch segment is `<user>/der-4036-slug-words`: take every `<prefix>-<digits>` run inside it.
-      const ids = word.match(/[a-z]+-\d+/g) ?? [];
-      return word ? [word, ...ids] : ids;
-    }),
-  );
+  const hayWords = `${pr.headRefName || ""} ${pr.title || ""}`.toLowerCase().split(/[^a-z0-9-]+/).filter(Boolean);
+  // An id matches a word EXACTLY, or as that word's leading `<id>-` segment. Both halves are load-bearing:
+  //   exact   `DER-4036` in a title, and the `<prefix>-<digits>` run inside `<user>/der-4036-slug-words`;
+  //   prefix  `create-worktree`'s own default branch is `${id.toLowerCase()}-work`, so a SPEC unit lives on
+  //           `spec-demo-u1-work` — a word no `<letters>-<digits>` rule can find. Requiring the trailing
+  //           `-` is what stops `der-403` from claiming `der-4036-work`, which is the collision this whole
+  //           function was fixed for.
+  const matchesId = (id) => {
+    const needle = String(id).toLowerCase();
+    return hayWords.some((word) => word === needle || word.startsWith(`${needle}-`)
+      || (word.match(/[a-z]+-\d+/g) ?? []).includes(needle));
+  };
   let issue;
   // When runIssues is PROVIDED (an array, even empty), the PR MUST name one of them — otherwise it's
   // not part of this run and we emit nothing. Only `null`/undefined means "no filter" (test convenience;
   // the reconcile caller never passes that — it guards on an empty scope).
   if (runIssues != null) {
     if (!Array.isArray(runIssues) || !runIssues.length) return [];
-    issue = runIssues.find((id) => hayTokens.has(String(id).toLowerCase()));
+    issue = runIssues.find((id) => matchesId(id));
     if (!issue) return [];
   }
   const m = typeof pr.body === "string" ? pr.body.match(/session_[A-Za-z0-9]+/) : null;
@@ -10377,14 +10382,17 @@ export async function runSubcommand(argv) {
       const events = await readEvents(runDir);
       const spawn = [...events].reverse().find((e) => e.type === "lead_spawned" && e.issue === o.issueId && e.cloudSessionId);
       const sessionId = o.session ?? spawn?.cloudSessionId ?? null;
+      // Resolved BEFORE the refusal below, which names it: a message that throws a ReferenceError instead
+      // of explaining itself is worse than no message, and the refusal path is exactly where nobody looks
+      // until it fires. (Caught by the round-3 gate's own re-run of the suite.)
+      const hostName = o.host ?? spawn?.host ?? "cloud";
       if (!sessionId) {
         throw new Error(
           `steer-cloud: no cloud session id for ${o.issueId}. Nothing on this run's ledger recorded one, so there is no live lead to steer. ` +
           "A pre-2026-08-18 cloud lead was spawned by RemoteTrigger routine and has no id here — pass it explicitly with --session session_… " +
-          "(the draft PR's footer carries it, and `state` folds it onto the unit's `handle`), or dispatch a replacement with `spawn-cloud --kickback <n>`.",
+          `(the draft PR's footer carries it, and \`state\` folds it onto the unit's \`handle\`), or dispatch a replacement with \`spawn-cloud --run ${o.runId ?? "<run>"} ${o.issueId} --host ${hostName} --worktree <p> --kickback <n> --push\` — the --host is REQUIRED, not decoration: it names the account this unit already lives on, and a cloud host is normally enabled:false (forced-only), so a command without it defaults to \`cloud\` and refuses.`,
         );
       }
-      const hostName = o.host ?? spawn?.host ?? "cloud";
       const hostCfg = getHosts()[hostName];
       if (!hostCfg?.credProfile) throw new Error(`steer-cloud: host "${hostName}" has no credProfile — a steer must go out on the SAME account that owns the session, and CLAUDE_CONFIG_DIR is how that is chosen.`);
       const credProfile = hostCfg.credProfile.startsWith("~") ? join(homedir(), hostCfg.credProfile.slice(1)) : hostCfg.credProfile;
@@ -11717,6 +11725,18 @@ export async function runSubcommand(argv) {
       // completes here like every other host. It still cannot when the unit has no worktree, which is what
       // every routine-era cloud unit looks like: the session clones the ref checked out in a worktree, and
       // without one there is nothing to clone from.
+      // A DISABLED cloud host does not get an automatic rotation spawn (2026-08-18). `spawn-cloud` treats an
+      // explicitly named host as the operator's opt-in — which is right when a human types it, and wrong
+      // here, where this command MANUFACTURES `--host <host>` from ledger state. An operator who disables a
+      // host mid-run (429s, a walled account, a repointed environment) means "send no more work there", and
+      // a rotation is more work. So stop at `rotation_prepared` and make the next dispatch a human's.
+      if (isCloud && hostCfg?.enabled === false) {
+        if (!o.dryRun) await appendEvent(runDir, { actor: "orch", type: "rotation_prepared", issue: o.issueId, rotation, brief: briefPath, host, blocked: "host_disabled" });
+        return {
+          briefPath, rotation, wipCommitted, noteSynthesized, host, spawned: false,
+          stdout: `prepared rotation ${rotation} for ${o.issueId}, but host "${host}" is enabled:false — REFUSING to spawn it automatically.\n  A disabled host means "no more work here", and this command would have synthesized the --host that spawn-cloud reads as an operator opt-in.\n  Read that host's note in .claude/work.config.json, then dispatch it yourself if you still want it:\n  spawn-cloud --run ${o.runId} ${o.issueId} --host ${host} --worktree ${it.worktree ?? "<p>"} --rotation ${rotation} --push`,
+        };
+      }
       if (isCloud && !it.worktree) {
         if (!o.dryRun) await appendEvent(runDir, { actor: "orch", type: "rotation_prepared", issue: o.issueId, rotation, brief: briefPath, host });
         return {
