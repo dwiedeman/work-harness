@@ -6939,11 +6939,22 @@ async function withEnv(patch, fn) {
 // Boot a run, take DER-1 to an UN-ACTIONED kickback, and put a cmux stub with the given outcome on disk.
 // The kickback is the state that makes this a P1: `lead_spawned` is the SOLE delivery evidence for a
 // kickback round, so a phantom one empties kickbacks_pending and clears lead_process_dead.
-async function kickedBackRun({ exit = 0, out = "", err = "cmux: connection refused" } = {}) {
+// The `sysctl` stub is not decoration. spawn-lead's local-dispatch freeze guard (6.3) shells the REAL
+// `sysctl vm.swapusage`, so every test below used to inherit the developer's machine state: on a box
+// swapping over 85% all five of them failed with the guard's refusal instead of exercising the
+// spawn-accounting they assert — and because install.sh gates on a green suite, a swapping machine could
+// not install the harness at all. Stubbing the probe on PATH keeps the wiring REAL (the call site still
+// runs `sysctl` and still honors its answer; SWAP_HIGH below proves that) while making the reading a
+// fixture instead of the weather.
+const SWAP_HEALTHY = "vm.swapusage:  total = 19456.00M  used = 2048.00M  free = 17408.00M  (encrypted)";
+const SWAP_FREEZE = "vm.swapusage:  total = 19456.00M  used = 18000.00M  free = 1456.00M  (encrypted)";
+
+async function kickedBackRun({ exit = 0, out = "", err = "cmux: connection refused", swap = SWAP_HEALTHY } = {}) {
   const root = await mkdtemp(join(tmpdir(), "wr-spawnfail-"));
   const bin = join(root, "bin");
   await mkdir(bin, { recursive: true });
   await writeStubBin(join(bin, "cmux"), { exit, out, err });
+  await writeStubBin(join(bin, "sysctl"), { exit: 0, out: swap });
   const { runId } = await runSubcommand(["init-run", "--project", "s", "--runs-root", root, "--repo-root", root]);
   const runDir = join(root, runId);
   for (const ev of [
@@ -6957,7 +6968,9 @@ async function kickedBackRun({ exit = 0, out = "", err = "cmux: connection refus
     "spawn-lead", "--run", runId, "DER-1", "--runs-root", root, "--repo-root", root,
     "--worktree", "/wt/DER-1", "--title", "t", ...extra,
   ];
-  return { root, runId, runDir, bin, cmux: join(bin, "cmux"), spawnArgs };
+  // One env patch every caller uses: the cmux stub AND the stubbed swap probe.
+  const env = { WORK_CMUX_BIN: join(bin, "cmux"), PATH: `${bin}:${process.env.PATH}` };
+  return { root, runId, runDir, bin, cmux: join(bin, "cmux"), spawnArgs, env };
 }
 
 test("DER-2739: spawnOutcome — a launch is PROVEN only by exit 0 AND a parsed workspace ref", () => {
@@ -6977,12 +6990,12 @@ test("DER-2739: spawnOutcome — a launch is PROVEN only by exit 0 AND a parsed 
 });
 
 test("DER-2739: a cmux launch that EXITS NONZERO appends NO lead_spawned — the kickback stays pending", async () => {
-  const { root, runId, runDir, cmux, spawnArgs } = await kickedBackRun({ exit: 1, out: "" });
+  const { root, runId, runDir, env, spawnArgs } = await kickedBackRun({ exit: 1, out: "" });
   try {
     const before = materializeState(await readEvents(runDir), { run_id: runId });
     assert.deepEqual(before.kickbacks_pending, ["DER-1"], "precondition: the kickback is un-actioned");
     assert.deepEqual(before.leads_dead.map((r) => r.issue), ["DER-1"], "precondition: the process is believed dead");
-    await withEnv({ WORK_CMUX_BIN: cmux }, () =>
+    await withEnv(env, () =>
       assert.rejects(
         () => runSubcommand(spawnArgs(["--kickback", "1"])),
         /did not succeed/,
@@ -7013,9 +7026,9 @@ test("DER-2739: a cmux launch that EXITS NONZERO appends NO lead_spawned — the
 });
 
 test("DER-2739: a cmux launch that EXITS 0 with no workspace ref is equally un-proven", async () => {
-  const { root, runId, runDir, cmux, spawnArgs } = await kickedBackRun({ exit: 0, out: "usage: cmux new-workspace [options]" });
+  const { root, runId, runDir, env, spawnArgs } = await kickedBackRun({ exit: 0, out: "usage: cmux new-workspace [options]" });
   try {
-    await withEnv({ WORK_CMUX_BIN: cmux }, () =>
+    await withEnv(env, () =>
       assert.rejects(() => runSubcommand(spawnArgs(["--kickback", "1"])), /did not succeed/));
     const evs = await readEvents(runDir);
     assert.equal(evs.filter((e) => e.type === "lead_spawned").length, 1, "exit 0 + null ref must not append a spawn");
@@ -7033,9 +7046,9 @@ test("DER-2739: a cmux launch that EXITS 0 with no workspace ref is equally un-p
 // The control that proves the gate does NOT block the healthy case. A gate that refuses every launch
 // would pass every assertion above while breaking the harness outright.
 test("DER-2739 CONTROL: a launch that exits 0 AND prints a workspace ref still records lead_spawned and actions the kickback", async () => {
-  const { root, runId, runDir, cmux, spawnArgs } = await kickedBackRun({ exit: 0, out: "created workspace:42", err: "" });
+  const { root, runId, runDir, env, spawnArgs } = await kickedBackRun({ exit: 0, out: "created workspace:42", err: "" });
   try {
-    const res = await withEnv({ WORK_CMUX_BIN: cmux }, () => runSubcommand(spawnArgs(["--kickback", "1"])));
+    const res = await withEnv(env, () => runSubcommand(spawnArgs(["--kickback", "1"])));
     assert.equal(res.workspace_ref, "workspace:42");
     const evs = await readEvents(runDir);
     assert.equal(evs.filter((e) => e.type === "lead_spawned").length, 2, "the healthy launch IS recorded");
@@ -7057,10 +7070,11 @@ test("DER-2739: a failed FIRST dispatch leaves the issue un-dispatched (queued),
   try {
     await mkdir(bin, { recursive: true });
     await writeStubBin(join(bin, "cmux"), { exit: 1, err: "cmux: no display" });
+    await writeStubBin(join(bin, "sysctl"), { exit: 0, out: SWAP_HEALTHY });
     const { runId } = await runSubcommand(["init-run", "--project", "s", "--runs-root", root, "--repo-root", root, "--issues", "DER-1,DER-2"]);
     const runDir = join(root, runId);
     await appendEvent(runDir, { actor: "orch", type: "worktree_created", issue: "DER-1", worktree: "/wt/DER-1", branch: "b1" });
-    await withEnv({ WORK_CMUX_BIN: join(bin, "cmux") }, () =>
+    await withEnv({ WORK_CMUX_BIN: join(bin, "cmux"), PATH: `${bin}:${process.env.PATH}` }, () =>
       assert.rejects(
         () => runSubcommand(["spawn-lead", "--run", runId, "DER-1", "--runs-root", root, "--repo-root", root, "--worktree", "/wt/DER-1", "--title", "t"]),
         /did not succeed/,
@@ -7250,10 +7264,30 @@ test("DER-2744: a lane whose transcript persistence was never PROVEN is visible 
   assert.deepEqual(rotated.transcripts_unverified, []);
 });
 
-test("DER-2744: a real spawn STAMPS the measured guarantee on the ledger event", async () => {
-  const { root, runId, runDir, cmux, spawnArgs } = await kickedBackRun({ exit: 0, out: "created workspace:77", err: "" });
+test("6.3 CONTROL: spawn-lead actually CONSULTS the swap probe — a freeze-zone reading refuses, --force overrides", async () => {
+  // The pure test above pins swapVerdict's decision. This one pins the WIRING: that spawn-lead runs the
+  // probe and honors it. Without it, stubbing `sysctl` healthy in the tests above would silently also
+  // cover for a call site that had stopped checking at all — a guard that cannot fail.
+  const { root, env, spawnArgs } = await kickedBackRun({ exit: 0, out: "created workspace:88", err: "", swap: SWAP_FREEZE });
   try {
-    const res = await withEnv({ WORK_CMUX_BIN: cmux }, () => runSubcommand(spawnArgs()));
+    await withEnv(env, () =>
+      assert.rejects(
+        () => runSubcommand(spawnArgs()),
+        /REFUSING a local dispatch.*92\.5%/s,
+        "the freeze-zone reading must refuse the dispatch, and say which reading did it",
+      ));
+    // …and the documented override must still work, or an operator who accepts the risk has no way out.
+    const forced = await withEnv(env, () => runSubcommand(spawnArgs(["--force"])));
+    assert.equal(forced.event.type, "lead_spawned");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("DER-2744: a real spawn STAMPS the measured guarantee on the ledger event", async () => {
+  const { root, runId, runDir, env, spawnArgs } = await kickedBackRun({ exit: 0, out: "created workspace:77", err: "" });
+  try {
+    const res = await withEnv(env, () => runSubcommand(spawnArgs()));
     assert.equal(res.event.transcripts_forced, true);
     const spawned = (await readEvents(runDir)).filter((e) => e.type === "lead_spawned").pop();
     assert.equal(spawned.transcripts_forced, true, "the event records what the LAUNCH STRING actually said, not a hardcoded claim");
@@ -11928,4 +11962,338 @@ test("DER-3011 remediation: both review parsers coerce a finding's priority the 
   assert.equal(parsePanelLensOutput({ raw: lensEnvelope({ verdict: "findings", findings: [{ title: "t", file: "a.ts" }] }), lens: "security" }).findings[0].priority, null);
   // Direct controls on the shared helper, so its contract is pinned independently of both callers.
   assert.deepEqual([WR.findingNumber(2), WR.findingNumber("2"), WR.findingNumber(null), WR.findingNumber(""), WR.findingNumber("x"), WR.findingNumber(NaN)], [2, 2, null, null, null, null]);
+});
+
+// ---------------------------------------------------------------------------
+// Cloud lead dispatch via `claude --cloud` (2026-08-18) — Option A of the cloud-sessions migration
+// ---------------------------------------------------------------------------
+// Every constraint asserted here was MEASURED on the 08-15/08-17 probes, and each test names the failure
+// the assertion exists to catch. The whole path is exercised offline: `origin` is a local bare repo and
+// `--claude-bin` points at a stub that prints the real CLI's receipt line, so the push, the pty log, the
+// id parse and the ledger event are all real code — only the network call is substituted.
+
+const CLOUD_HOSTS_CFG = {
+  worktreeRoot: "/tmp/wr-cloud-wt",
+  hosts: {
+    local: { cap: 2 },
+    mini: { enabled: true, cap: 3, ssh: "example-mini", repo: "/r", worktreeRoot: "/w", ledgerRoot: "/l" },
+    cloud: { enabled: true, cap: 4, kind: "cloud", os: "linux", credProfile: "/tmp/wr-profile-cloud" },
+    cloudbare: { enabled: true, cap: 4, kind: "cloud", os: "linux" },
+    cloudoff: { enabled: false, cap: 4, kind: "cloud", os: "linux", credProfile: "/tmp/wr-profile-off" },
+  },
+};
+
+// A repo with a REAL `origin` (a local bare repo — no network), plus a worktree on an unpushed branch.
+async function mkCloudSandbox({ branch = "feat/der-9", cfg = CLOUD_HOSTS_CFG } = {}) {
+  const dir = await mkdtemp(join(tmpdir(), "wr-cloud-"));
+  const originBare = join(dir, "origin.git");
+  const bare = spawnSync("git", ["init", "--bare", "--quiet", "-b", "main", originBare], { encoding: "utf8" });
+  if (bare.status !== 0) throw new Error(`git init --bare failed: ${bare.stderr}`);
+  const repo = join(dir, "repo");
+  await mkdir(repo, { recursive: true });
+  const init = spawnSync("git", ["init", "--quiet", "-b", "main", repo], { encoding: "utf8" });
+  if (init.status !== 0) throw new Error(`git init failed: ${init.stderr}`);
+  const git = (...args) => {
+    const r = spawnSync("git", ["-C", repo, ...args], { encoding: "utf8" });
+    if (r.status !== 0) throw new Error(`git ${args.join(" ")} failed: ${r.stderr || r.stdout}`);
+    return String(r.stdout ?? "");
+  };
+  git("config", "user.email", "harness@example.com");
+  git("config", "user.name", "Harness Test");
+  git("config", "commit.gpgsign", "false");
+  await writeFile(join(repo, "README.md"), "seed\n", "utf8");
+  git("add", "-A");
+  git("commit", "-q", "-m", "seed");
+  git("remote", "add", "origin", originBare);
+  git("push", "-q", "origin", "main");
+  await mkdir(join(repo, ".claude"), { recursive: true });
+  await writeFile(join(repo, ".claude", "work.config.json"), JSON.stringify(cfg), "utf8");
+  const wt = join(dir, "wt");
+  git("worktree", "add", "-q", "-b", branch, wt);
+  const runsRoot = join(dir, "runs");
+  const { runId } = await runSubcommand(["init-run", "--project", "cloudsandbox", "--runs-root", runsRoot, "--repo-root", repo]);
+  const runDir = join(runsRoot, runId);
+  await mkdir(join(runDir, "briefs"), { recursive: true });
+  const brief = `# Cloud /work lead — DER-9\n\nBRIEF-BODY-MARKER\n\n## Guardrails\n\nBRIEF-TAIL-MARKER\n`;
+  await writeFile(join(runDir, "briefs", "DER-9.md"), brief, "utf8");
+  const push = () => git("push", "-q", "-u", "origin", branch);
+  return { dir, repo, wt, git, runsRoot, runId, runDir, branch, brief, push };
+}
+
+// A stand-in for the CLI. Prints the receipt line the real one prints, and RECORDS its own argv so the
+// test can prove what was actually handed to it (a builder test alone proves only what we intended).
+async function mkClaudeStub(dir, { sessionId = "session_01STUBaaa", exitCode = 0, silent = false } = {}) {
+  const bin = join(dir, "claude-stub.sh");
+  const argvLog = join(dir, "stub-argv.txt");
+  const body = [
+    "#!/bin/sh",
+    `printf '%s\\n' "$@" > ${JSON.stringify(argvLog)}`,
+    `printf 'CLAUDE_CONFIG_DIR=%s\\n' "$CLAUDE_CONFIG_DIR" >> ${JSON.stringify(argvLog)}`,
+    `printf 'API_KEY_PRESENT=%s\\n' "${"$"}{ANTHROPIC_API_KEY:+yes}" >> ${JSON.stringify(argvLog)}`,
+    silent ? "" : `echo "Created cloud session: ${sessionId}"`,
+    silent ? "" : `echo "Monitor at https://claude.ai/code/${sessionId}"`,
+    `exit ${exitCode}`,
+  ].filter(Boolean).join("\n") + "\n";
+  await writeFile(bin, body, "utf8");
+  await chmod(bin, 0o755);
+  return { bin, argvLog };
+}
+
+test("cloudSpawnCommand: pty-wrapped, key-scrubbed, and the printed line is DERIVED from the args that run", () => {
+  const built = WR.cloudSpawnCommand({ credProfile: "/p/.claude-x", model: "claude-opus-5", prompt: "the brief", logPath: "/tmp/x.log" });
+  assert.equal(built.command, "script", "`claude --cloud` refuses -p/--bg and demands a TTY — `script` is the pty");
+  assert.deepEqual(built.args.slice(0, 2), ["-q", "/tmp/x.log"], "the pty log is where the only dispatch receipt lands");
+  assert.ok(built.args.includes("--cloud"));
+  assert.equal(built.args[built.args.length - 1], "the brief", "the brief is the LAST argv — a cloud session has no other input channel");
+  for (const k of ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"]) {
+    assert.ok(built.args.includes(k), `${k} must be scrubbed: an inherited metered endpoint bills the wrong account`);
+  }
+  assert.deepEqual(built.env, { CLAUDE_CONFIG_DIR: "/p/.claude-x" }, "the profile selects the ACCOUNT, so it rides the env, not a re-splittable arg string");
+  // The preview must not be able to drift from what executes.
+  for (const a of built.args) assert.ok(built.line.includes(a.includes(" ") ? `'${a}'` : a), `the printed line must contain the real arg ${a}`);
+  assert.throws(() => WR.cloudSpawnCommand({ model: "m", prompt: "p", logPath: "/l" }), /credProfile is required/);
+  assert.throws(() => WR.cloudSpawnCommand({ credProfile: "/p", model: "m", logPath: "/l" }), /prompt is required/);
+});
+
+test("cloudSpawnOutcome: the session id is the ONLY receipt — and an id with a nonzero exit is still a dispatch", () => {
+  const ok = WR.cloudSpawnOutcome({ exitCode: 0, log: "Created cloud session: session_01AbC" });
+  assert.deepEqual([ok.ok, ok.session_id], [true, "session_01AbC"]);
+  // CONTROL — the shape that must never be read as a spawn. Exit 0 + no id is what an onboarding hang and
+  // a swallowed create both look like; synthesizing an id here is the failure this returns false for.
+  const none = WR.cloudSpawnOutcome({ exitCode: 0, log: "" });
+  assert.equal(none.ok, false);
+  assert.equal(none.session_id, null, "no id must NEVER be replaced by a synthesized one");
+  assert.match(none.reason, /exited 0 but printed no session_<id>/);
+  assert.equal(WR.cloudSpawnOutcome({ exitCode: 1, log: "boom" }).ok, false);
+  // The asymmetry: the server already created the session, so this is ok:true with a do-not-retry note.
+  // Recording it as failed would invite the retry that puts two leads on one branch.
+  const late = WR.cloudSpawnOutcome({ exitCode: 143, log: "Created cloud session: session_01Late" });
+  assert.equal(late.ok, true);
+  assert.equal(late.session_id, "session_01Late");
+  assert.match(late.note, /session EXISTS.*do NOT retry/s);
+  // The pty log arrives with \r line endings; the id must survive that.
+  assert.equal(WR.cloudSpawnOutcome({ exitCode: 0, log: `x${String.fromCharCode(13)}${String.fromCharCode(10)}session_01Cr` }).session_id, "session_01Cr");
+});
+
+test("cloudBranchRefusal: the CHECKED-OUT ref is what a cloud session clones — name, detach and drift each refuse", () => {
+  const A = "a".repeat(40), C = "c".repeat(40);
+  assert.equal(WR.cloudBranchRefusal({ branch: "b", checkedOut: "b", localSha: A, remoteSha: A }), null, "the passing case must exist, or the guard is untestable");
+  assert.match(WR.cloudBranchRefusal({ branch: "b", checkedOut: "other", localSha: A, remoteSha: A, worktree: "/wt" }), /has `other` checked out.*checkout b/s);
+  assert.match(WR.cloudBranchRefusal({ branch: "b", checkedOut: "HEAD", localSha: A, remoteSha: A }), /DETACHED HEAD/);
+  assert.match(WR.cloudBranchRefusal({ branch: "b", checkedOut: "b", localSha: A, remoteSha: null, worktree: "/wt" }), /NOT on origin.*push -u origin b/s);
+  // The subtle one: the ref EXISTS on origin but behind local HEAD, so the lead would silently start from
+  // code the orchestrator never sent. "The branch exists" is not the invariant; sha equality is.
+  assert.match(WR.cloudBranchRefusal({ branch: "b", checkedOut: "b", localSha: A, remoteSha: C }), /silently DROPPED/);
+  assert.match(WR.cloudBranchRefusal({ branch: "b", checkedOut: "b", localSha: null, remoteSha: A }), /could not read HEAD/);
+});
+
+test("spawn-cloud --dry-run: prints the real command with the FULL brief, and appends nothing (DER-2514 purity)", async () => {
+  const s = await mkCloudSandbox();
+  try {
+    s.push();
+    const before = (await readEvents(s.runDir)).length;
+    const out = await runSubcommand(["spawn-cloud", "--run", s.runId, "DER-9", "--runs-root", s.runsRoot, "--repo-root", s.repo,
+      "--worktree", s.wt, "--host", "cloud", "--model", "opus", "--dry-run"]);
+    assert.match(out.stdout, /CLAUDE_CONFIG_DIR=\/tmp\/wr-profile-cloud script -q /);
+    assert.match(out.stdout, /--model claude-opus-5 --cloud /, "the lane alias must resolve to the id the cloud path is proven to honor");
+    assert.ok(out.stdout.includes("BRIEF-TAIL-MARKER"), "the brief's TAIL must be in the argv — truncation would eat the kickback findings");
+    assert.equal(out.event.type, "lead_spawned");
+    assert.equal(out.event.host_kind, "cloud");
+    assert.equal(out.event.branch, s.branch);
+    assert.equal(out.event.cloudSessionId, undefined, "a preview has no receipt, so it must not carry one");
+    assert.equal((await readEvents(s.runDir)).length, before, "a dry run must write NOTHING to the ledger");
+  } finally { await rm(s.dir, { recursive: true, force: true }); }
+});
+
+test("spawn-cloud REFUSES an unpushed branch and names the push — then the SAME call passes once pushed", async () => {
+  const s = await mkCloudSandbox();
+  try {
+    // The branch exists only locally: a cloud session resolves the ref remotely, so this dies at
+    // provisioning with 0 turns and reads as a lead that never started.
+    await assert.rejects(
+      () => runSubcommand(["spawn-cloud", "--run", s.runId, "DER-9", "--runs-root", s.runsRoot, "--repo-root", s.repo,
+        "--worktree", s.wt, "--host", "cloud", "--dry-run"]),
+      /NOT on origin.*push -u origin/s,
+    );
+    // CONTROL — the identical call after a push must succeed, or the refusal above proves nothing.
+    s.push();
+    const out = await runSubcommand(["spawn-cloud", "--run", s.runId, "DER-9", "--runs-root", s.runsRoot, "--repo-root", s.repo,
+      "--worktree", s.wt, "--host", "cloud", "--dry-run"]);
+    assert.ok(out.stdout.includes("--cloud"));
+  } finally { await rm(s.dir, { recursive: true, force: true }); }
+});
+
+test("spawn-cloud: a REAL spawn pushes with --push, parses the id from the pty log, and records it as the receipt", async () => {
+  const s = await mkCloudSandbox();
+  try {
+    const stub = await mkClaudeStub(s.dir, { sessionId: "session_01Real9" });
+    const out = await runSubcommand(["spawn-cloud", "--run", s.runId, "DER-9", "--runs-root", s.runsRoot, "--repo-root", s.repo,
+      "--worktree", s.wt, "--host", "cloud", "--model", "sonnet", "--push", "--claude-bin", stub.bin]);
+    assert.equal(out.cloudSessionId, "session_01Real9", "the id must come from the launcher's own output");
+    assert.equal(out.stdout, "session_01Real9");
+    assert.equal(out.monitor, "https://claude.ai/code/session_01Real9");
+    // --push published the ref, which is the precondition the guard checks.
+    const remote = spawnSync("git", ["-C", s.repo, "ls-remote", "origin", `refs/heads/${s.branch}`], { encoding: "utf8" });
+    assert.match(String(remote.stdout), new RegExp(s.branch.replace("/", "\\/")), "--push must actually publish the branch");
+    // What the launcher REALLY received (not what the builder intended).
+    const argv = await readFile(stub.argvLog, "utf8");
+    assert.ok(argv.includes("BRIEF-TAIL-MARKER"), "the full brief reached the CLI");
+    assert.ok(argv.includes("CLAUDE_CONFIG_DIR=/tmp/wr-profile-cloud"), "the account was selected by profile");
+    assert.ok(argv.includes("API_KEY_PRESENT=\n") || argv.includes("API_KEY_PRESENT="), "ANTHROPIC_API_KEY must not reach the child");
+    assert.ok(argv.split("\n").includes("claude-sonnet-5"), "the sonnet lane resolved to the proven id");
+    const evs = await readEvents(s.runDir);
+    const spawned = evs.filter((e) => e.type === "lead_spawned");
+    assert.equal(spawned.length, 1);
+    assert.equal(spawned[0].cloudSessionId, "session_01Real9");
+    assert.equal(spawned[0].host, "cloud");
+    assert.equal(spawned[0].transcripts_forced, false, "a cloud transcript is unreadable from here — measured false, never assumed true");
+    // …and state folds the receipt into BOTH the steer target and the monitor handle.
+    const st = materializeState(await readEvents(s.runDir));
+    assert.equal(st.issues["DER-9"].cloud_session_id, "session_01Real9");
+    assert.equal(st.issues["DER-9"].handle, "session_01Real9", "links.md must have a monitor URL from the spawn, not only after the draft PR appears");
+    assert.ok(renderLinksMd(st).includes("https://claude.ai/code/session_01Real9"));
+    assert.equal(st.transcripts_unverified.length, 0, "a cloud lane must never sit in this banner — an always-red banner is one nobody reads");
+  } finally { await rm(s.dir, { recursive: true, force: true }); }
+});
+
+test("spawn-cloud: a launcher that prints NO session id records lead_spawn_failed, never a synthesized id", async () => {
+  const s = await mkCloudSandbox();
+  try {
+    s.push();
+    const stub = await mkClaudeStub(s.dir, { silent: true });
+    await assert.rejects(
+      () => runSubcommand(["spawn-cloud", "--run", s.runId, "DER-9", "--runs-root", s.runsRoot, "--repo-root", s.repo,
+        "--worktree", s.wt, "--host", "cloud", "--claude-bin", stub.bin]),
+      (err) => {
+        assert.match(String(err.message), /claude --cloud/, "the refusal must name the launcher that failed, not cmux");
+        assert.match(String(err.message), /BEFORE retrying, confirm no session was created/, "a create can land while the call dies — a blind retry puts two leads on one branch");
+        assert.match(String(err.message), /THEME PICKER/, "the measured cause of a silent hang must be named with its one-time fix");
+        return true;
+      },
+    );
+    const evs = await readEvents(s.runDir);
+    assert.equal(evs.filter((e) => e.type === "lead_spawned").length, 0, "an unproven launch must not record a spawn");
+    const failed = evs.filter((e) => e.type === "lead_spawn_failed");
+    assert.equal(failed.length, 1, "…it must record the FAILURE, so the issue stays queued and the next wake hears about it");
+    const st = materializeState(await readEvents(s.runDir));
+    assert.equal(st.issues["DER-9"].status, "queued", "a failed dispatch is un-dispatched, not in flight");
+  } finally { await rm(s.dir, { recursive: true, force: true }); }
+});
+
+test("spawn-cloud: config refusals — non-cloud host, missing credProfile, disabled host, absent brief, second spawn", async () => {
+  const s = await mkCloudSandbox();
+  try {
+    s.push();
+    const base = ["spawn-cloud", "--run", s.runId, "DER-9", "--runs-root", s.runsRoot, "--repo-root", s.repo, "--worktree", s.wt, "--dry-run"];
+    await assert.rejects(() => runSubcommand([...base, "--host", "mini"]), /not kind:"cloud".*spawn-lead --host mini/s);
+    // A cloud entry with no credProfile would ride whatever account this machine last logged in as —
+    // operator state that changes without touching the config.
+    await assert.rejects(() => runSubcommand([...base, "--host", "cloudbare"]), /has no credProfile/);
+    await assert.rejects(() => runSubcommand([...base, "--host", "cloudoff"]), /enabled:false.*re-enable CONDITION/s);
+    await assert.rejects(() => runSubcommand([...base, "--host", "nosuch"]), /unknown host "nosuch"/);
+    await assert.rejects(
+      () => runSubcommand(["spawn-cloud", "--run", s.runId, "DER-77", "--runs-root", s.runsRoot, "--repo-root", s.repo, "--worktree", s.wt, "--host", "cloud", "--dry-run"]),
+      /no brief at .*write-brief/s,
+    );
+    // A second FIRST spawn is refused: nothing here can close a cloud session, so two leads would both
+    // push to one branch. The refusal must point at the steer, which is the correct cloud kickback path.
+    await appendEvent(s.runDir, { actor: "orch", type: "lead_spawned", issue: "DER-9", host: "cloud", host_kind: "cloud", cloudSessionId: "session_01Prior" });
+    await assert.rejects(() => runSubcommand([...base, "--host", "cloud"]), /already has a cloud lead \(session_01Prior\).*steer-cloud/s);
+    // …but a kickback re-spawn is the legitimate second dispatch, and it records the handover.
+    await writeFile(join(s.runDir, "briefs", "DER-9.kb2.md"), "kickback brief\n", "utf8");
+    const kb = await runSubcommand([...base, "--host", "cloud", "--kickback", "2"]);
+    assert.equal(kb.event.replaces_session, "session_01Prior");
+    assert.equal(kb.event.kickback, 2);
+  } finally { await rm(s.dir, { recursive: true, force: true }); }
+});
+
+test("steer-cloud: delivers the round to the LIVE session, demands an ack, and records kickback_relayed", async () => {
+  const s = await mkCloudSandbox();
+  try {
+    await appendEvent(s.runDir, { actor: "orch", type: "lead_spawned", issue: "DER-9", host: "cloud", host_kind: "cloud", cloudSessionId: "session_01Live" });
+    await appendEvent(s.runDir, { actor: "shepherd", type: "kickback", issue: "DER-9", pr: 42, sha: "d".repeat(40) });
+    await writeFile(join(s.runDir, "briefs", "DER-9.kb1.md"), "FINDINGS: fix the tenant filter\n", "utf8");
+    const dry = await runSubcommand(["steer-cloud", "--run", s.runId, "DER-9", "--runs-root", s.runsRoot, "--repo-root", s.repo, "--kickback", "1", "--dry-run"]);
+    assert.match(dry.stdout, /claude -p .*--cloud session_01Live/s, "the steer must target the session the ledger recorded");
+    assert.ok(dry.stdout.includes("FINDINGS: fix the tenant filter"), "the round's brief is the message");
+    assert.equal(dry.ack, "kickback_ack", "the demanded ack reuses the type the cloud fold already accepts");
+    assert.ok(dry.stdout.includes('"type":"kickback_ack"'), "a queued steer and a lost steer look identical without a demanded ack");
+    assert.ok(dry.stdout.includes('"round":1'), "the round makes the ack unique per round — round 1's comment must not satisfy round 2");
+    assert.ok(dry.stdout.includes("/issues/42/comments"), "the ack command must carry the REAL PR number (from the kickback event), not a <PR> placeholder");
+    assert.equal((await readEvents(s.runDir)).filter((e) => e.type === "kickback_relayed").length, 0, "a dry run delivers nothing, so it records nothing");
+
+    // The real path, with a stub standing in for the CLI's accept line.
+    const stub = await mkClaudeStub(s.dir, { sessionId: "unused" });
+    await writeFile(stub.bin, `#!/bin/sh\nprintf '%s\\n' "$@" > ${JSON.stringify(stub.argvLog)}\necho "Sent to cloud session"\n`, "utf8");
+    await chmod(stub.bin, 0o755);
+    const out = await runSubcommand(["steer-cloud", "--run", s.runId, "DER-9", "--runs-root", s.runsRoot, "--repo-root", s.repo, "--kickback", "1", "--pr", "42", "--claude-bin", stub.bin]);
+    assert.equal(out.delivered, true);
+    const relayed = (await readEvents(s.runDir)).filter((e) => e.type === "kickback_relayed");
+    assert.equal(relayed.length, 1);
+    assert.equal(relayed[0].cloudSessionId, "session_01Live");
+    assert.equal(relayed[0].ack_expected, "kickback_ack");
+    assert.equal(relayed[0].ack_round, 1);
+    assert.equal(relayed[0].pr, 42);
+    // The delivery must ACTION the round: no new lead_spawned, and the kickback stops being pending.
+    const st = materializeState(await readEvents(s.runDir));
+    assert.equal(st.issues["DER-9"].kickback_unactioned, false, "a delivered steer IS the round's delivery");
+    assert.equal(st.kickbacks_pending.length, 0);
+    assert.equal((await readEvents(s.runDir)).filter((e) => e.type === "lead_spawned").length, 1, "steering must not fabricate a second spawn");
+  } finally { await rm(s.dir, { recursive: true, force: true }); }
+});
+
+test("steer-cloud: an UNPROVEN delivery records nothing and names the respawn fallback (the kickback stays pending)", async () => {
+  const s = await mkCloudSandbox();
+  try {
+    await appendEvent(s.runDir, { actor: "orch", type: "lead_spawned", issue: "DER-9", host: "cloud", host_kind: "cloud", cloudSessionId: "session_01Gone" });
+    await appendEvent(s.runDir, { actor: "shepherd", type: "kickback", issue: "DER-9", pr: 42, sha: "d".repeat(40) });
+    await writeFile(join(s.runDir, "briefs", "DER-9.kb1.md"), "findings\n", "utf8");
+    // Exit 0 with no accept line — an expired session. Exit code alone cannot see this, which is why the
+    // outcome binds to the CLI's own "Sent to cloud session".
+    const bin = join(s.dir, "silent-steer.sh");
+    await writeFile(bin, "#!/bin/sh\nexit 0\n", "utf8");
+    await chmod(bin, 0o755);
+    await assert.rejects(
+      () => runSubcommand(["steer-cloud", "--run", s.runId, "DER-9", "--runs-root", s.runsRoot, "--repo-root", s.repo, "--kickback", "1", "--claude-bin", bin]),
+      (err) => {
+        assert.match(String(err.message), /NOT delivered/);
+        assert.match(String(err.message), /stays UN-ACTIONED/, "an undelivered round must keep surfacing at every wake");
+        assert.match(String(err.message), /get_run_log session_01Gone/, "read the session before replacing it — never kill on inference");
+        assert.match(String(err.message), /spawn-cloud .*--kickback 1 --push/s, "the fallback must be spelled out, not remembered");
+        return true;
+      },
+    );
+    assert.equal((await readEvents(s.runDir)).filter((e) => e.type === "kickback_relayed").length, 0);
+    const st = materializeState(await readEvents(s.runDir));
+    assert.equal(st.issues["DER-9"].kickback_unactioned, true, "the round is still owed");
+    assert.equal(st.kickbacks_pending.length, 1);
+  } finally { await rm(s.dir, { recursive: true, force: true }); }
+});
+
+test("steer-cloud: a pre-2026-08-18 cloud lead has no recorded session id — refuse and name both recoveries", async () => {
+  const s = await mkCloudSandbox();
+  try {
+    // A routine-spawned lead: lead_spawned with a host but no cloudSessionId (what every pre-migration
+    // ledger looks like).
+    await appendEvent(s.runDir, { actor: "orch", type: "lead_spawned", issue: "DER-9", host: "cloud" });
+    await assert.rejects(
+      () => runSubcommand(["steer-cloud", "--run", s.runId, "DER-9", "--runs-root", s.runsRoot, "--repo-root", s.repo, "--dry-run"]),
+      /no cloud session id.*--session session_.*spawn-cloud --kickback/s,
+    );
+    // CONTROL — an explicit --session makes the same call work, so the refusal is about the missing id.
+    await writeFile(join(s.runDir, "briefs", "DER-9.md"), "brief\n", "utf8");
+    const out = await runSubcommand(["steer-cloud", "--run", s.runId, "DER-9", "--runs-root", s.runsRoot, "--repo-root", s.repo, "--session", "session_01Explicit", "--dry-run"]);
+    assert.match(out.stdout, /--cloud session_01Explicit/);
+  } finally { await rm(s.dir, { recursive: true, force: true }); }
+});
+
+test("transcripts_unverified excludes cloud lanes by HOST KIND, not by the literal name 'cloud'", () => {
+  // The bug this pins: a run whose leads went to the second/third cloud account recorded host:"cloud2",
+  // matched no exclusion, and sat in this banner for the life of the run.
+  const st = materializeState([
+    { event_id: 1, ts: "2026-08-18T00:00:00Z", actor: "orch", type: "lead_spawned", issue: "DER-1", host: "cloud2", host_kind: "cloud", cloudSessionId: "session_01Two" },
+    { event_id: 2, ts: "2026-08-18T00:00:01Z", actor: "orch", type: "lead_spawned", issue: "DER-2", host: "mini" },
+  ]);
+  const listed = st.transcripts_unverified.map((r) => r.issue);
+  assert.deepEqual(listed, ["DER-2"], "the mini lane with no attestation IS listed (the control), the cloud2 lane is not");
 });

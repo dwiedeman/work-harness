@@ -15,6 +15,56 @@ run materially different harness code against **one shared ledger** with no way 
 gate itself gained the missing half below — attesting the *acting* process's own version, not only
 versions already recorded in the ledger — in DER-2779.
 
+## [0.8.0] — 2026-08-18
+
+**Cloud leads are dispatched as `claude --cloud` sessions, and a cloud kickback steers the live lead.**
+Two new subcommands replace a recipe the orchestrator ran by hand with MCP tools:
+
+- **`spawn-cloud`** wraps `claude --cloud` in a pty (the CLI refuses `-p`/`--bg` and demands a TTY) and
+  records the returned `session_…` id as the dispatch receipt on `lead_spawned` (`cloudSessionId`,
+  `host_kind:"cloud"`, `branch`, `sha`, `model`, `worktree`). The receipt and the ledger event are now
+  written by ONE code path — the routine recipe created the session with an MCP tool and then relied on
+  the orchestrator hand-appending the event, which is the seam a fabricated id gets in through. An absent
+  id records `lead_spawn_failed` and never a synthesized one; an id with a nonzero exit IS a dispatch
+  (the session exists, so a retry would put two leads on one branch) and carries a do-not-retry note.
+- **`steer-cloud`** delivers a kickback INTO the running session — which still holds the context of the
+  work the findings are about — and records `kickback_relayed` instead of a second `lead_spawned`. It
+  demands a `kickback_ack` WORK-EVENT comment, because a steer queues behind the in-flight turn and
+  "sent" is not "read". Delivery is proven by the CLI's own `Sent to cloud session`, not by exit 0; an
+  unproven steer records NOTHING, so the round stays pending and keeps waking the orchestrator, and the
+  refusal prints the `spawn-cloud --kickback` fallback for an expired session.
+
+**A cloud lead now needs a worktree — this REVERSED.** A CLI cloud session clones the ref checked out in
+the cwd and has no branch-selection flag, so `spawn-cloud` refuses without `--worktree`, and refuses
+again unless that branch is on `origin` at the worktree's exact HEAD sha (`--push` publishes it). Both
+halves are measured failures: a local-only commit dies at provisioning with 0 turns (reading exactly like
+a lead that never started), and a remote ref behind local HEAD silently drops commits from the lead's
+checkout. `rotate-lead` completes a cloud rotation itself now, except for a routine-era unit with no
+worktree, where it prints the two commands to run.
+
+**Environment selection is per ACCOUNT, so `credProfile` became load-bearing.** `claude --cloud
+--environment` accepts only `ccpool_…` self-hosted ids and rejects the `env_…` routine ids: a CLI session
+runs the account's server-side default cloud environment, chosen by `CLAUDE_CONFIG_DIR`. A cloud host
+entry with no `credProfile` is refused rather than silently riding whatever account the machine last
+logged in as; a legacy `environmentId` is inert history.
+
+Also in this release:
+
+- The brief's boot step confirms the branch with `checkout -B` instead of creating it with `checkout -b`
+  (the session already starts on the issue branch), and the cloud kickback ack instruction points at a
+  WORK-EVENT PR comment — a cloud lead has no ledger access, so the shared `append` form named a command
+  that did not exist in its brief.
+- `state.transcripts_unverified` excludes cloud lanes by `host_kind`, not by the literal host name
+  `"cloud"`: a run whose leads went to the second or third cloud account recorded `host:"cloud2"` and sat
+  in that banner for the life of the run — the always-red state the exclusion exists to prevent.
+- `--claude-bin` / `hosts.<name>.claudeBin` pins the real CLI when a shim precedes it on PATH.
+- **The local-dispatch freeze guard's own tests no longer depend on the developer's machine.** Five
+  spawn-accounting tests shelled the real `sysctl vm.swapusage`, so on a box swapping over 85% they
+  failed with the guard's refusal instead of testing what they assert — and since `install.sh` gates on a
+  green suite, a swapping machine could not install the harness at all. The probe is now stubbed on PATH
+  (a fixture, not the weather) and a new control proves the call site still runs it and still honors a
+  freeze-zone reading, which is the half `swapVerdict`'s pure test cannot cover.
+
 ## [0.7.0] — 2026-08-18
 
 **Cloud leads run the pre-PR codex gate themselves.** 0.6.0 made `codex exec` the gate for every lead

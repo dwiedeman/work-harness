@@ -1,7 +1,11 @@
 # Cloud lead brief template (cloud lead env)
 
-Template for a `/work` lead running as a Claude Code **cloud session** (spawned via the claude.ai
-RemoteTrigger one-shot API — see `spawn-lead --host cloud`). Fill the `<…>` slots. This mirrors the
+Template for a `/work` lead running as a Claude Code **cloud session** (dispatched by
+`work-runner.mjs spawn-cloud`, which wraps `claude --cloud`; before 2026-08-18 it was a claude.ai
+RemoteTrigger one-shot routine). THE WHOLE BRIEF IS ONE ARGV STRING — it is the only channel into the
+session, so nothing here may rely on a file the lead cannot fetch. The session starts ON the issue
+branch (it clones the ref checked out in the orchestrator's worktree), which is why step 1b CONFIRMS the
+branch with `checkout -B` instead of creating it. Fill the `<…>` slots. This mirrors the
 local `/work-lead` brief but adapts to the cloud sandbox's constraints (learned 2026-07-15 across 6
 qualification probes). Keep the **Provenance & authorization** block — zero-context cloud sessions
 have refused injection-shaped briefs without it.
@@ -65,7 +69,7 @@ fi
 ## Draft-PR-first lifecycle (how the orchestrator sees you — DER-1838)
 There is no local ledger file, and you must NOT enumerate/report session or env identifiers (that
 reads as recon and gets refused). Instead the orchestrator derives everything from your **PR state**:
-1. **At boot, before doing the work:** `git checkout -b <gitBranchName>` → empty WIP commit
+1. **At boot, before doing the work:** confirm the branch you are already on — `git rev-parse --abbrev-ref HEAD` should print `<gitBranchName>`; if not (or if detached), pin it with `git checkout -B <gitBranchName>`, never `checkout -b` (which fails on the branch you are already on) → empty WIP commit
    (`git commit --allow-empty -m "wip(<DER-id>): cloud lead started"`) → push → **open a DRAFT PR via
    the GitHub MCP tools** (draft:true, base main). A draft runs **no CI and no Codex**. Its footer
    carries your `session_01…` handle automatically — that's the orchestrator's liveness signal + the

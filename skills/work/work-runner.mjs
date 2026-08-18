@@ -115,6 +115,16 @@ export function parseArgs(argv) {
     else if (a === "--skip-probes") o.skipProbes = true;
     else if (a === "--window") o.window = Number.parseInt(argv[++i], 10);
     else if (a === "--rotation") o.rotation = Number.parseInt(argv[++i], 10);
+    // Cloud dispatch (2026-08-18). `--push` is a BOOLEAN: through the `--xxx <value>` catch-all it would
+    // eat the following token (a `--worktree` path, say) as its value and then never be read — the same
+    // "a flag that silently lands nowhere" shape the --codex-* branches above exist to avoid.
+    else if (a === "--push") o.push = true;
+    else if (a === "--timeout-ms") o.timeoutMs = Number.parseInt(argv[++i], 10);
+    else if (a === "--session") o.session = argv[++i];
+    else if (a === "--message") o.message = argv[++i];
+    // The catch-all would key this as `claude-bin`, which no caller reads — the same dead-flag shape the
+    // --codex-* branches call out.
+    else if (a === "--claude-bin") o.claudeBin = argv[++i];
     else if (a.startsWith("--")) o[a.slice(2)] = argv[++i];
     else if (!o.subcommand) o.subcommand = a;
     else o.rest.push(a);
@@ -298,14 +308,22 @@ export function carvedOutIds(texts = []) {
 // At round ≥ 2 (DER-2219 P3) this AUTO-ESCALATES the brief to a comprehensive enumerate-the-class
 // directive — the manual round-14 fix from the 2026-07-16 16-round PR, made mechanical so it lands
 // at round 2 without the orchestrator remembering to compose it.
-function kickbackSharedLines({ findings, priorRounds, kickback }) {
+function kickbackSharedLines({ findings, priorRounds, kickback, isCloud = false, repo = null, issueId = null }) {
+  // The ack instruction MUST match the channel the reader actually has. A cloud lead has no ledger access
+  // at all — it reports by WORK-EVENT PR comment — so the `append` form below pointed it at a command that
+  // does not exist in its brief, which made the ack unreachable for exactly the lane whose delivery is
+  // hardest to prove (a steered cloud round queues behind the in-flight turn). `kickback_ack` is already
+  // on the cloud-reportable allowlist, so the fix is the right comment, not a new event type.
+  const ackLine = isCloud
+    ? `**FIRST, acknowledge receipt** (a message can queue unseen — the ledger, not the send, is the delivery record): \`gh api repos/${repo ?? "<owner>/<repo>"}/issues/<PR>/comments -f body='WORK-EVENT {"type":"kickback_ack","issues":${JSON.stringify([issueId ?? "<id>"])},"pr":<PR>,"round":${kickback ?? 1}}'\`. The orchestrator treats a missing ack as an undelivered round and will replace this session.`
+    : `**FIRST, acknowledge receipt** (messages between sessions can queue unseen — the ledger, not the message, is the delivery record): \`… append … '{"actor":"lead:<id>","type":"kickback_ack","issue":"<id>","round":${kickback ?? 1}}'\` using the exact append command from your original brief. The orchestrator respawns this round if no ack lands in ~10 min.`;
   const lines = [
     ``,
     `### Findings`,
     ``,
     findings || "(see the PR review threads)",
     ``,
-    `**FIRST, acknowledge receipt** (messages between sessions can queue unseen — the ledger, not the message, is the delivery record): \`… append … '{"actor":"lead:<id>","type":"kickback_ack","issue":"<id>","round":${kickback ?? 1}}'\` using the exact append command from your original brief. The orchestrator respawns this round if no ack lands in ~10 min.`,
+    ackLine,
     ``,
     `**Fix the CLASS, not the instance:** when a finding is one instance of a pattern — one of N data sources missing a filter, one of N entry points missing a guard, one of N completion/release paths missing a hook — enumerate and fix EVERY sibling in this same round (grep for the pattern) and say so in the PR. One-instance fixes cost 8+ extra review rounds on 2026-07-16 (the reviewer finds the siblings one round at a time).`,
   ];
@@ -694,9 +712,15 @@ export function renderBrief({ issueId, title, worktree, branch, runId, runDir, r
 }
 
 // Cloud-lead brief (DER-1834, validated 2026-07-15 via DER-1835/PR #808). A cloud lead is a Claude
-// Code cloud session (Anthropic-managed VM): no worktree, no cmux, spawned by the ORCHESTRATOR via the
-// RemoteTrigger tool (work-runner can't auth to claude.ai). Ledger reporting is a WORK-EVENT PR
-// comment the orchestrator folds via `reconcile-pr-events`.
+// Code cloud session (Anthropic-managed VM): no worktree, no cmux. Since 2026-08-18 it is spawned by
+// `spawn-cloud` (a `claude --cloud` session; the pre-migration path was the orchestrator's own
+// RemoteTrigger routine, which work-runner could not drive because it cannot auth to claude.ai). THE
+// BRIEF IS THE ARGV: the whole text below is passed as one argument, so it is also the only channel into
+// the session. Ledger reporting is still a WORK-EVENT PR comment folded by `reconcile-pr-events`.
+//
+// One consequence worth stating where the template lives: the session clones the ref CHECKED OUT in the
+// orchestrator's worktree, so the lead starts ON its issue branch rather than on main — which is why the
+// playbook below confirms the branch with `checkout -B` instead of creating it with `checkout -b`.
 //
 // Repo identity comes from `.claude/work.config.json` `repo` (see REPO_IDENTITY), NOT from literals in
 // this file — the slug, the owner's login and the commit-author line were all hardcoded here, which is
@@ -715,7 +739,7 @@ export function renderCloudBrief({ issueId, title, branch, runId, acceptance, ki
   const p = (...xs) => L.push(...xs);
   p(`# Cloud /work lead — ${allIds.join(", ")}${title ? `: ${title}` : ""}`, ``);
   p(`## Provenance & authorization`, ``);
-  p(`Scheduled by **${owner}**, the repository owner, from their own Claude account via a one-shot routine on their own cloud environment. The env's \`GH_TOKEN\` secret was configured by them for this. The commit-author convention below is the repo's own — verify it in the repo's agent instructions. You are a delivery lead for \`${repo}\`: take ${allIds.join(" + ")} to a clean PR and hand off (do NOT merge).`, ``);
+  p(`Scheduled by **${owner}**, the repository owner, from their own Claude account and their own cloud environment. The env's \`GH_TOKEN\` secret and its codex reviewer grant were configured by them for this. The commit-author convention below is the repo's own — verify it in the repo's agent instructions. You are a delivery lead for \`${repo}\`: take ${allIds.join(" + ")} to a clean PR and hand off (do NOT merge).`, ``);
   p(`## Session preamble (run FIRST)`, ``, "```bash",
     ...(commitAuthor ? [`git config user.name ${JSON.stringify(commitAuthor.name)} && git config user.email ${JSON.stringify(commitAuthor.email)}`] : []),
     `export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"`,
@@ -735,7 +759,7 @@ export function renderCloudBrief({ issueId, title, branch, runId, acceptance, ki
   p(`## Playbook (draft-PR-first lifecycle — this is how the orchestrator sees + monitors you)`, ``,
     `1. **FIRST, before doing the work — register yourself by opening a DRAFT PR.** This is the orchestrator's liveness + handle signal, so do it EARLY:`,
     `   a. Confirm git identity (the preamble set it): \`git log -1\` must show the repo's required commit author.`,
-    `   b. \`git checkout -b ${branch ?? "<gitBranchName>"}\`; make an empty WIP commit so a PR can open with no code yet: \`git commit --allow-empty -m "wip(${issueId}): cloud lead started"\`; push.`,
+    `   b. **Confirm your branch — you should already BE on it.** Your session cloned the ref the orchestrator had checked out, so \`git rev-parse --abbrev-ref HEAD\` should print \`${branch ?? "<gitBranchName>"}\`. If it prints anything else (or \`HEAD\`, i.e. detached), pin it: \`git checkout -B ${branch ?? "<gitBranchName>"}\` — creates-or-resets, correct either way. Do NOT use \`checkout -b\`: on the branch you are already on it fails, and that failure has nothing to do with your work. Then make an empty WIP commit so a PR can open with no code yet: \`git commit --allow-empty -m "wip(${issueId}): cloud lead started"\`; push.`,
     `   c. **Open a DRAFT PR via the GitHub MCP tools** (draft:true, base main; authored by the configured commit author). A draft runs NO CI and NO Codex review — it's a placeholder. Title mentions ${allIds.join(" + ")}; body: one line noting it's a cloud lead in progress.`,
     `2. Read AGENTS.md + the area's invariants. **If the change isn't trivially clear, write a short plan FIRST, inline** — the \`/superpowers:*\` plugins (writing-plans, brainstorming, …) are NOT installed in cloud sessions (they're user-global, not repo-committed), so do not call them; instead jot: goal · exact files to touch · steps · definition-of-done · **reference-as-map** (the analogous existing implementation you're following, or "no analog exists"), then implement against it. (Repo-committed skills under \`.claude/skills\` and the built-in Skill tool ARE available.)`,
     `2b. **Declare your file scope BEFORE your first commit — MANDATORY (2026-07-25).** You have no ledger access, so emit it as a PR comment exactly like the token report in step 6:\n   \`gh api repos/${repo}/issues/<PR>/comments -f body='WORK-EVENT {"type":"plan_scope","issues":["${allIds.join('","')}"],"fileScope":["path/a.ts","path/b.ts"],"expectedAdditions":600}'\`\n   **This is a BUDGET, not a note.** The declared \`fileScope\` bounds this PR: if the real change needs **more than 1.5× the declared file count**, STOP, re-emit an updated \`plan_scope\`, and say so in the PR body — do not silently grow. ${assignedBudget ? `Your **assigned budget is ${assignedBudget.files} files / ~${assignedBudget.additions} additions** (see "Assigned budget" above) — declare against it, do not raise it.` : "Aim for **≤ ~800 additions / ≤ ~12 files**."} Measured 2026-07-25: review rounds scale directly with diff size (<1k additions → 1.25 rounds; >7k → 5.67), and cloud briefs previously never asked for this at all — the PR that shipped 98 files / +11,537 lines with no declared scope took 5 rounds and never merged.`,
@@ -778,7 +802,7 @@ export function renderCloudBrief({ issueId, title, branch, runId, acceptance, ki
   if (kickback) {
     p(``, `## ⚠ Kickback (round ${kickback})`, ``,
       `The branch and its PR already exist — the shepherd **converted the PR back to draft** when kicking it back, so it runs no CI while you fix. Load the branch state, address the findings below, re-verify (targeted), and push to the SAME branch. Then **mark the PR \`ready_for_review\` again** via the GitHub MCP tools — that draft→ready transition IS your re-hand-off (it re-fires CI + Codex and hands you back to the shepherd, exactly like your first hand-off, and the orchestrator derives it as a fresh \`handed_off\`). Do NOT open a new PR; do NOT merge. **NEVER mark ready without having pushed a fix** — a ready flip at the unchanged head SHA is a flap the harness now ignores, and it wastes the round.`,
-      ...kickbackSharedLines({ findings, priorRounds, kickback }));
+      ...kickbackSharedLines({ findings, priorRounds, kickback, isCloud: true, repo, issueId }));
   }
   return L.join("\n") + "\n";
 }
@@ -5511,7 +5535,10 @@ export function ledgerProtocolVerdict(events = [], { attestedVersion = null, att
 // appends) assumes one wire protocol. NOT exempt for --dry-run — unlike `assertExistingRunDir` (where a
 // preview genuinely cannot fork a ledger), a dry-run prints a boot command the operator then pastes, so
 // a preview that hides the skew hides it at exactly the moment it would be acted on.
-const VERSION_GATED_SUBCOMMANDS = new Set(["spawn-lead", "spawn-shepherd", "spawn-orch", "rotate-lead", "rotate-shepherd"]);
+// Every command that commits MORE work to a ledger. `spawn-cloud` and `steer-cloud` belong here for the
+// same reason `spawn-lead` does: a mixed-version ledger must refuse dispatch, and a steer is a DELIVERY
+// (it writes the kickback_relayed that closes a round), not a read.
+const VERSION_GATED_SUBCOMMANDS = new Set(["spawn-lead", "spawn-cloud", "steer-cloud", "spawn-shepherd", "spawn-orch", "rotate-lead", "rotate-shepherd"]);
 
 export function assertLedgerProtocolCompatible(verdict, subcommand, { allowSkew = false } = {}) {
   if (!verdict || verdict.ok) return;
@@ -6484,7 +6511,17 @@ export function materializeState(rawEvents, meta = {}) {
         if (e.worktree) it.worktree = e.worktree;
         if (e.workspace_ref) it.workspace_ref = e.workspace_ref;
         if (e.host) it.host = e.host;
+        if (e.host_kind) it.host_kind = e.host_kind;
         if (e.leadType) it.leadType = e.leadType;
+        // The cloud dispatch receipt (2026-08-18). It is BOTH the steer target (`steer-cloud` reads it to
+        // deliver a kickback into the live lead) and the monitor handle — which used to arrive only later,
+        // scraped from the draft PR's footer, so links.md was empty for the whole pre-PR window. It
+        // OVERWRITES `handle` on purpose: after a replacement spawn the PR footer still names the session
+        // that opened the PR (the dead one), while this is the session now doing the work.
+        if (e.cloudSessionId) {
+          it.cloud_session_id = e.cloudSessionId;
+          it.handle = e.cloudSessionId;
+        }
         // A ROTATION re-spawn (2026-07-25) carries `rotation: n`. It is the action that clears the
         // pending request — exactly as a shepherd_spawned clears shepherd_rotate_pending. A PLAIN
         // re-spawn (kickback) must NOT clear it: the lead is still deep, and silently dropping the
@@ -7043,13 +7080,19 @@ export function materializeState(rawEvents, meta = {}) {
     // never fire. `null` (no attestation) is listed alongside an explicit `false`, because the defect this
     // came from was invisible precisely because absence was read as fine.
     //
-    // CLOUD leads are excluded: they are launched by RemoteTrigger, not by a boot builder, and have no
-    // locally readable transcript AT ALL — the skill says so ("cloud leads are not pollable"). Their
-    // blind spot is already modelled (they report by PR comment, and lead_context_unreadable covers the
-    // probe), so listing them here would put a permanently-red entry in a banner whose whole value is
-    // that a non-empty list means act. A banner that is always non-empty is a banner nobody reads.
+    // CLOUD leads are excluded: their session runs on an Anthropic-managed VM, so there is no locally
+    // readable transcript AT ALL — the skill says so ("cloud leads are not pollable"). Their blind spot is
+    // already modelled (they report by PR comment, and lead_context_unreadable covers the probe), so
+    // listing them here would put a permanently-red entry in a banner whose whole value is that a
+    // non-empty list means act. A banner that is always non-empty is a banner nobody reads.
+    //
+    // 2026-08-18: the test is `host_kind`, not just the literal name "cloud". A run whose leads went to
+    // the SECOND or THIRD cloud account recorded `host:"cloud2"`/`"cloud3"` and matched none of it, so
+    // every one of those lanes sat in this banner for the life of the run — the exact always-red state the
+    // exclusion exists to prevent. `spawn-cloud` stamps host_kind:"cloud"; the name check stays for events
+    // written before it existed.
     transcripts_unverified: Object.entries(issues)
-      .filter(([, v]) => v.transcripts_forced !== true && ACTIVE_STATUSES.has(v.status) && v.host !== "cloud")
+      .filter(([, v]) => v.transcripts_forced !== true && ACTIVE_STATUSES.has(v.status) && v.host !== "cloud" && v.host_kind !== "cloud")
       .map(([k, v]) => ({
         issue: k, host: v.host, leadType: v.leadType, pr: v.pr,
         attested: v.transcripts_forced,
@@ -7959,18 +8002,189 @@ export function spawnFailedEvent({ role = "lead", issue = null, host = null, kic
 // the ledger is what the next wake — and a successor orchestrator that never saw this stderr — reads.
 // The `record the gap` precedent is DER-2745's telemetry_gap: an instrument that cannot measure says so
 // in the ledger instead of exiting quietly.
-async function refuseUnprovenSpawn({ runDir, role, label, outcome, ...rest }) {
+// `launcher` names the thing that failed, and `retry` says what re-running costs. Both used to be
+// hardcoded to cmux, which was true while cmux was the only launcher; the cloud path (2026-08-18) spawns
+// through `claude --cloud`, where "check cmux on the target host" is advice that cannot help and the
+// retry advice is DIFFERENT in kind — a cloud retry can create a SECOND session on one branch, so the
+// caller supplies the retry line rather than inheriting cmux's.
+async function refuseUnprovenSpawn({ runDir, role, label, outcome, launcher = "cmux", retry = null, ...rest }) {
   const ev = spawnFailedEvent({ role, outcome, ...rest });
   if (runDir) await appendEvent(runDir, ev);
   throw new Error(
-    `${label}: the cmux launch did not succeed — ${outcome.reason}.\n` +
+    `${label}: the ${launcher} launch did not succeed — ${outcome.reason}.\n` +
       `  NO ${role}_spawned was recorded; a ${ev.type} was. So state shows this as un-dispatched rather\n` +
       "  than in flight, any pending kickback stays pending, and a lead_process_dead claim is not cleared.\n" +
       (outcome.note ? `  the launcher said: ${outcome.note}\n` : "") +
-      "  Retry the same command: nothing was created and nothing was cleaned up (the worktree stays\n" +
-      "  registered — create-worktree RESUMES it, DER-2742). If it keeps failing, the launcher is the\n" +
-      "  problem, not the ledger — check `cmux` on the target host.",
+      (retry ??
+        "  Retry the same command: nothing was created and nothing was cleaned up (the worktree stays\n" +
+        "  registered — create-worktree RESUMES it, DER-2742). If it keeps failing, the launcher is the\n" +
+        "  problem, not the ledger — check `cmux` on the target host."),
   );
+}
+
+// ---------------------------------------------------------------------------
+// Cloud lead dispatch — `claude --cloud`, not RemoteTrigger routines (2026-08-18)
+// ---------------------------------------------------------------------------
+// Every constraint below was MEASURED on the 2026-08-15/08-17 probes (sessions 0171ZeVU…, 017Lwc7y…,
+// and the 08-17 P1/P4 pair); none of it is inferred from the flag's help text:
+//
+//   pty            `claude --cloud` refuses `-p`/`--bg` and demands a TTY, so it is wrapped in
+//                  `script -q <log>`. BSD `script` calls tcgetattr on ITS OWN STDIN: a socket (what a
+//                  harness Bash tool hands it) makes it exit 1 with an EMPTY log, so stdin must be
+//                  /dev/null or a tty. `runCommand`'s stdio[0]="ignore" IS /dev/null — do not "improve"
+//                  it to "pipe". It propagates the child's exit code (verified: child 7 ⇒ script 7).
+//   receipt        it prints `Created cloud session: … session_<id>` and exits 0 immediately
+//                  (fire-and-forget). That id is the ONLY dispatch receipt; a synthesized one is the
+//                  failure mode this harness has paid for repeatedly, so an absent id records
+//                  lead_spawn_failed instead.
+//   branch         the session clones THE CWD'S CHECKED-OUT REF and there is no branch-selection flag,
+//                  so the spawn must run in the issue's worktree AND that ref must be on origin at the
+//                  same sha — a local-only commit dies at provisioning (`error_during_execution`, 0
+//                  turns), and a remote ref BEHIND local HEAD silently drops the local commits.
+//   env            `--environment` accepts only `ccpool_…` self-hosted ids, so a CLI session runs the
+//                  ACCOUNT'S default cloud environment, selected per-profile by CLAUDE_CONFIG_DIR. That
+//                  is why hosts.<name>.credProfile is mandatory here and why the codex-provisioned env
+//                  is bound to an account rather than passed per spawn.
+//   profile        a cred profile that has never been through first-run onboarding HANGS on the theme
+//                  picker under the pty (stdin is /dev/null, nothing can answer). That is the one hang
+//                  this command diagnoses by name rather than reporting as a bare "no session id".
+export const CLOUD_SESSION_RE = /session_[A-Za-z0-9]+/;
+
+// The pty log arrives with \r line endings and a leading ^D; the id shape is unaffected by both, which is
+// why this reads the RAW text rather than trying to normalize a terminal capture into lines.
+export function parseCloudSessionId(text) {
+  return String(text ?? "").match(CLOUD_SESSION_RE)?.[0] ?? null;
+}
+
+// Lane alias → the model id the cloud path is PROVEN to honor (P4, 2026-08-17: `--model claude-opus-5`
+// and `--model claude-sonnet-5` both echoed back on the session's own `init` event). An explicit full id
+// passes through untouched, so this map never blocks a newer model — it only spares every caller from
+// guessing whether the `opus`/`sonnet` aliases resolve on this path. THE IDS DRIFT: this map is the one
+// place to update them (the claude-api skill carries the current list).
+export const CLOUD_LANE_MODELS = { opus: "claude-opus-5", sonnet: "claude-sonnet-5" };
+export function cloudLeadModel(model) {
+  return CLOUD_LANE_MODELS[String(model ?? "")] ?? model ?? null;
+}
+
+// Pure command builder. `line` is derived from the SAME args array the spawn runs, so the operator-facing
+// preview cannot drift from what executes — the one thing a builder-plus-printer pair gets wrong.
+// CLAUDE_CONFIG_DIR rides the child env (not the arg list) because it selects the ACCOUNT, and an account
+// selected by a string the shell might re-split is not a selection at all.
+export function cloudSpawnCommand({ credProfile, model, prompt, logPath, claudeBin = "claude" } = {}) {
+  if (!credProfile) throw new Error("cloudSpawnCommand: credProfile is required — the cred profile IS the account, and the account IS the cloud environment");
+  if (!logPath) throw new Error("cloudSpawnCommand: logPath is required — the pty log is where the session-id receipt lands");
+  if (!prompt) throw new Error("cloudSpawnCommand: prompt is required — a cloud lead's brief is its only instruction");
+  const args = ["-q", logPath, "env", "-u", "ANTHROPIC_API_KEY", "-u", "ANTHROPIC_AUTH_TOKEN", "-u", "ANTHROPIC_BASE_URL", claudeBin];
+  if (model) args.push("--model", model);
+  args.push("--cloud", prompt);
+  return {
+    command: "script",
+    args,
+    env: { CLAUDE_CONFIG_DIR: credProfile },
+    line: `CLAUDE_CONFIG_DIR=${shellQuote(credProfile)} script ${args.map(shellQuote).join(" ")}`,
+  };
+}
+
+// Two facts, same shape as spawnOutcome (DER-2739), with one deliberate asymmetry:
+//
+// A session id present with a NONZERO exit is treated as a SUCCESSFUL dispatch, not a failure. The id is
+// printed by the server's create response, so the session EXISTS; recording that as failed would invite a
+// retry, and a retry means two leads on one branch — the failure mode that corrupts a branch. The
+// nonzero exit is carried as a note instead, so it is visible without being acted on as "nothing landed".
+export function cloudSpawnOutcome({ exitCode, stdout = "", stderr = "", log = "" } = {}) {
+  const sessionId = parseCloudSessionId(log) ?? parseCloudSessionId(stdout) ?? parseCloudSessionId(stderr);
+  const said = [log, stderr, stdout].map((s) => String(s || "").replace(/\r/g, "").trim()).find(Boolean);
+  const note = said ? said.split("\n").slice(-3).join(" ").slice(0, 400) : null;
+  if (sessionId) {
+    return {
+      ok: true, session_id: sessionId, exit_code: exitCode ?? null, reason: null,
+      note: exitCode === 0 ? null : `the launcher exited ${exitCode} AFTER printing ${sessionId} — the session EXISTS; do NOT retry (that would put a second lead on one branch)`,
+    };
+  }
+  if (exitCode !== 0) {
+    return { ok: false, session_id: null, exit_code: exitCode ?? null, reason: `the launcher exited ${exitCode} and printed no session_<id>`, note };
+  }
+  return { ok: false, session_id: null, exit_code: 0, reason: "the launcher exited 0 but printed no session_<id> — no session was created", note };
+}
+
+// Why a timeout is its own diagnosis: the measured cause is a cred profile that has never completed
+// first-run onboarding. `claude --cloud` then blocks on the theme picker behind the pty forever, and the
+// symptom (no output, no id, killed at the timeout) is byte-identical to a quota wall or a network stall.
+// Naming the likeliest cause with its one-time fix is the difference between a 2-minute repair and the
+// 40-minute misdiagnosis the same shape caused on the codex shim.
+export function cloudSpawnTimeoutNote(credProfile) {
+  return `the launcher produced no session id before the timeout. The measured cause is a cred profile that has never been first-run-initialized: \`claude --cloud\` then waits on the onboarding THEME PICKER behind the pty, where stdin is /dev/null and nothing can answer it. Initialize it interactively ONCE — \`CLAUDE_CONFIG_DIR=${credProfile ?? "<profile>"} claude\`, answer the prompts, quit — then re-run this spawn. (Setting .theme in that profile's .claude.json is NOT enough: a version bump re-onboards.)`;
+}
+
+// The branch precondition, as a PURE verdict over three facts, so the proof lives in a unit test instead
+// of in a live spawn. Deliberately stricter than "the branch exists on origin": the cloud session resolves
+// the ref REMOTELY, so a remote tip that differs from local HEAD means the lead starts from code the
+// orchestrator never intended — silently, with a green spawn. Both halves return the exact repair.
+export function cloudBranchRefusal({ branch, checkedOut, localSha, remoteSha, worktree } = {}) {
+  if (!branch) return "spawn-cloud: no branch — a cloud session clones the ref checked out in the worktree, so the branch must be known before the spawn";
+  if (!localSha) return `spawn-cloud: could not read HEAD in ${worktree ?? "the worktree"} — the spawn's source ref is unreadable, so nothing about what the lead would clone can be proven`;
+  // The CHECKED-OUT ref is what the session clones, so a worktree sitting on another branch (or detached,
+  // where rev-parse --abbrev-ref prints "HEAD") sends the lead to start from code nobody chose — with a
+  // green spawn and a plausible session id. The branch NAME is not what selects the source; this is.
+  if (checkedOut && checkedOut !== branch) {
+    return `spawn-cloud: ${worktree ?? "the worktree"} has ${checkedOut === "HEAD" ? "a DETACHED HEAD" : `\`${checkedOut}\``} checked out, not \`${branch}\`. A cloud session clones the CHECKED-OUT ref (no branch-selection flag exists), so this spawn would hand the lead the wrong starting point and still return a session id. Check the branch out first: git -C ${worktree ?? "<worktree>"} checkout ${branch}`;
+  }
+  if (!remoteSha) {
+    return `spawn-cloud: branch ${branch} is NOT on origin. A cloud session resolves the ref remotely, so this spawn would die at provisioning with 0 turns (error_during_execution) — which reads as a lead that failed to start, not as a missing branch. Push it first: git -C ${worktree ?? "<worktree>"} push -u origin ${branch} (or re-run with --push).`;
+  }
+  if (remoteSha !== localSha) {
+    return `spawn-cloud: origin/${branch} is at ${remoteSha.slice(0, 9)} but the worktree HEAD is ${localSha.slice(0, 9)}. The cloud session would clone origin's tip, so every local commit ahead of it is silently DROPPED from the lead's checkout. Push first: git -C ${worktree ?? "<worktree>"} push origin ${branch} (or re-run with --push).`;
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Steering a live cloud lead (2026-08-18) — how a cloud kickback is DELIVERED
+// ---------------------------------------------------------------------------
+// `claude -p "<msg>" --cloud <session_id>` is the one headless channel into a running cloud session:
+// accepted with no pty (unlike CREATE), it prints "Sent to cloud session" and returns. The message QUEUES
+// if a turn is in flight and is consumed at the turn boundary — which is precisely why the ack below
+// exists: "queued" and "swallowed" are indistinguishable from the sending side.
+export function cloudSteerCommand({ credProfile, sessionId, prompt, claudeBin = "claude" } = {}) {
+  if (!credProfile) throw new Error("cloudSteerCommand: credProfile is required — a steer must ride the account that owns the session");
+  if (!sessionId) throw new Error("cloudSteerCommand: sessionId is required");
+  if (!prompt) throw new Error("cloudSteerCommand: prompt is required");
+  const args = ["-u", "ANTHROPIC_API_KEY", "-u", "ANTHROPIC_AUTH_TOKEN", "-u", "ANTHROPIC_BASE_URL", claudeBin, "-p", prompt, "--cloud", sessionId];
+  return {
+    command: "env",
+    args,
+    env: { CLAUDE_CONFIG_DIR: credProfile },
+    line: `CLAUDE_CONFIG_DIR=${shellQuote(credProfile)} env ${args.map(shellQuote).join(" ")} < /dev/null`,
+  };
+}
+
+// The demanded acknowledgement. It deliberately reuses `kickback_ack` — a type the cloud-reportable
+// allowlist ALREADY accepts and the fold already treats as proof of life — rather than inventing a token
+// the orchestrator would have to grep for. The round makes it unique per round, so a round-2 ack can never
+// be satisfied by round-1's comment, and the receipt lands in the ledger instead of in a comment nobody
+// re-reads. A steer QUEUES behind the in-flight turn, so "sent" and "read" are different claims: this is
+// the only thing that distinguishes them from outside the session.
+export function cloudSteerAckInstruction({ repo = null, pr = null, issueId = null, round = 1 } = {}) {
+  const ids = JSON.stringify([issueId ?? "<id>"]);
+  const prRef = pr != null ? String(pr) : "<PR>";
+  return [
+    `**Acknowledge this message BEFORE you start fixing.** A steer queues behind your in-flight turn, so from outside the session "delivered" and "lost" look identical — this ack is the only thing that separates them, and the orchestrator treats a missing one as an undelivered round:`,
+    ``,
+    `\`gh api repos/${repo ?? "<owner>/<repo>"}/issues/${prRef}/comments -f body='WORK-EVENT {"type":"kickback_ack","issues":${ids},"pr":${prRef},"round":${round}}'\``,
+    ``,
+    `Then fix the findings above, push to the SAME branch, and re-mark the PR \`ready_for_review\` (that draft→ready flip is your re-hand-off). Do NOT open a new PR.`,
+  ].join("\n");
+}
+
+// A steer is proven by the CLI's own accept line, not by exit 0 — the same "a check that cannot fail is
+// not evidence" rule the codex gate is held to. An exit-0 run with no accept line is UNPROVEN delivery.
+export function cloudSteerOutcome({ exitCode, stdout = "", stderr = "" } = {}) {
+  const text = `${String(stdout || "")}${String(stderr || "")}`.replace(/\r/g, "");
+  const accepted = /sent to cloud session/i.test(text);
+  const said = text.trim() ? text.trim().split("\n").slice(-3).join(" ").slice(0, 400) : null;
+  if (exitCode !== 0) return { ok: false, exit_code: exitCode ?? null, reason: `the steer exited ${exitCode}`, note: said };
+  if (!accepted) return { ok: false, exit_code: 0, reason: 'the steer exited 0 but the CLI never printed "Sent to cloud session" — delivery is UNPROVEN (an ended or expired session is the usual cause)', note: said };
+  return { ok: true, exit_code: 0, reason: null, note: null };
 }
 
 function shellQuote(value) {
@@ -9996,6 +10210,197 @@ export async function runSubcommand(argv) {
       if (!o.dryRun) await appendEvent(runDir, ev);
       return { stdout: line, workspace_ref: ref, event: ev, dryRun: !!o.dryRun };
     }
+    // Cloud lead dispatch (2026-08-18) — replaces the orchestrator's hand-run `RemoteTrigger create`
+    // recipe. It lives HERE, in the runner, for one reason: the dispatch receipt and the ledger event are
+    // now written by the same code path. Under the routine recipe the orchestrator created the trigger with
+    // an MCP tool and then hand-appended `lead_spawned`, which is exactly the seam where a fabricated or
+    // mismatched id gets in ([[dispatch-id-is-a-claim-not-a-receipt]]). `claude --cloud` needs no claude.ai
+    // MCP auth — it reads the cred profile's own OAuth — so the runner can own the whole step.
+    case "spawn-cloud": {
+      assertNotRoot("spawn a cloud lead");
+      if (!runDir) throw new Error("spawn-cloud: --run <run-id> is required — the brief is read from the run dir and the dispatch receipt is written to its ledger");
+      const hostName = o.host ?? "cloud";
+      const hosts = getHosts();
+      const hostCfg = hosts[hostName];
+      if (!hostCfg) throw new Error(`spawn-cloud: unknown host "${hostName}" — define it in .claude/work.config.json hosts (have: ${Object.keys(hosts).join(", ")})`);
+      if (hostCfg.kind !== "cloud") throw new Error(`spawn-cloud: host "${hostName}" is not kind:"cloud" — a machine host is dispatched with \`spawn-lead --host ${hostName}\`, which launches through cmux/ssh. This command only speaks \`claude --cloud\`.`);
+      // The profile IS the account, and the account IS the cloud environment (`--environment` rejects the
+      // `env_…` ids, so there is no per-spawn override). An entry with no profile rides the machine's
+      // default login — operator state that changes without touching this config, which is why the
+      // config's own comment calls a profile-less cloud entry a latent boot failure.
+      if (!hostCfg.credProfile) throw new Error(`spawn-cloud: host "${hostName}" has no credProfile. A cloud spawn selects its ACCOUNT (and therefore its cloud environment) with CLAUDE_CONFIG_DIR, so a profile-less entry would silently ride whatever account this machine last logged in as. Add "credProfile": "~/.claude-<account>" to hosts.${hostName}.`);
+      if (hostCfg.enabled === false && !o.force) {
+        throw new Error(`spawn-cloud: host "${hostName}" is enabled:false in .claude/work.config.json — read that entry's own _comment_disabled* note for the re-enable CONDITION before overriding. --force dispatches anyway.`);
+      }
+      if (!o.worktree) throw new Error("spawn-cloud: --worktree is required. It is not bookkeeping: the cloud session clones the ref CHECKED OUT THERE (there is no branch-selection flag), so the worktree is how this spawn chooses what the lead starts from.");
+      const credProfile = hostCfg.credProfile.startsWith("~") ? join(homedir(), hostCfg.credProfile.slice(1)) : hostCfg.credProfile;
+      // A bare `claude` on PATH is not necessarily the CLI: on this machine the first hit is a cmux SHIM,
+      // and the codex probe carries a whole resolver (resolveCodexBin) because a shim's hang is
+      // byte-identical to a quota wall. Default stays `claude` — the shim has been measured to pass
+      // `--cloud` through correctly — with `--claude-bin` / hosts.<name>.claudeBin to pin the real binary.
+      const claudeBin = o.claudeBin ?? hostCfg.claudeBin ?? "claude";
+      const model = cloudLeadModel(o.model ?? "opus");
+      const events = runDir ? await readEvents(runDir) : [];
+      const bundle = o.bundle ? bundleList(o.issueId, o.bundle) : null;
+      // A duplicate FIRST spawn is refused because a cloud session cannot be closed from here (no CLI stop
+      // exists on this path — unproven, so not claimed), which means the two leads would both push to one
+      // branch. A kickback/rotation re-spawn is the legitimate second dispatch and says so with its flag;
+      // the predecessor's id rides the event as `replaces_session` so an audit can follow the handover.
+      const priorSpawn = [...events].reverse().find((e) => e.type === "lead_spawned" && e.issue === o.issueId && e.cloudSessionId);
+      if (priorSpawn && !o.kickback && !o.rotation && !o.force) {
+        throw new Error(
+          `spawn-cloud: ${o.issueId} already has a cloud lead (${priorSpawn.cloudSessionId}) on this run's ledger, and this spawn carries no --kickback/--rotation. ` +
+          "Two live sessions on one branch corrupt it, and a cloud session cannot be closed from this harness. " +
+          `To deliver findings to the EXISTING lead use \`steer-cloud --run ${o.runId ?? "<run>"} ${o.issueId}\` (it keeps the lead's context). ` +
+          "If that session is genuinely gone, re-run with --kickback <n> (or --force) to record the replacement deliberately.",
+        );
+      }
+      const fname = o.rotation
+        ? `${o.issueId}.rot${o.rotation}.md`
+        : o.kickback
+          ? `${o.issueId}.kb${o.kickback}.md`
+          : `${o.issueId}.md`;
+      const briefPath = join(runDir, "briefs", fname);
+      let brief;
+      try { brief = await readFile(briefPath, "utf8"); }
+      catch { throw new Error(`spawn-cloud: no brief at ${briefPath} — write it first: \`write-brief --run ${o.runId ?? "<run>"} ${o.issueId} --host ${hostName}${o.kickback ? ` --kickback ${o.kickback}` : ""} …\`. The brief text IS the argv this command passes to \`claude --cloud\`; there is no other channel into a cloud session.`);
+      }
+      // Branch precondition. `--push` publishes the ref instead of refusing, which is what an unattended
+      // dispatch wants; without it the refusal prints the exact push command, because pushing to origin
+      // on someone's behalf should be something the call site asked for.
+      const branchFromLedger = [...events].reverse().find((e) => e.type === "worktree_created" && e.issue === o.issueId && e.branch)?.branch ?? null;
+      const readSha = async (args) => {
+        const r = await runCommand({ command: "git", args, cwd: o.worktree, timeoutMs: 30000 });
+        return r.exitCode === 0 ? String(r.stdout || "").trim() : null;
+      };
+      const checkedOut = await readSha(["rev-parse", "--abbrev-ref", "HEAD"]);
+      const branch = o.branch ?? branchFromLedger ?? (checkedOut && checkedOut !== "HEAD" ? checkedOut : null);
+      const localSha = await readSha(["rev-parse", "HEAD"]);
+      const remoteShaOf = async () => {
+        const r = await runCommand({ command: "git", args: ["ls-remote", "origin", `refs/heads/${branch}`], cwd: o.worktree, timeoutMs: 60000 });
+        // ls-remote exits 0 with EMPTY output for an absent ref, so the sha — not the exit code — is the
+        // fact. An exit failure (no network, no remote) is also "unproven", never "absent".
+        return r.exitCode === 0 ? (String(r.stdout || "").trim().split(/\s+/)[0] || null) : null;
+      };
+      let remoteSha = branch ? await remoteShaOf() : null;
+      let refusal = cloudBranchRefusal({ branch, checkedOut, localSha, remoteSha, worktree: o.worktree });
+      if (refusal && o.push && !o.dryRun && branch && localSha && checkedOut === branch) {
+        // Never --force: a diverged remote must fail loudly here rather than have this command rewrite
+        // someone else's ref to make its own precondition true.
+        const pushed = await runCommand({ command: "git", args: ["push", "-u", "origin", branch], cwd: o.worktree, timeoutMs: 180000 });
+        if (pushed.exitCode !== 0) throw new Error(`spawn-cloud: --push failed for ${branch}: ${(pushed.stderr || pushed.stdout || "").trim().slice(0, 400)}`);
+        remoteSha = await remoteShaOf();
+        refusal = cloudBranchRefusal({ branch, checkedOut, localSha, remoteSha, worktree: o.worktree });
+      }
+      if (refusal) throw new Error(refusal);
+      const logPath = join(runDir ?? tmpdir(), "briefs", `${o.issueId}${o.kickback ? `.kb${o.kickback}` : ""}${o.rotation ? `.rot${o.rotation}` : ""}.cloud-spawn.log`);
+      const built = cloudSpawnCommand({ credProfile, model, prompt: brief, logPath, claudeBin });
+      const ev = {
+        actor: "orch", type: "lead_spawned", issue: o.issueId, host: hostName, host_kind: "cloud",
+        // The worktree is recorded for the same reason the machine paths record it: a cloud unit now OWNS
+        // one locally (it is what chose the cloned ref), so reap has something to clean up and rotate-lead
+        // has somewhere to put the WIP commit. Routine-era cloud units had neither.
+        worktree: o.worktree,
+        kickback: o.kickback ?? 0, branch, model, sha: localSha,
+        // A cloud transcript is not readable from here at all (the state fold excludes cloud lanes from
+        // the transcripts_unverified banner for exactly this reason), so this is `false` — measured, not
+        // assumed, which is the DER-2744 rule.
+        transcripts_forced: false,
+      };
+      if (o.rotation) ev.rotation = o.rotation;
+      if (bundle) ev.bundle = bundle;
+      if (priorSpawn) ev.replaces_session = priorSpawn.cloudSessionId;
+      // Dry-run purity (DER-2514): print the exact command, touch nothing.
+      if (o.dryRun) return { stdout: built.line, host: hostName, branch, model, event: ev, dryRun: true };
+      await mkdir(join(runDir, "briefs"), { recursive: true });
+      const timeoutMs = Number.isFinite(o.timeoutMs) ? o.timeoutMs : 180000;
+      const res = await runCommand({ command: built.command, args: built.args, cwd: o.worktree, env: { ...process.env, ...built.env }, timeoutMs });
+      const log = await readFile(logPath, "utf8").catch(() => "");
+      const outcome = cloudSpawnOutcome({ exitCode: res.exitCode, stdout: res.stdout, stderr: res.stderr, log });
+      if (!outcome.ok) {
+        await refuseUnprovenSpawn({
+          runDir, role: "lead", label: `spawn-cloud ${o.issueId} on ${hostName}`,
+          launcher: "claude --cloud",
+          outcome: { ...outcome, note: outcome.note ?? cloudSpawnTimeoutNote(hostCfg.credProfile) },
+          retry:
+            "  BEFORE retrying, confirm no session was created: a create can land while the CLI call dies\n" +
+            `  ([[dispatch-id-is-a-claim-not-a-receipt]]). Read the pty log (${logPath}) and this account's\n` +
+            "  session list; a blind retry is how one branch gets two leads. Likeliest cause when the log is\n" +
+            `  empty: ${cloudSpawnTimeoutNote(hostCfg.credProfile)}`,
+          issue: o.issueId, host: hostName, kickback: o.kickback ?? 0, rotation: o.rotation ?? null,
+        });
+      }
+      ev.cloudSessionId = outcome.session_id;
+      if (outcome.note) ev.note = outcome.note;
+      await appendEvent(runDir, ev);
+      return {
+        stdout: outcome.session_id, cloudSessionId: outcome.session_id, host: hostName, branch, model,
+        monitor: `https://claude.ai/code/${outcome.session_id}`, log: logPath, event: ev,
+      };
+    }
+    // Cloud kickback delivery (2026-08-18, Task 7) — steer the LIVE lead instead of respawning a
+    // context-less one. Measured: `claude -p "<msg>" --cloud <session_id>` is accepted headlessly, queues
+    // during a running turn, and is consumed at the turn boundary. The lead still holds the context of the
+    // work the findings are about, which is the whole point; a fresh spawn re-reads everything and
+    // re-litigates decisions the predecessor already made.
+    case "steer-cloud": {
+      if (!runDir) throw new Error("steer-cloud: --run <run-id> is required — the session id and the delivery receipt both live on that run's ledger");
+      const events = await readEvents(runDir);
+      const spawn = [...events].reverse().find((e) => e.type === "lead_spawned" && e.issue === o.issueId && e.cloudSessionId);
+      const sessionId = o.session ?? spawn?.cloudSessionId ?? null;
+      if (!sessionId) {
+        throw new Error(
+          `steer-cloud: no cloud session id for ${o.issueId}. Nothing on this run's ledger recorded one, so there is no live lead to steer. ` +
+          "A pre-2026-08-18 cloud lead was spawned by RemoteTrigger routine and has no id here — pass it explicitly with --session session_… " +
+          "(the draft PR's footer carries it, and `state` folds it onto the unit's `handle`), or dispatch a replacement with `spawn-cloud --kickback <n>`.",
+        );
+      }
+      const hostName = o.host ?? spawn?.host ?? "cloud";
+      const hostCfg = getHosts()[hostName];
+      if (!hostCfg?.credProfile) throw new Error(`steer-cloud: host "${hostName}" has no credProfile — a steer must go out on the SAME account that owns the session, and CLAUDE_CONFIG_DIR is how that is chosen.`);
+      const credProfile = hostCfg.credProfile.startsWith("~") ? join(homedir(), hostCfg.credProfile.slice(1)) : hostCfg.credProfile;
+      // The message: an explicit --message, else the kickback brief on disk (write-brief already unions
+      // every un-delivered finding into it, so this path inherits that rather than re-deriving it).
+      let message = o.message ?? null;
+      if (!message) {
+        const fname = o.kickback ? `${o.issueId}.kb${o.kickback}.md` : `${o.issueId}.md`;
+        const briefPath = join(runDir, "briefs", fname);
+        try { message = await readFile(briefPath, "utf8"); }
+        catch { throw new Error(`steer-cloud: no --message and no brief at ${briefPath} — compose the round's brief first (\`write-brief --host ${hostName} --kickback ${o.kickback ?? "<n>"} --findings …\`), or pass --message "<text>".`); }
+      }
+      // A demanded ACK is what made the queued-steer delivery PROVABLE on the 08-15 probe; without it a
+      // steer that vanished and one that was read look identical from here. The PR number comes from the
+      // round's own kickback event when the caller did not pass one — the instruction is worthless with a
+      // `<PR>` placeholder in it, and the ledger already knows the number.
+      const round = o.kickback ?? 0;
+      const prFromLedger = [...events].reverse().find((e) => e.issue === o.issueId && e.pr != null)?.pr ?? null;
+      const pr = o.pr != null ? Number(o.pr) : prFromLedger;
+      const ack = "kickback_ack";
+      const prompt = `${message}\n\n---\n\n${cloudSteerAckInstruction({ repo: getRepoIdentity().repoSlug, pr, issueId: o.issueId, round: round || 1 })}\n`;
+      const built = cloudSteerCommand({ credProfile, sessionId, prompt, claudeBin: o.claudeBin ?? hostCfg.claudeBin ?? "claude" });
+      const ev = {
+        actor: "orch", type: "kickback_relayed", issue: o.issueId, host: hostName,
+        cloudSessionId: sessionId, ack_expected: ack, ack_round: round || 1,
+        ...(o.kickback ? { kickback: o.kickback } : {}), ...(pr != null ? { pr } : {}),
+      };
+      if (o.dryRun) return { stdout: built.line, cloudSessionId: sessionId, ack, event: ev, dryRun: true };
+      const res = await runCommand({ command: built.command, args: built.args, env: { ...process.env, ...built.env }, timeoutMs: Number.isFinite(o.timeoutMs) ? o.timeoutMs : 120000 });
+      const outcome = cloudSteerOutcome({ exitCode: res.exitCode, stdout: res.stdout, stderr: res.stderr });
+      if (!outcome.ok) {
+        // NO event is recorded, deliberately: an undelivered steer must leave the kickback PENDING, which
+        // is what keeps it on `state.kickbacks_pending` and in front of the next wake. The fallback is a
+        // replacement spawn on the same branch — printed here so the caller does not have to remember it.
+        throw new Error(
+          `steer-cloud ${o.issueId}: the steer was NOT delivered — ${outcome.reason}.\n` +
+          `  NO kickback_relayed was recorded, so this round stays UN-ACTIONED and keeps surfacing in state.kickbacks_pending.\n` +
+          (outcome.note ? `  the CLI said: ${outcome.note}\n` : "") +
+          `  If the session has ENDED or EXPIRED (read it first: RemoteTrigger get_run_log ${sessionId}), fall back to a\n` +
+          `  replacement lead on the same branch: spawn-cloud --run ${o.runId ?? "<run>"} ${o.issueId} --host ${hostName} --worktree <p> --kickback ${o.kickback ?? "<n>"} --push`,
+        );
+      }
+      await appendEvent(runDir, ev);
+      return { stdout: `${sessionId} ${ack}`, cloudSessionId: sessionId, ack, event: ev, delivered: true };
+    }
     case "review-usage": {
       // Lead-facing: `… review-usage --run <r> --runs-root <p> --issue DER-x [--round n] --file review.json`
       // (or the payload on stdin). Appends the reviewer's token_usage event and PRINTS the review text,
@@ -11275,16 +11680,33 @@ export async function runSubcommand(argv) {
         await writeFile(briefPath, brief, "utf8");
       }
 
-      // 5. Respawn on the SAME worktree. Cloud is the exception: RemoteTrigger is the orchestrator's
-      // own tool, not a runner subcommand, so prepare everything and hand the brief back to it.
-      if (isCloud) {
+      // 5. Respawn on the SAME worktree. A cloud rotation used to stop here — RemoteTrigger was the
+      // orchestrator's own MCP tool, not something the runner could call — so it prepared the brief and
+      // handed it back. Since 2026-08-18 the cloud spawn IS a subcommand (`spawn-cloud`), so the rotation
+      // completes here like every other host. It still cannot when the unit has no worktree, which is what
+      // every routine-era cloud unit looks like: the session clones the ref checked out in a worktree, and
+      // without one there is nothing to clone from.
+      if (isCloud && !it.worktree) {
         if (!o.dryRun) await appendEvent(runDir, { actor: "orch", type: "rotation_prepared", issue: o.issueId, rotation, brief: briefPath, host });
         return {
           briefPath, rotation, wipCommitted, noteSynthesized, host, spawned: false,
-          stdout: `prepared rotation ${rotation} for ${o.issueId} (cloud). Brief: ${briefPath}\nSpawn it yourself with the RemoteTrigger tool — rotate-lead cannot create a cloud session.`,
+          stdout: `prepared rotation ${rotation} for ${o.issueId} (cloud), but this unit has NO worktree — a routine-era cloud unit.\n  Brief: ${briefPath}\n  Give it one and spawn: create-worktree --run ${o.runId} ${o.issueId}, then\n  spawn-cloud --run ${o.runId} ${o.issueId} --host ${host} --worktree <p> --rotation ${rotation} --push`,
         };
       }
-      const spawnArgs = [
+      const spawnArgs = isCloud
+        ? [
+          "spawn-cloud", "--run", o.runId, o.issueId,
+          "--worktree", it.worktree,
+          "--rotation", String(rotation),
+          "--host", host,
+          // The rotation brief is a fresh session's only instruction, and its branch must be on origin at
+          // this exact sha before the clone — the WIP commit above may well have just moved it.
+          "--push",
+          ...(o.runsRoot ? ["--runs-root", o.runsRoot] : []),
+          ...(o.repoRoot ? ["--repo-root", o.repoRoot] : []),
+          ...(o.dryRun ? ["--dry-run"] : []),
+        ]
+        : [
         "spawn-lead", "--run", o.runId, o.issueId,
         "--worktree", it.worktree,
         "--rotation", String(rotation),
@@ -11300,6 +11722,7 @@ export async function runSubcommand(argv) {
       return {
         briefPath, rotation, wipCommitted, noteSynthesized, host, spawned: true,
         workspace_ref: spawned.workspace_ref ?? null,
+        ...(spawned.cloudSessionId ? { cloudSessionId: spawned.cloudSessionId } : {}),
         // Dry-run purity (DER-2514): the brief is not written, so hand its content back for preview.
         ...(o.dryRun ? { brief, dryRun: true } : {}),
         stdout: `rotated ${o.issueId} → rotation ${rotation} (${host})${o.dryRun ? " [DRY-RUN — nothing written, nothing recorded]" : ""}\n  brief: ${briefPath}${noteSynthesized ? "  ⚠ synthesized note (predecessor left none)" : ""}\n  wip commit: ${wipCommitted ? "created" : "nothing to commit"}\n  ${spawned.stdout ?? ""}`.trimEnd(),
@@ -12362,6 +12785,23 @@ Subcommands:
   write-brief --run <r> <DER-id> [--bundle DER-x,DER-y] [--kickback n] [--worktree p] [--title t] [--acceptance a] [--findings f] [--lead-type claude|kimi|gpt|dsv4]
               [--plan <run-plan.json> | --budget-files N --budget-additions N]  stamp the ASSIGNED budget into the brief
   spawn-lead --run <r> <DER-id> --worktree <p> [--bundle DER-x,DER-y] [--kickback n] [--model opus] [--lead-type claude|kimi|gpt|dsv4] [--dry-run]
+  spawn-cloud --run <r> <DER-id> --worktree <p> [--host cloud] [--model opus|sonnet] [--kickback n] [--rotation n] [--push] [--dry-run]
+                                              dispatch a CLOUD lead as a \`claude --cloud\` session and record
+                                              its session id as the receipt. REFUSES: a branch not on origin
+                                              at the worktree's HEAD sha (the session clones the ref checked
+                                              out there — a local-only commit dies at provisioning with 0
+                                              turns), a host with no credProfile (the profile is the account
+                                              and the account is the environment), and a second FIRST spawn
+                                              (nothing here can close a cloud session, so two leads would
+                                              push to one branch — steer instead). An absent session id
+                                              records lead_spawn_failed; it is never synthesized.
+  steer-cloud --run <r> <DER-id> [--kickback n] [--message <t>] [--session session_…] [--pr n] [--dry-run]
+                                              DELIVER a kickback into the LIVE cloud lead (it still holds the
+                                              context of the work the findings are about) — records
+                                              kickback_relayed, never a second lead_spawned. Proven by the
+                                              CLI's own "Sent to cloud session", not by exit 0; an unproven
+                                              steer records NOTHING so the round stays pending, and prints
+                                              the spawn-cloud fallback for an expired session.
 
 Lead types: pass the SAME --lead-type to write-brief AND spawn-lead. The brief then names the type's
 concrete per-slot models. EVERY type renders the mandatory 3-lens adversarial review panel (DER-2360);
@@ -12556,9 +12996,14 @@ in .claude/work.config.json leadTypes; proxy-backed types run on --host local on
 See the README's lead-types section.
 Lead concentration (DER-1834): init-run accepts --host <name> (FORCE every lead onto <name>, e.g.
 --host cloud) or --prefer <name> (try it first, then overflow) — recorded in run_started for pickHost.
-Cloud host (kind:"cloud"): write-brief --host cloud emits the cloud-session brief; the ORCHESTRATOR
-spawns it via the RemoteTrigger tool (not a subcommand) and folds WORK-EVENT PR comments via
-reconcile-pr-events. See SKILL.md §3 "Cloud host dispatch".
+Cloud host (kind:"cloud"): write-brief --host cloud emits the cloud-session brief, then spawn-cloud
+dispatches it as a \`claude --cloud\` session (2026-08-18 — the RemoteTrigger routine recipe is retired).
+Two preconditions, both enforced: a WORKTREE (the session clones the ref checked out there — there is no
+branch-selection flag) whose branch is on origin at the same sha (--push publishes it), and a credProfile
+on the host entry (the profile is the account, and the ACCOUNT'S default cloud environment is the env —
+--environment takes only ccpool_… ids). A cloud kickback is a steer-cloud into the LIVE session, not a
+fresh spawn. Reporting is unchanged: WORK-EVENT PR comments folded by reconcile-pr-events.
+See SKILL.md §3 "Cloud host dispatch".
 
 Env: WORK_CMUX_BIN (override cmux path). Runs live under tmp/work/<run-id>/ (gitignored).`;
 }

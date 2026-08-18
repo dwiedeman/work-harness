@@ -28,7 +28,7 @@
     "email": "0000000+your-github-login@users.noreply.github.com"
   },
 
-  "//hosts": "Where leads run. `local` always exists. `kind:\"ssh\"` overflows to another machine over cmux ssh; `kind:\"cloud\"` is a Claude Code cloud environment spawned via the RemoteTrigger tool. One entry PER ACCOUNT — environmentId is per-account and credProfile pins which login it is spawned from.",
+  "//hosts": "Where leads run. `local` always exists. `kind:\"ssh\"` overflows to another machine over cmux ssh; `kind:\"cloud\"` is a Claude Code cloud session dispatched by `spawn-cloud` (a pty-wrapped `claude --cloud`). One entry PER ACCOUNT, and `credProfile` is MANDATORY: the profile selects the account, and that account's server-side default cloud environment IS the environment (`--environment` accepts only ccpool_ ids, so there is no per-spawn override). Set the default once per account with /remote-env; a legacy `environmentId` here is inert history from the retired RemoteTrigger routine path.",
   "hosts": {
     "local": { "cap": 2 },
     "mini": {
