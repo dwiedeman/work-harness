@@ -8634,14 +8634,26 @@ export function parsePrEventComments({ comments = [], runIssues = null, pr = nul
 export function deriveCloudPrEvents({ pr, runIssues = null, bundles = {}, status = null, kickbackSha = null, trustedPrAuthors, repoOwner } = {}) {
   if (!pr || pr.number == null) return [];
   if (!prIdentityTrusted(pr, { trustedPrAuthors, repoOwner })) return [];
-  const hay = `${pr.headRefName || ""} ${pr.title || ""}`.toLowerCase();
+  // Unit ids are matched as WHOLE TOKENS, never as substrings (2026-08-18). `hay.includes("der-403")` is
+  // true of a PR titled "DER-4036 …", so a run holding both ids folded DER-4036's lifecycle onto DER-403 —
+  // executed, not hypothesised. It was always wrong; the cloud migration made it load-bearing, because a
+  // CLI-dispatched cloud lead is system-bound to a `claude/…` branch (DER-4036) and the PR TITLE becomes
+  // the only place the id appears. Tokenising on non-alphanumerics keeps the old branch-or-title reach
+  // (`derrekwiedeman/der-4036-…` still matches) while making a longer id stop matching a shorter one.
+  const hayTokens = new Set(
+    `${pr.headRefName || ""} ${pr.title || ""}`.toLowerCase().split(/[^a-z0-9-]+/).flatMap((word) => {
+      // A branch segment is `<user>/der-4036-slug-words`: take every `<prefix>-<digits>` run inside it.
+      const ids = word.match(/[a-z]+-\d+/g) ?? [];
+      return word ? [word, ...ids] : ids;
+    }),
+  );
   let issue;
   // When runIssues is PROVIDED (an array, even empty), the PR MUST name one of them — otherwise it's
   // not part of this run and we emit nothing. Only `null`/undefined means "no filter" (test convenience;
   // the reconcile caller never passes that — it guards on an empty scope).
   if (runIssues != null) {
     if (!Array.isArray(runIssues) || !runIssues.length) return [];
-    issue = runIssues.find((id) => hay.includes(String(id).toLowerCase()));
+    issue = runIssues.find((id) => hayTokens.has(String(id).toLowerCase()));
     if (!issue) return [];
   }
   const m = typeof pr.body === "string" ? pr.body.match(/session_[A-Za-z0-9]+/) : null;
@@ -10241,8 +10253,13 @@ export async function runSubcommand(argv) {
       // default login — operator state that changes without touching this config, which is why the
       // config's own comment calls a profile-less cloud entry a latent boot failure.
       if (!hostCfg.credProfile) throw new Error(`spawn-cloud: host "${hostName}" has no credProfile. A cloud spawn selects its ACCOUNT (and therefore its cloud environment) with CLAUDE_CONFIG_DIR, so a profile-less entry would silently ride whatever account this machine last logged in as. Add "credProfile": "~/.claude-<account>" to hosts.${hostName}.`);
-      if (hostCfg.enabled === false && !o.force) {
-        throw new Error(`spawn-cloud: host "${hostName}" is enabled:false in .claude/work.config.json — read that entry's own _comment_disabled* note for the re-enable CONDITION before overriding. --force dispatches anyway.`);
+      // `enabled:false` + an EXPLICIT `--host <name>` is the harness's forced-only idiom, and pickHost
+      // already implements it ("a forced host is an explicit operator opt-in → bypass enabled:false").
+      // This path has to agree with it: a config can truthfully say "disabled means --host only" while
+      // this command refuses that exact invocation, and then the documented opt-in is a lie. What still
+      // refuses is a DEFAULTED host — nobody chose it, so nobody read the note explaining why it is off.
+      if (hostCfg.enabled === false && !o.host && !o.force) {
+        throw new Error(`spawn-cloud: host "${hostName}" is enabled:false in .claude/work.config.json and you did not name it — read that entry's own _comment_disabled*/_comment_optin* note for the re-enable CONDITION, then opt in deliberately with \`--host ${hostName}\` (or --force).`);
       }
       if (!o.worktree) throw new Error("spawn-cloud: --worktree is required. It is not bookkeeping: the cloud session clones the ref CHECKED OUT THERE (there is no branch-selection flag), so the worktree is how this spawn chooses what the lead starts from.");
       const credProfile = hostCfg.credProfile.startsWith("~") ? join(homedir(), hostCfg.credProfile.slice(1)) : hostCfg.credProfile;

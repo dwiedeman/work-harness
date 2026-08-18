@@ -15,6 +15,23 @@ run materially different harness code against **one shared ledger** with no way 
 gate itself gained the missing half below — attesting the *acting* process's own version, not only
 versions already recorded in the ledger — in DER-2779.
 
+## [0.8.2] — 2026-08-18
+
+Two defects the round-2 pre-PR gate **executed** rather than argued, both in code the cloud migration made
+load-bearing:
+
+- **A unit id was matched as a SUBSTRING of a PR's branch-or-title.** `hay.includes("der-403")` is true of
+  a PR titled "DER-4036 …", so a run holding both ids folded DER-4036's lifecycle events onto DER-403 —
+  repointing the wrong unit's PR, and able to hand off the wrong one. Ids are now matched as whole tokens
+  (the `<user>/der-4036-slug` branch form still matches, and spec-mode `SPEC-…-U1` ids still match). This
+  bug predates the migration; the migration made the PR TITLE the only place a cloud lead's id appears,
+  which is what turned a latent mismatch into a routing hazard.
+- **`spawn-cloud` refused the very opt-in the config prescribes.** `pickHost` treats a forced host as an
+  explicit operator opt-in and bypasses `enabled:false`; `spawn-cloud` demanded `--force` on top of
+  `--host <name>`, so "disabled means forced-only" was true of routing and false of dispatch. Naming a host
+  explicitly is now the opt-in on both paths; a DEFAULTED disabled host still refuses, because nobody chose
+  it.
+
 ## [0.8.1] — 2026-08-18
 
 **A cloud lead does NOT move off its own branch, and the pre-PR gate policy in the deployed skill is

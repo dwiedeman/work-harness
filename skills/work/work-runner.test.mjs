@@ -12189,7 +12189,9 @@ test("spawn-cloud: config refusals — non-cloud host, missing credProfile, disa
     // A cloud entry with no credProfile would ride whatever account this machine last logged in as —
     // operator state that changes without touching the config.
     await assert.rejects(() => runSubcommand([...base, "--host", "cloudbare"]), /has no credProfile/);
-    await assert.rejects(() => runSubcommand([...base, "--host", "cloudoff"]), /enabled:false.*re-enable CONDITION/s);
+    // NOTE: naming a DISABLED host explicitly is the opt-in, not an error — see the forced-only test
+    // below; `enabled:false` + `--host <name>` is how this harness expresses "reachable only on purpose".
+    // What refuses is a host nobody named (covered there too).
     await assert.rejects(() => runSubcommand([...base, "--host", "nosuch"]), /unknown host "nosuch"/);
     await assert.rejects(
       () => runSubcommand(["spawn-cloud", "--run", s.runId, "DER-77", "--runs-root", s.runsRoot, "--repo-root", s.repo, "--worktree", s.wt, "--host", "cloud", "--dry-run"]),
@@ -12296,4 +12298,54 @@ test("transcripts_unverified excludes cloud lanes by HOST KIND, not by the liter
   ]);
   const listed = st.transcripts_unverified.map((r) => r.issue);
   assert.deepEqual(listed, ["DER-2"], "the mini lane with no attestation IS listed (the control), the cloud2 lane is not");
+});
+
+test("deriveCloudPrEvents matches a unit id as a WHOLE TOKEN — a longer id in the title must not fold onto a shorter run id", () => {
+  // Executed by the pre-PR gate on the cloud-migration PR: `hay.includes("der-403")` is true of a PR
+  // titled "DER-4036 …", so a run holding both ids folded DER-4036's lifecycle onto DER-403 — repointing
+  // the wrong unit's PR and potentially handing it off. Always wrong; the cloud migration made it
+  // load-bearing, because a CLI-dispatched cloud lead is bound to a `claude/…` branch (DER-4036) and the
+  // TITLE is then the only place the id appears.
+  const opts = { trustedPrAuthors: ["dwiedeman"], repoOwner: "acme" };
+  const pr = (title, head) => ({
+    number: 1, title, headRefName: head, isDraft: true, body: "",
+    author: { login: "dwiedeman" }, headRepositoryOwner: { login: "acme" }, isCrossRepository: false,
+  });
+  const issueOf = (p, ids) => deriveCloudPrEvents({ pr: p, runIssues: ids, ...opts })[0]?.issue ?? null;
+
+  // THE BUG: the prefix id is listed first, so a substring match returns it.
+  assert.equal(issueOf(pr("fix: DER-4036 branch binding", "claude/x-1"), ["DER-403", "DER-4036"]), "DER-4036",
+    "a longer id in the title must bind to the longer id, never to its prefix");
+  // …and a run that holds ONLY the shorter id must not claim the longer id's PR at all.
+  assert.equal(issueOf(pr("fix: DER-4036 branch binding", "claude/x-1"), ["DER-403"]), null,
+    "DER-403 is not named by a DER-4036 PR");
+  // CONTROLS — the reach that must SURVIVE the fix, or this trades one silent mismatch for another.
+  assert.equal(issueOf(pr("fix: DER-4036 branch", "claude/x-1"), ["DER-4036"]), "DER-4036", "title match");
+  assert.equal(issueOf(pr("fix: something", "derrekwiedeman/der-4036-branch-thing"), ["DER-4036"]), "DER-4036",
+    "the branch form `<user>/der-4036-slug` must still match — that is how every non-cloud PR is found");
+  assert.equal(issueOf(pr("chore: nothing to see", "claude/y-2"), ["DER-4036"]), null, "an unrelated PR still folds nothing");
+  // A spec-mode unit id keeps working (it is not `<prefix>-<digits>`, so it matches as a bare token).
+  assert.equal(issueOf(pr("feat: SPEC-demo-U1 lands", "claude/z-3"), ["SPEC-demo-U1"]), "SPEC-demo-U1");
+});
+
+test("spawn-cloud: an explicitly NAMED host is the operator opt-in, exactly as pickHost treats forceHost", async () => {
+  // The two paths have to agree or the documented opt-in is a lie. pickHost's rule is "a forced host is an
+  // explicit operator opt-in → bypass enabled:false"; spawn-cloud used to demand --force on top of
+  // `--host <name>`, so the config could truthfully say "disabled = forced-only" while the command that
+  // performs the dispatch refused the exact invocation the config prescribed.
+  const s = await mkCloudSandbox();
+  try {
+    s.push();
+    const base = ["spawn-cloud", "--run", s.runId, "DER-9", "--runs-root", s.runsRoot, "--repo-root", s.repo, "--worktree", s.wt, "--dry-run"];
+    const out = await runSubcommand([...base, "--host", "cloudoff"]);
+    assert.match(out.stdout, /--cloud/, "naming a disabled host explicitly IS the opt-in");
+    assert.equal(out.event.host, "cloudoff");
+    // CONTROL — the guard still fires when the host was DEFAULTED rather than named, which is the case
+    // where nobody made a deliberate choice.
+    const cfg = JSON.parse(await readFile(join(s.repo, ".claude", "work.config.json"), "utf8"));
+    cfg.hosts.cloud = { ...cfg.hosts.cloud, enabled: false };
+    await writeFile(join(s.repo, ".claude", "work.config.json"), JSON.stringify(cfg), "utf8");
+    await assert.rejects(() => runSubcommand(base), /enabled:false.*re-enable CONDITION/s,
+      "a defaulted host that is disabled must still refuse — no deliberate choice was made");
+  } finally { await rm(s.dir, { recursive: true, force: true }); }
 });
