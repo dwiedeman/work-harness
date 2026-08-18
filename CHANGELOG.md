@@ -15,6 +15,49 @@ run materially different harness code against **one shared ledger** with no way 
 gate itself gained the missing half below — attesting the *acting* process's own version, not only
 versions already recorded in the ledger — in DER-2779.
 
+## [0.8.5] — 2026-08-18
+
+Round 4 of the pre-PR gate (`turn.completed = 1`, 94 command executions, verdict **not ready**: 4×P1, 5×P2).
+Its findings were again dominated by defects the PREVIOUS round's fixes created — the second consecutive
+fix-induced round. So this release does not patch the call sites the reviewer named. **Each fix is applied
+to the class, and each class gets a test that derives its own roster or sweeps its own property**, because
+one-instance-at-a-time is the mechanism by which all three rounds recurred.
+
+- **`steer-cloud` sent work to a DISABLED host with no human opt-in** (DER-4050). 0.8.4 established the
+  rule — a `--host` this harness MANUFACTURES from ledger state is not the operator's choice — and applied
+  it to `rotate-lead` only. `steer-cloud` resolves its host the same way and had no guard, so a kickback
+  round walked straight into an account someone had disabled for 429s or a wall. It now refuses before the
+  command is built, records nothing (the round stays on `kickbacks_pending`), and prints the deliberate
+  `--host` opt-in. **`THE FAMILY` test derives its roster from the runner's own `VERSION_GATED_SUBCOMMANDS`**:
+  a new dispatching subcommand must declare its disabled-host behavior or the suite fails.
+- **The missing-session recovery named the WRONG account** (DER-4050). The lookup required
+  `e.cloudSessionId`, which is exactly the field a routine-era `lead_spawned` lacks — so the one event that
+  knew the unit's host was discarded on the path built to recover it, and the printed command pointed at a
+  different account's environment. Host resolution no longer depends on the session id.
+- **`reap` could not clean up a CLI cloud unit, so a cloud run could never be closed out** (DER-4053).
+  Every host but literal `local` was treated as ssh-remote; a cloud entry has no `ssh`/`ledgerRoot`/`repo`,
+  so cleanup composed `undefined/<run>/briefs/<id>` and threw — no worktree removal, no `reaped` event. The
+  axis is host **kind**: a cloud unit owns a LOCAL staging worktree and has no ssh process to kill. Cleanup
+  deliberately ignores `enabled` — a unit that has already done its work must be reapable after its host is
+  disabled. This was the actual blocker on delivering an issue end-to-end through the cloud lane.
+- **A PR could still fold onto the WRONG unit** (DER-4051). Identity matching had been fixed twice and was
+  still first-hit: an open-ended `<id>-` prefix let `SPEC-DEMO-U1` claim both the prose word
+  `spec-demo-u1-compatibility` in a title about U2 and the unrelated longer unit `spec-demo-u1-followup-u2`,
+  and `runIssues.find` let ledger order beat an exact title match. Matching is now **ranked** (exact, then
+  the `<id>-work` branch shape that is the prefix rule's only real purpose) and **ambiguity is refused**
+  rather than guessed — except for a bundle, where one primary covering every winner still resolves.
+- **A blocked rotation was invisible to the next wake** (DER-4050). `rotation_prepared` had been appended
+  since 0.8.4 and nothing folded it, so a prepared-and-waiting rotation read exactly like an untouched one.
+  It now folds to `state.lead_rotation_blocked` with its reason and its already-written brief, and clears
+  when the dispatch lands. The no-worktree branch also runs BEFORE the disabled-host guard, which had
+  shadowed it and printed `--worktree <p>` for a unit that has no worktree.
+- **Dry-run stopped claiming work it skipped** (DER-4050): `rotate-lead --dry-run` reported
+  `noteSynthesized: true` although synthesis is explicitly skipped; it now reports `noteWouldSynthesize`.
+
+Still open from round 4, filed rather than fixed here: DER-4052 (the documented failed-to-start recovery
+selects a `.kb<n>.md` brief that does not exist for an initial spawn failure, and the ROST mini runbook's
+routing prose is stale).
+
 ## [0.8.4] — 2026-08-18
 
 Round 3 of the pre-PR gate, which reviewed the forced-only change itself. Three of these are defects the

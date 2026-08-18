@@ -19,6 +19,7 @@ import {
   requiresDocker, parseIssueList, bundleList,
   hostsToPull, mergedReconcileEvents, parseWakeOn, ACTIONABLE_EVENT_TYPES,
   reapCleanupCommands, reapCleanupOutcome, renderCloudBrief, parsePrEventComments, deriveCloudPrEvents,
+  VERSION_GATED_SUBCOMMANDS,
   codexReviewCommand, codexTokensFromLog, parseCodexReview, reviewFindingsEvent, scoreReviewFidelity, codexRunCompleted,
   codexFalseGreenRefusal,
   dedupeTerminalEvents, escalateKickbackModel, getShepherdModel, getDefaultPreferHosts,
@@ -12393,4 +12394,201 @@ test("deriveCloudPrEvents: create-worktree's OWN default branch shape still matc
   assert.equal(f(pr("feat: work", "der-4036-work"), ["DER-4036"]), "DER-4036", "linear default branch");
   assert.equal(f(pr("feat: work", "derrekwiedeman/der-4036-slug"), ["DER-4036"]), "DER-4036", "linear gitBranchName form");
   assert.equal(f(pr("feat: work", "der-4036-work"), ["DER-403"]), null, "the collision stays refused through the prefix rule");
+});
+
+// ---- DER-4050 / DER-4051 / DER-4053: the classes behind three consecutive fix-induced gate rounds ----
+//
+// Rounds 2, 3 and 4 each fixed the instance the reviewer named and left the class open. These tests exist to
+// make the CLASS the unit of coverage: a family roster derived from the runner itself, an identity property
+// swept over colliding shapes, and a reap that crosses the host-kind boundary. Each assertion below was
+// confirmed to FAIL against the pre-fix implementation — a check that cannot fail is not evidence.
+
+// THE FAMILY TEST (DER-4050). The rule is "a command that MANUFACTURES --host from ledger state must not
+// read it as an operator opt-in". 0.8.4 applied it to `rotate-lead` alone; `steer-cloud` and the legacy
+// recovery path were the same rule, same file, unapplied. So the roster is derived from the runner's own
+// VERSION_GATED_SUBCOMMANDS — the set of subcommands that dispatch an agent — and every member must declare
+// its behavior here. Adding a dispatching subcommand without deciding this question fails the test.
+const DISABLED_HOST_POLICY = {
+  // Resolves its host from the LEDGER ⇒ bound by the rule, and exercised live below.
+  "steer-cloud": "ledger-resolved",
+  "rotate-lead": "ledger-resolved",
+  // DEFAULTS its host (to "cloud") rather than reading the ledger; already guarded at its own call site,
+  // covered by the existing spawn-cloud tests.
+  "spawn-cloud": "defaulted-guarded",
+  // Takes `--host` from argv only (`o.host ?? "local"`), so an unnamed host is always `local`, which is
+  // never a disabled cloud account. Nothing to manufacture.
+  "spawn-lead": "argv-only",
+  "spawn-shepherd": "argv-only",
+  "spawn-orch": "argv-only",
+  "rotate-shepherd": "argv-only",
+};
+
+test("THE FAMILY (DER-4050): every dispatching subcommand declares how it treats a disabled host", () => {
+  // Derived from the runner, not hand-copied: a new dispatching subcommand shows up here automatically.
+  const undeclared = [...VERSION_GATED_SUBCOMMANDS].filter((n) => !(n in DISABLED_HOST_POLICY));
+  assert.deepEqual(undeclared, [],
+    "a new dispatching subcommand must declare its disabled-host behavior — 'a manufactured --host is not an operator opt-in' is a CLASS rule, and the way it kept recurring was being applied one call site at a time");
+  // The roster must be non-trivial in the direction that matters: the rule only binds ledger-resolved hosts,
+  // so a policy map that quietly drifted to all-"argv-only" would pass vacuously.
+  const ledgerResolved = Object.entries(DISABLED_HOST_POLICY).filter(([, v]) => v === "ledger-resolved").map(([k]) => k);
+  assert.ok(ledgerResolved.length >= 2, "at least steer-cloud and rotate-lead resolve a host from the ledger");
+  for (const name of ledgerResolved) assert.ok(VERSION_GATED_SUBCOMMANDS.has(name), `${name} must still be a dispatching subcommand`);
+});
+
+test("THE FAMILY (DER-4050): a ledger-resolved DISABLED host refuses, and the SAME call with --host goes through", async () => {
+  // Three legs per command, because only the trio proves the guard rather than a coincidence:
+  //   1. enabled host, no --host        → DISPATCHES  (the positive control: this path CAN record a dispatch)
+  //   2. disabled host, no --host       → REFUSES     (the rule)
+  //   3. disabled host, explicit --host → DISPATCHES  (forced-only still works; the guard is not a wall)
+  const dispatchTypes = new Set(["lead_spawned", "kickback_relayed"]);
+  for (const host of ["cloud", "cloudoff"]) {
+    for (const explicit of [false, true]) {
+      if (host === "cloud" && explicit) continue; // leg 1 only needs the unnamed form
+      const s = await mkCloudSandbox();
+      try {
+        s.push();
+        const stub = await mkClaudeStub(s.dir, { sessionId: "session_01Fam" });
+        await writeFile(stub.bin, `#!/bin/sh\nprintf '%s\\n' "$@" > ${JSON.stringify(stub.argvLog)}\necho "Sent to cloud session"\n`, "utf8");
+        await chmod(stub.bin, 0o755);
+        await appendEvent(s.runDir, { actor: "orch", type: "worktree_created", issue: "DER-9", worktree: s.wt, branch: s.branch });
+        await appendEvent(s.runDir, { actor: "orch", type: "lead_spawned", issue: "DER-9", host, host_kind: "cloud", worktree: s.wt, cloudSessionId: "session_01Live" });
+        await appendEvent(s.runDir, { actor: "shepherd", type: "kickback", issue: "DER-9", pr: 42, sha: "d".repeat(40) });
+        await writeFile(join(s.runDir, "briefs", "DER-9.kb1.md"), "FINDINGS: fix it\n", "utf8");
+        const before = (await readEvents(s.runDir)).filter((e) => dispatchTypes.has(e.type)).length;
+        const argv = ["steer-cloud", "--run", s.runId, "DER-9", "--runs-root", s.runsRoot, "--repo-root", s.repo,
+          "--kickback", "1", "--pr", "42", "--claude-bin", stub.bin, ...(explicit ? ["--host", host] : [])];
+        const disabledAndUnnamed = host === "cloudoff" && !explicit;
+        let threw = null;
+        try { await runSubcommand(argv); } catch (e) { threw = e; }
+        const after = (await readEvents(s.runDir)).filter((e) => dispatchTypes.has(e.type)).length;
+        if (disabledAndUnnamed) {
+          assert.ok(threw, "steer-cloud must REFUSE a ledger-resolved disabled host");
+          assert.match(String(threw.message), /enabled:false/, "…and say why");
+          assert.match(String(threw.message), /--host cloudoff/, "…and print the deliberate opt-in");
+          assert.equal(after, before, "a refused steer records NOTHING, so the round stays on kickbacks_pending");
+        } else {
+          assert.equal(threw, null, `steer-cloud must still deliver (host=${host} explicit=${explicit}): ${threw?.message}`);
+          assert.equal(after, before + 1, "the positive control: this path really can record a dispatch, so the refusal above is a guard and not an unrelated failure");
+        }
+      } finally { await rm(s.dir, { recursive: true, force: true }); }
+    }
+  }
+});
+
+test("steer-cloud (DER-4050): a legacy lead_spawned with NO session id still yields the unit's OWN host", async () => {
+  // The `spawn` lookup requires `e.cloudSessionId`, which is exactly what a pre-2026-08-18 routine-era event
+  // lacks — so the one event that knew this unit's account was discarded on the very path that exists to
+  // recover it, `hostName` fell back to "cloud", and the printed recovery pointed at a DIFFERENT account.
+  const s = await mkCloudSandbox();
+  try {
+    await appendEvent(s.runDir, { actor: "orch", type: "lead_spawned", issue: "DER-9", host: "cloudoff", host_kind: "cloud", worktree: s.wt });
+    await assert.rejects(
+      () => runSubcommand(["steer-cloud", "--run", s.runId, "DER-9", "--runs-root", s.runsRoot, "--repo-root", s.repo, "--kickback", "1"]),
+      (err) => {
+        const m = String(err.message);
+        assert.match(m, /no cloud session id/);
+        assert.match(m, /--host cloudoff/, "the replacement must name the account this unit ALREADY lives on");
+        assert.ok(!/--host cloud\b/.test(m), "…and must NOT fall back to the generic `cloud` host, which is a different account");
+        return true;
+      },
+    );
+  } finally { await rm(s.dir, { recursive: true, force: true }); }
+});
+
+test("rotate-lead (DER-4050): a no-worktree cloud unit on a DISABLED host is told to create-worktree first", async () => {
+  // Both branches stop at rotation_prepared, so the ONLY thing their order decides is which recovery the
+  // operator is handed. The disabled guard was placed first and shadowed the no-worktree branch, printing
+  // `--worktree <p>` for a unit that has no worktree to name and omitting the create-worktree step.
+  const s = await mkCloudSandbox();
+  try {
+    await appendEvent(s.runDir, { actor: "orch", type: "lead_spawned", issue: "DER-9", host: "cloudoff", host_kind: "cloud", cloudSessionId: "session_01Old" });
+    await appendEvent(s.runDir, { actor: "lead", type: "pr_opened", issue: "DER-9", pr: 5 });
+    const out = await runSubcommand(["rotate-lead", "--run", s.runId, "DER-9", "--runs-root", s.runsRoot, "--repo-root", s.repo]);
+    assert.equal(out.spawned, false);
+    assert.match(out.stdout, /create-worktree --run/, "the recovery a unit with no worktree actually needs");
+    assert.match(out.stdout, /enabled:false/, "…and it must still say the host is disabled, so the human knows naming it IS the opt-in");
+    const evs = await readEvents(s.runDir);
+    const prepared = evs.filter((e) => e.type === "rotation_prepared");
+    assert.equal(prepared.length, 1);
+    assert.equal(prepared[0].blocked, "host_disabled", "the block reason survives even on the no-worktree branch");
+  } finally { await rm(s.dir, { recursive: true, force: true }); }
+});
+
+test("rotation_prepared (DER-4050): a blocked rotation FOLDS into state, with its reason and its brief", async () => {
+  // The event was appended since 2026-08-18 and nothing folded it, so `state` showed a rotation that was
+  // prepared-and-waiting as indistinguishable from one nobody had touched. Its own new test asserted the
+  // event existed on the ledger — not that any reader could see it.
+  const s = await mkCloudSandbox();
+  try {
+    s.push();
+    for (const ev of [
+      { actor: "orch", type: "worktree_created", issue: "DER-9", worktree: s.wt, branch: s.branch },
+      { actor: "orch", type: "lead_spawned", issue: "DER-9", host: "cloudoff", host_kind: "cloud", worktree: s.wt, cloudSessionId: "session_01Old" },
+      { actor: "lead", type: "pr_opened", issue: "DER-9", pr: 5 },
+    ]) await appendEvent(s.runDir, ev);
+    await runSubcommand(["rotate-lead", "--run", s.runId, "DER-9", "--runs-root", s.runsRoot, "--repo-root", s.repo]);
+    const st = materializeState(await readEvents(s.runDir));
+    assert.equal(st.lead_rotation_blocked.length, 1, "a prepared-but-unspawned rotation must be visible to the next wake");
+    const b = st.lead_rotation_blocked[0];
+    assert.equal(b.issue, "DER-9");
+    assert.equal(b.reason, "host_disabled");
+    assert.equal(b.host, "cloudoff");
+    assert.ok(b.brief && b.brief.endsWith("DER-9.rot1.md"), "…including WHERE the already-written brief is");
+    // And it clears when the human runs the dispatch the refusal printed.
+    await appendEvent(s.runDir, { actor: "orch", type: "lead_spawned", issue: "DER-9", host: "cloudoff", host_kind: "cloud", worktree: s.wt, rotation: 1, cloudSessionId: "session_01New" });
+    assert.deepEqual(materializeState(await readEvents(s.runDir)).lead_rotation_blocked, [],
+      "a landed spawn clears the block — otherwise the banner becomes permanent furniture and stops meaning anything");
+  } finally { await rm(s.dir, { recursive: true, force: true }); }
+});
+
+test("reap (DER-4053): a CLI cloud unit is cleaned up LOCALLY and reaches `reaped`", async () => {
+  // `it.host !== "local"` treated a cloud unit as ssh-remote. A cloud host entry has no ssh/ledgerRoot/repo,
+  // so leadBriefPattern composed `undefined/<run>/briefs/<id>` and threw: no worktree cleanup, no `reaped`
+  // event, and therefore no way to close out a run that used the cloud lane at all. The axis is host KIND —
+  // a cloud unit's worktree is a LOCAL staging checkout, and there is no ssh process to kill.
+  const s = await mkCloudSandbox();
+  const prevCmux = process.env.WORK_CMUX_BIN;
+  process.env.WORK_CMUX_BIN = "/usr/bin/true"; // close-workspace is a no-op here; cleanup is what's under test
+  try {
+    s.push();
+    for (const ev of [
+      { actor: "orch", type: "worktree_created", issue: "DER-9", worktree: s.wt, branch: s.branch },
+      { actor: "orch", type: "lead_spawned", issue: "DER-9", host: "cloudoff", host_kind: "cloud", worktree: s.wt, cloudSessionId: "session_01Old" },
+      { actor: "lead", type: "pr_opened", issue: "DER-9", pr: 5 },
+    ]) await appendEvent(s.runDir, ev);
+    const out = await runSubcommand(["reap", "--run", s.runId, "DER-9", "--runs-root", s.runsRoot, "--repo-root", s.repo, "--abandon"]);
+    const evs = await readEvents(s.runDir);
+    const reaped = evs.filter((e) => e.type === "reaped");
+    assert.equal(reaped.length, 1, "a cloud unit MUST reach `reaped` — without it the run can never be completed");
+    const steps = (reaped[0].cleanup ?? []).map((c) => c.step);
+    assert.ok(steps.some((x) => x.startsWith("local_")), `cloud cleanup runs on the LOCAL staging worktree, got: ${JSON.stringify(steps)}`);
+    assert.ok(!steps.some((x) => x.startsWith("remote_")), "…and never over ssh: a cloud VM is not reachable that way");
+    assert.ok(out.stdout);
+  } finally {
+    if (prevCmux === undefined) delete process.env.WORK_CMUX_BIN; else process.env.WORK_CMUX_BIN = prevCmux;
+    await rm(s.dir, { recursive: true, force: true });
+  }
+});
+
+test("deriveCloudPrEvents (DER-4051): identity is RANKED, and genuine ambiguity is REFUSED", () => {
+  // Two spot fixes (substring → whole-token → whole-token + `<id>-` prefix) each closed the collision they
+  // were shown. This asserts the PROPERTY instead: an exact match outranks a prefix match, the answer does
+  // not depend on ledger order, and equally-strong matches on different units emit nothing rather than
+  // guessing. Every case here returns a different answer under the a4dbe4e predicate.
+  const o = { trustedPrAuthors: ["dwiedeman"], repoOwner: "acme" };
+  const pr = (t, h) => ({ number: 1, title: t, headRefName: h ?? "claude/session-42", isDraft: true, body: "", author: { login: "dwiedeman" }, headRepositoryOwner: { login: "acme" }, isCrossRepository: false });
+  const f = (p, ids, bundles = {}) => deriveCloudPrEvents({ pr: p, runIssues: ids, bundles, ...o })[0]?.issue ?? null;
+
+  // The round-4 reproduction: an exact id in the title, and a DIFFERENT unit's id appearing as a prose prefix.
+  const prose = pr("feat(SPEC-DEMO-U2): preserve SPEC-DEMO-U1-compatibility");
+  assert.equal(f(prose, ["SPEC-DEMO-U1", "SPEC-DEMO-U2"]), "SPEC-DEMO-U2", "an exact title match outranks a prefix match");
+  assert.equal(f(prose, ["SPEC-DEMO-U2", "SPEC-DEMO-U1"]), "SPEC-DEMO-U2", "…and the answer does not depend on ledger order");
+  // A longer, VALID unit's work branch must not be claimed by the shorter id that prefixes it.
+  assert.equal(f(pr("wip", "spec-demo-u1-followup-u2-work"), ["SPEC-DEMO-U1"]), null,
+    "`<id>-work` is the only branch shape the prefix rule exists for; an open-ended prefix swallowed unrelated units");
+  // Ambiguity is refused rather than resolved by position — folding onto the wrong unit is worse than not folding.
+  assert.equal(f(pr("fix: DER-1 and DER-2 are unrelated"), ["DER-1", "DER-2"]), null, "two equally-strong matches on unrelated units emit NOTHING");
+  // …but a BUNDLE legitimately names several of its own ids, and must still resolve to the covering primary.
+  assert.equal(f(pr("fix: DER-1 + DER-2 together"), ["DER-1", "DER-2"], { "DER-1": ["DER-1", "DER-2"] }), "DER-1",
+    "a bundle is not ambiguity: one primary covers every winner");
 });

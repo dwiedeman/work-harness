@@ -5547,7 +5547,10 @@ export function ledgerProtocolVerdict(events = [], { attestedVersion = null, att
 // Every command that commits MORE work to a ledger. `spawn-cloud` and `steer-cloud` belong here for the
 // same reason `spawn-lead` does: a mixed-version ledger must refuse dispatch, and a steer is a DELIVERY
 // (it writes the kickback_relayed that closes a round), not a read.
-const VERSION_GATED_SUBCOMMANDS = new Set(["spawn-lead", "spawn-cloud", "steer-cloud", "spawn-shepherd", "spawn-orch", "rotate-lead", "rotate-shepherd"]);
+// EXPORTED so the disabled-host family test can derive its roster from the runner itself (DER-4050). This
+// is the set of subcommands that DISPATCH an agent, which is exactly the family the forced-only rule binds:
+// a new member added here must also declare how it treats an `enabled:false` host, or that test fails.
+export const VERSION_GATED_SUBCOMMANDS = new Set(["spawn-lead", "spawn-cloud", "steer-cloud", "spawn-shepherd", "spawn-orch", "rotate-lead", "rotate-shepherd"]);
 
 export function assertLedgerProtocolCompatible(verdict, subcommand, { allowSkew = false } = {}) {
   if (!verdict || verdict.ok) return;
@@ -6512,6 +6515,11 @@ export function materializeState(rawEvents, meta = {}) {
         it.spawn_failed = false;
         it.spawn_failed_note = null;
         it.spawn_failed_exit_code = null;
+        // A spawn that landed also clears a PREPARED-BUT-BLOCKED rotation (DER-4050): the human ran the
+        // command the refusal printed, so the rotation is no longer owed to anyone.
+        it.rotation_blocked = null;
+        it.rotation_blocked_reason = null;
+        it.rotation_blocked_brief = null;
         // DER-2744 — did this launch PROVE it forces transcript persistence? The spawn path measures it
         // off the real command string; anything else (an older harness on another host, a hand-appended
         // recovery event, every pre-fix ledger line) carries no attestation and folds to `null` = UNKNOWN.
@@ -6559,6 +6567,17 @@ export function materializeState(rawEvents, meta = {}) {
         it.spawn_failed_note = e.reason ?? e.note ?? "the launch could not be proven";
         it.spawn_failed_exit_code = e.exit_code ?? null;
         it.workspace_ref = null;
+        if (e.host) it.host = e.host;
+        break;
+      case "rotation_prepared":
+        // A rotation whose brief IS WRITTEN but whose spawn was refused — a disabled cloud host, or a unit
+        // with no worktree. `rotate_lead` has appended this event since 2026-08-18 and NOTHING folded it
+        // (DER-4050): the next wake read `lead_rotate_pending` with no reason and no recovery command, so a
+        // prepared rotation went quiet exactly like an unprepared one. `rotate_pending` is deliberately left
+        // alone — the lead still needs rotating; what this records is WHY it stopped and where to resume.
+        it.rotation_blocked = e.rotation ?? true;
+        it.rotation_blocked_reason = e.blocked ?? "not_spawned";
+        it.rotation_blocked_brief = e.brief ?? null;
         if (e.host) it.host = e.host;
         break;
       case "rotate_requested":
@@ -7007,7 +7026,13 @@ export function materializeState(rawEvents, meta = {}) {
     // moment — never mid-hand-off.
     lead_rotate_pending: Object.entries(issues)
       .filter(([, v]) => v.rotate_pending && !DONE_STATUSES.has(v.status))
-      .map(([k, v]) => ({ issue: k, pct: v.rotate_pct, disposition: v.rotate_disposition, rotations: v.rotations, source: v.rotate_source ?? "lead", host: v.host, pr: v.pr })),
+      .map(([k, v]) => ({ issue: k, pct: v.rotate_pct, disposition: v.rotate_disposition, rotations: v.rotations, source: v.rotate_source ?? "lead", host: v.host, pr: v.pr, ...(v.rotation_blocked ? { blocked: v.rotation_blocked_reason ?? "not_spawned" } : {}) })),
+    // Rotations PREPARED but not spawned (DER-4050). A separate banner from `lead_rotate_pending` because
+    // the obligation is different: the brief already exists and the only thing missing is a human's
+    // deliberate dispatch, so this list is directly actionable rather than a signal to go look.
+    lead_rotation_blocked: Object.entries(issues)
+      .filter(([, v]) => v.rotation_blocked && !DONE_STATUSES.has(v.status))
+      .map(([k, v]) => ({ issue: k, rotation: v.rotation_blocked === true ? null : v.rotation_blocked, reason: v.rotation_blocked_reason ?? "not_spawned", brief: v.rotation_blocked_brief ?? null, host: v.host, worktree: v.worktree ?? null })),
     // Blind-spot banner (2026-07-26). An in-flight lead whose context utilization could not be read.
     // This is NOT lead_rotate_pending — we are not claiming it needs rotating, we are claiming we
     // CANNOT SEE IT, which the orchestrator must resolve by hand (check the pane; check whether the
@@ -8641,16 +8666,25 @@ export function deriveCloudPrEvents({ pr, runIssues = null, bundles = {}, status
   // the only place the id appears. Tokenising on non-alphanumerics keeps the old branch-or-title reach
   // (`derrekwiedeman/der-4036-…` still matches) while making a longer id stop matching a shorter one.
   const hayWords = `${pr.headRefName || ""} ${pr.title || ""}`.toLowerCase().split(/[^a-z0-9-]+/).filter(Boolean);
-  // An id matches a word EXACTLY, or as that word's leading `<id>-` segment. Both halves are load-bearing:
-  //   exact   `DER-4036` in a title, and the `<prefix>-<digits>` run inside `<user>/der-4036-slug-words`;
-  //   prefix  `create-worktree`'s own default branch is `${id.toLowerCase()}-work`, so a SPEC unit lives on
-  //           `spec-demo-u1-work` — a word no `<letters>-<digits>` rule can find. Requiring the trailing
-  //           `-` is what stops `der-403` from claiming `der-4036-work`, which is the collision this whole
-  //           function was fixed for.
-  const matchesId = (id) => {
+  // Matching is RANKED, not first-hit (DER-4051, 2026-08-18). Two earlier attempts at this — substring, then
+  // whole-token with a `<id>-` prefix — each fixed the collision they were shown and left the class open, so
+  // the rule is now stated as strengths and ambiguity is REFUSED rather than resolved by ledger order:
+  //   2 (exact)  the word IS the id (`DER-4036` in a title), or the id is a `<letters>-<digits>` run inside
+  //              it (`<user>/der-4036-slug-words`, Linear's own gitBranchName shape).
+  //   1 (branch) the word is exactly `<id>-work` — `create-worktree`'s default branch (10059/10084 derive
+  //              `${o.issueId.toLowerCase()}-work`), which is how a SPEC unit like `spec-demo-u1-work` is
+  //              reachable at all, since no `<letters>-<digits>` rule can find it.
+  // The `-work` anchor replaces the open-ended `startsWith(`${needle}-`)`: that prefix let a run's own
+  // `SPEC-DEMO-U1` claim BOTH the prose word `spec-demo-u1-compatibility` in a title about U2 and the
+  // unrelated longer unit `spec-demo-u1-followup-u2-work`. `der-403` still cannot claim `der-4036-work`.
+  const matchStrength = (id) => {
     const needle = String(id).toLowerCase();
-    return hayWords.some((word) => word === needle || word.startsWith(`${needle}-`)
-      || (word.match(/[a-z]+-\d+/g) ?? []).includes(needle));
+    let best = 0;
+    for (const word of hayWords) {
+      if (word === needle || (word.match(/[a-z]+-\d+/g) ?? []).includes(needle)) return 2;
+      if (word === `${needle}-work`) best = Math.max(best, 1);
+    }
+    return best;
   };
   let issue;
   // When runIssues is PROVIDED (an array, even empty), the PR MUST name one of them — otherwise it's
@@ -8658,8 +8692,23 @@ export function deriveCloudPrEvents({ pr, runIssues = null, bundles = {}, status
   // the reconcile caller never passes that — it guards on an empty scope).
   if (runIssues != null) {
     if (!Array.isArray(runIssues) || !runIssues.length) return [];
-    issue = runIssues.find((id) => matchesId(id));
-    if (!issue) return [];
+    const scored = runIssues.map((id) => ({ id, strength: matchStrength(id) })).filter((x) => x.strength > 0);
+    if (!scored.length) return [];
+    const top = Math.max(...scored.map((x) => x.strength));
+    const winners = scored.filter((x) => x.strength === top).map((x) => x.id);
+    if (winners.length === 1) issue = winners[0];
+    else {
+      // Several ids match EQUALLY WELL. That is normal for a bundle — one PR titled "DER-1 + DER-2" whose
+      // ids are all members of one bundle — and a cross-unit corruption risk for anything else. Resolve
+      // only the bundle case, by finding a primary whose list covers every winner. Otherwise emit NOTHING:
+      // folding a lifecycle onto the wrong unit is strictly worse than not folding it, and the missing
+      // `lead_online` is already caught by the deadline/failed-to-start safety net.
+      issue = winners.find((cand) => {
+        const grp = Array.isArray(bundles[cand]) ? bundles[cand] : null;
+        return grp && winners.every((w) => grp.includes(w));
+      });
+      if (!issue) return [];
+    }
   }
   const m = typeof pr.body === "string" ? pr.body.match(/session_[A-Za-z0-9]+/) : null;
   const handle = m ? m[0] : null;
@@ -10382,10 +10431,16 @@ export async function runSubcommand(argv) {
       const events = await readEvents(runDir);
       const spawn = [...events].reverse().find((e) => e.type === "lead_spawned" && e.issue === o.issueId && e.cloudSessionId);
       const sessionId = o.session ?? spawn?.cloudSessionId ?? null;
+      // HOST RESOLUTION MUST NOT DEPEND ON THE SESSION ID (DER-4050). `spawn` above requires
+      // `e.cloudSessionId`, which is exactly the field a pre-2026-08-18 routine-era `lead_spawned` LACKS —
+      // so the one event that still knows this unit's account was discarded on the very path that exists to
+      // recover it. `hostName` then fell back to "cloud" and the refusal below printed a replacement command
+      // pointing at a DIFFERENT account's environment. Fall back to the latest spawn carrying a host at all.
+      const spawnAnyHost = [...events].reverse().find((e) => e.type === "lead_spawned" && e.issue === o.issueId && e.host);
       // Resolved BEFORE the refusal below, which names it: a message that throws a ReferenceError instead
       // of explaining itself is worse than no message, and the refusal path is exactly where nobody looks
       // until it fires. (Caught by the round-3 gate's own re-run of the suite.)
-      const hostName = o.host ?? spawn?.host ?? "cloud";
+      const hostName = o.host ?? spawn?.host ?? spawnAnyHost?.host ?? "cloud";
       if (!sessionId) {
         throw new Error(
           `steer-cloud: no cloud session id for ${o.issueId}. Nothing on this run's ledger recorded one, so there is no live lead to steer. ` +
@@ -10394,6 +10449,22 @@ export async function runSubcommand(argv) {
         );
       }
       const hostCfg = getHosts()[hostName];
+      // A DISABLED host does not receive a steer it did not ask for (DER-4050). This is the same rule
+      // `spawn-cloud` states at its own guard and `rotate-lead` at its: an explicitly named host is the
+      // operator's opt-in, and a host this command SYNTHESIZED from ledger state is not. A kickback round is
+      // new work, and "enabled:false" means no more work here — set when an account starts 429ing, gets
+      // walled, or is repointed at another environment, all of which a steer would walk straight into.
+      // Guarded BEFORE the command is built, so nothing is dispatched and no `kickback_relayed` is recorded:
+      // the round must stay on `state.kickbacks_pending` and keep surfacing until a human decides.
+      if (hostCfg?.enabled === false && !o.host && !o.force) {
+        throw new Error(
+          `steer-cloud: ${o.issueId}'s lead is on host "${hostName}", which is enabled:false in .claude/work.config.json — and you did not name it.\n` +
+          `  NO steer was sent and NO kickback_relayed was recorded, so this round stays UN-ACTIONED and keeps surfacing in state.kickbacks_pending.\n` +
+          `  This host was resolved from the ledger, not chosen by you; a disabled host means "no more work here", and a kickback round is more work.\n` +
+          `  Read that host entry's own _comment_disabled*/_comment_optin* note for the re-enable CONDITION, then opt in deliberately:\n` +
+          `  steer-cloud --run ${o.runId ?? "<run>"} ${o.issueId} --host ${hostName}${o.kickback ? ` --kickback ${o.kickback}` : ""} (or --force)`,
+        );
+      }
       if (!hostCfg?.credProfile) throw new Error(`steer-cloud: host "${hostName}" has no credProfile — a steer must go out on the SAME account that owns the session, and CLAUDE_CONFIG_DIR is how that is chosen.`);
       const credProfile = hostCfg.credProfile.startsWith("~") ? join(homedir(), hostCfg.credProfile.slice(1)) : hostCfg.credProfile;
       // The message: an explicit --message, else the kickback brief on disk (write-brief already unions
@@ -11725,6 +11796,24 @@ export async function runSubcommand(argv) {
       // completes here like every other host. It still cannot when the unit has no worktree, which is what
       // every routine-era cloud unit looks like: the session clones the ref checked out in a worktree, and
       // without one there is nothing to clone from.
+      // A dry run SYNTHESIZES NOTHING (`noteSynthesized && !o.dryRun` above), so the payload must not claim
+      // it did. The brief still renders with the synthesized-note warning — that is a faithful preview of
+      // what WOULD be written — but the caller-visible field describes the action actually taken (DER-4050).
+      const noteFields = o.dryRun
+        ? { noteSynthesized: false, noteWouldSynthesize: noteSynthesized }
+        : { noteSynthesized };
+      // ORDER IS LOAD-BEARING (DER-4050): the no-worktree branch runs FIRST. Both branches stop at
+      // `rotation_prepared`, so the only thing the order decides is WHICH recovery the operator is told —
+      // and a routine-era cloud unit on a disabled host needs the `create-worktree` step, which the
+      // disabled-host message does not carry. Putting the disabled guard first shadowed it and printed
+      // `--worktree <p>` for a unit that has no worktree to name.
+      if (isCloud && !it.worktree) {
+        if (!o.dryRun) await appendEvent(runDir, { actor: "orch", type: "rotation_prepared", issue: o.issueId, rotation, brief: briefPath, host, ...(hostCfg?.enabled === false ? { blocked: "host_disabled" } : {}) });
+        return {
+          briefPath, rotation, wipCommitted, ...noteFields, host, spawned: false,
+          stdout: `prepared rotation ${rotation} for ${o.issueId} (cloud), but this unit has NO worktree — a routine-era cloud unit.\n  Brief: ${briefPath}\n  Give it one and spawn: create-worktree --run ${o.runId} ${o.issueId}, then\n  spawn-cloud --run ${o.runId} ${o.issueId} --host ${host} --worktree <p> --rotation ${rotation} --push${hostCfg?.enabled === false ? `\n  NOTE: host "${host}" is also enabled:false — naming it above IS the deliberate opt-in.` : ""}`,
+        };
+      }
       // A DISABLED cloud host does not get an automatic rotation spawn (2026-08-18). `spawn-cloud` treats an
       // explicitly named host as the operator's opt-in — which is right when a human types it, and wrong
       // here, where this command MANUFACTURES `--host <host>` from ledger state. An operator who disables a
@@ -11733,15 +11822,8 @@ export async function runSubcommand(argv) {
       if (isCloud && hostCfg?.enabled === false) {
         if (!o.dryRun) await appendEvent(runDir, { actor: "orch", type: "rotation_prepared", issue: o.issueId, rotation, brief: briefPath, host, blocked: "host_disabled" });
         return {
-          briefPath, rotation, wipCommitted, noteSynthesized, host, spawned: false,
+          briefPath, rotation, wipCommitted, ...noteFields, host, spawned: false,
           stdout: `prepared rotation ${rotation} for ${o.issueId}, but host "${host}" is enabled:false — REFUSING to spawn it automatically.\n  A disabled host means "no more work here", and this command would have synthesized the --host that spawn-cloud reads as an operator opt-in.\n  Read that host's note in .claude/work.config.json, then dispatch it yourself if you still want it:\n  spawn-cloud --run ${o.runId} ${o.issueId} --host ${host} --worktree ${it.worktree ?? "<p>"} --rotation ${rotation} --push`,
-        };
-      }
-      if (isCloud && !it.worktree) {
-        if (!o.dryRun) await appendEvent(runDir, { actor: "orch", type: "rotation_prepared", issue: o.issueId, rotation, brief: briefPath, host });
-        return {
-          briefPath, rotation, wipCommitted, noteSynthesized, host, spawned: false,
-          stdout: `prepared rotation ${rotation} for ${o.issueId} (cloud), but this unit has NO worktree — a routine-era cloud unit.\n  Brief: ${briefPath}\n  Give it one and spawn: create-worktree --run ${o.runId} ${o.issueId}, then\n  spawn-cloud --run ${o.runId} ${o.issueId} --host ${host} --worktree <p> --rotation ${rotation} --push`,
         };
       }
       const spawnArgs = isCloud
@@ -11771,7 +11853,7 @@ export async function runSubcommand(argv) {
       ];
       const spawned = await runSubcommand(spawnArgs);
       return {
-        briefPath, rotation, wipCommitted, noteSynthesized, host, spawned: true,
+        briefPath, rotation, wipCommitted, ...noteFields, host, spawned: true,
         workspace_ref: spawned.workspace_ref ?? null,
         ...(spawned.cloudSessionId ? { cloudSessionId: spawned.cloudSessionId } : {}),
         // Dry-run purity (DER-2514): the brief is not written, so hand its content back for preview.
@@ -11811,7 +11893,15 @@ export async function runSubcommand(argv) {
       // Only load-bearing when the unit was ACTIVE — an --abandon on an already-merged unit is a no-op
       // flag, and stamping `abandoned: true` there would claim a destruction that did not happen.
       const abandonedActive = abandoned && !REAP_TERMINAL_ELIGIBLE(it.status);
-      const remoteHost = it.host && it.host !== "local" ? getHosts()[it.host] : null;
+      // "Remote" here means SSH-REACHABLE MACHINE, not "not local" (DER-4053). A cloud unit runs on an
+      // Anthropic-managed VM reached by `claude --cloud`: its host entry has no `ssh`, no `ledgerRoot` and no
+      // remote `repo`, and its worktree is a LOCAL staging checkout that the session cloned FROM. Treating
+      // `kind:"cloud"` as ssh-remote sent reap down the remote branch, where `leadBriefPattern` composed
+      // `undefined/<run>/briefs/<id>` and threw — so there was no worktree cleanup, no `reaped` event, and a
+      // cloud run could never be closed out at all. Cleanup deliberately ignores `enabled` (a unit that has
+      // already done its work must be reapable even after its host is disabled); the axis is KIND.
+      const reapHostCfg = it.host && it.host !== "local" ? getHosts()[it.host] : null;
+      const remoteHost = reapHostCfg && reapHostCfg.kind !== "cloud" ? reapHostCfg : null;
       // DER-2740: every cleanup result is CAPTURED rather than discarded. Cleanup stays best-effort — the
       // run must still be able to end — but "best-effort" was silently doing double duty as "unrecorded".
       const cleanupSteps = [];
