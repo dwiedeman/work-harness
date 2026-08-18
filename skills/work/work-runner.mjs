@@ -6515,11 +6515,15 @@ export function materializeState(rawEvents, meta = {}) {
         it.spawn_failed = false;
         it.spawn_failed_note = null;
         it.spawn_failed_exit_code = null;
-        // A spawn that landed also clears a PREPARED-BUT-BLOCKED rotation (DER-4050): the human ran the
-        // command the refusal printed, so the rotation is no longer owed to anyone.
-        it.rotation_blocked = null;
-        it.rotation_blocked_reason = null;
-        it.rotation_blocked_brief = null;
+        // A spawn that landed clears a PREPARED-BUT-BLOCKED rotation — but ONLY the matching one (round 5
+        // #4). Clearing on ANY spawn meant a kickback respawn, which has nothing to do with the owed
+        // rotation, erased the banner and the path to the brief that was already written: "prepared then
+        // forgotten" again, one level up from the bug the banner was added for.
+        if (it.rotation_blocked && Number(e.rotation) > 0 && Number(e.rotation) === Number(it.rotation_blocked)) {
+          it.rotation_blocked = null;
+          it.rotation_blocked_reason = null;
+          it.rotation_blocked_brief = null;
+        }
         // DER-2744 — did this launch PROVE it forces transcript persistence? The spawn path measures it
         // off the real command string; anything else (an older harness on another host, a hand-appended
         // recovery event, every pre-fix ledger line) carries no attestation and folds to `null` = UNKNOWN.
@@ -8656,7 +8660,7 @@ export function parsePrEventComments({ comments = [], runIssues = null, pr = nul
 // uses for comments ("an unauthenticated comment is not untrusted input to be sanitized, it is not input").
 // `trustedPrAuthors`/`repoOwner` default to module config; there is deliberately NO "no filter" escape
 // hatch of the kind `runIssues: null` provides, because that would be a bypass rather than a convenience.
-export function deriveCloudPrEvents({ pr, runIssues = null, bundles = {}, status = null, kickbackSha = null, trustedPrAuthors, repoOwner } = {}) {
+export function deriveCloudPrEvents({ pr, runIssues = null, bundles = {}, status = null, kickbackSha = null, boundIssue = null, trustedPrAuthors, repoOwner } = {}) {
   if (!pr || pr.number == null) return [];
   if (!prIdentityTrusted(pr, { trustedPrAuthors, repoOwner })) return [];
   // Unit ids are matched as WHOLE TOKENS, never as substrings (2026-08-18). `hay.includes("der-403")` is
@@ -8698,9 +8702,19 @@ export function deriveCloudPrEvents({ pr, runIssues = null, bundles = {}, status
     const winners = scored.filter((x) => x.strength === top).map((x) => x.id);
     if (winners.length === 1) issue = winners[0];
     else {
-      // Several ids match EQUALLY WELL. That is normal for a bundle — one PR titled "DER-1 + DER-2" whose
-      // ids are all members of one bundle — and a cross-unit corruption risk for anything else. Resolve
-      // only the bundle case, by finding a primary whose list covers every winner. Otherwise emit NOTHING:
+      // Several ids match EQUALLY WELL. Resolve from DURABLE EVIDENCE before considering the text at all:
+      // if this PR is already bound to one of the tied units (`state.issues[id].pr`, i.e. a scan that
+      // already resolved it, or a `pr_opened` the lead itself reported), that binding outranks anything a
+      // title says. Without this, a PR that folded fine for hours goes dark the moment its title gains a
+      // second run id — a cross-reference like "fix(DER-2): preserve DER-1 compatibility" — and a live unit
+      // reads as a lead that never started, which routes the operator to a REPLACEMENT SPAWN onto a branch
+      // that already has work on it. That is the dangerous half of refusing ambiguity, and it is the half a
+      // durable binding removes (round 5 #2). A never-yet-bound ambiguous PR is still refused below.
+      if (boundIssue && winners.includes(boundIssue)) issue = boundIssue;
+      else {
+      // Otherwise: normal for a bundle — one PR titled "DER-1 + DER-2" whose ids are all members of one
+      // bundle — and a cross-unit corruption risk for anything else. Resolve only the bundle case, by
+      // finding a primary whose list covers every winner. Otherwise emit NOTHING:
       // folding a lifecycle onto the wrong unit is strictly worse than not folding it, and the missing
       // `lead_online` is already caught by the deadline/failed-to-start safety net.
       // The covering candidate must be its group's PRIMARY (`bundles[primary]` is documented "primary
@@ -8713,6 +8727,7 @@ export function deriveCloudPrEvents({ pr, runIssues = null, bundles = {}, status
       };
       issue = winners.find(covers);
       if (!issue) return [];
+      }
     }
   }
   const m = typeof pr.body === "string" ? pr.body.match(/session_[A-Za-z0-9]+/) : null;
@@ -9011,6 +9026,9 @@ async function reconcilePrEventsInto(runDir, runId, repoRoot) {
           isCrossRepository: data.isCrossRepository,
         },
         runIssues: scope, bundles, status: issueStatus, kickbackSha: kickbackShaByPr.get(pr),
+        // The durable binding this PR already has, if any (round 5 #2). `prToIssue` is built from
+        // `state.issues[id].pr`, so it only exists once something already resolved this PR to a unit.
+        boundIssue: issue ?? null,
       }),
       { repoRoot, kickbackSha: issueStatus === "kickback" ? kickbackShaByPr.get(pr) : null },
     );
@@ -11730,7 +11748,13 @@ export async function runSubcommand(argv) {
 
       // 1. Close the workspace. The worktree SURVIVES — that is the whole difference from `reap`.
       if (!o.dryRun) {
-        if (ssh) {
+        // A DISABLED host is not contacted at all. The kill probe below refuses the whole rotation when it
+        // cannot get a verdict, which on a disabled host is both likely (that host is often disabled BECAUSE
+        // it is unreachable or walled) and pointless: the disabled guard further down is going to refuse the
+        // respawn anyway, so there is no second-writer risk to probe for. Without this, a disabled ssh host
+        // died on an unverifiable probe BEFORE reaching the guard, and the operator got a "fix your ssh"
+        // message instead of "this host is disabled, here is the command to run deliberately".
+        if (ssh && hostCfg?.enabled !== false) {
           // POSTCONDITION (DER-2775): the predecessor must be PROVEN gone before step 5 respawns onto the
           // same worktree. `pkill …; true` proved nothing, so a lead that ignored the signal left TWO live
           // leads on one worktree — the branch-corruption failure this whole close-then-respawn dance
@@ -11824,11 +11848,18 @@ export async function runSubcommand(argv) {
       // here, where this command MANUFACTURES `--host <host>` from ledger state. An operator who disables a
       // host mid-run (429s, a walled account, a repointed environment) means "send no more work there", and
       // a rotation is more work. So stop at `rotation_prepared` and make the next dispatch a human's.
-      if (isCloud && hostCfg?.enabled === false) {
+      // NOT `isCloud &&` (round 5 #6). The rule is about a MANUFACTURED host, not about cloud: `rotate-lead`
+      // synthesizes the host from ledger state for every kind, so a disabled MINI took an automatic rotation
+      // spawn while a disabled cloud host was refused. That defect predates the guard and survived it
+      // precisely because the guard was written for the one host kind the reviewer happened to name.
+      if (hostCfg?.enabled === false) {
         if (!o.dryRun) await appendEvent(runDir, { actor: "orch", type: "rotation_prepared", issue: o.issueId, rotation, brief: briefPath, host, blocked: "host_disabled" });
+        const redispatch = isCloud
+          ? `spawn-cloud --run ${o.runId} ${o.issueId} --host ${host} --worktree ${it.worktree ?? "<p>"} --rotation ${rotation} --push`
+          : `spawn-lead --run ${o.runId} ${o.issueId} --host ${host} --worktree ${it.worktree ?? "<p>"} --rotation ${rotation}`;
         return {
           briefPath, rotation, wipCommitted, ...noteFields, host, spawned: false,
-          stdout: `prepared rotation ${rotation} for ${o.issueId}, but host "${host}" is enabled:false — REFUSING to spawn it automatically.\n  A disabled host means "no more work here", and this command would have synthesized the --host that spawn-cloud reads as an operator opt-in.\n  Read that host's note in .claude/work.config.json, then dispatch it yourself if you still want it:\n  spawn-cloud --run ${o.runId} ${o.issueId} --host ${host} --worktree ${it.worktree ?? "<p>"} --rotation ${rotation} --push`,
+          stdout: `prepared rotation ${rotation} for ${o.issueId}, but host "${host}" is enabled:false — REFUSING to spawn it automatically.\n  A disabled host means "no more work here", and this command would have synthesized the --host that a spawn reads as an operator opt-in.\n  Read that host's note in .claude/work.config.json, then dispatch it yourself if you still want it:\n  ${redispatch}`,
         };
       }
       const spawnArgs = isCloud

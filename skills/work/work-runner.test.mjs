@@ -12435,6 +12435,59 @@ test("THE FAMILY (DER-4050): every dispatching subcommand declares how it treats
   for (const name of ledgerResolved) assert.ok(VERSION_GATED_SUBCOMMANDS.has(name), `${name} must still be a dispatching subcommand`);
 });
 
+// Round 5 #6: the roster was derived but only ONE member was ever exercised, so a disabled-host defect in
+// `rotate-lead` stayed green — and there really was one (a disabled MINI took an automatic rotation spawn,
+// because the guard had been written `isCloud && …` for the one kind the round-4 reviewer named). Every
+// ledger-resolved member now gets its legs run. `forcedOptIn` differs by design: `steer-cloud` accepts an
+// explicit `--host` as the opt-in, `rotate-lead` manufactures its host unconditionally and has no such
+// escape, so its contract is "refuse, and hand back the command a human runs instead".
+const LEDGER_RESOLVED_MEMBERS = ["steer-cloud", "rotate-lead"];
+
+test("THE FAMILY (DER-4050): EVERY ledger-resolved member refuses a disabled host — including a disabled non-cloud host", async () => {
+  // Declared members and exercised members must be the same set, or this test is decoration again.
+  assert.deepEqual(
+    [...LEDGER_RESOLVED_MEMBERS].sort(),
+    Object.entries(DISABLED_HOST_POLICY).filter(([, v]) => v === "ledger-resolved").map(([k]) => k).sort(),
+    "every member declared ledger-resolved must actually be exercised below",
+  );
+  const CFG = {
+    worktreeRoot: "/tmp/wr-cloud-wt",
+    hosts: {
+      local: { cap: 2 },
+      mini: { enabled: true, cap: 3, ssh: "example-mini", repo: "/r", worktreeRoot: "/w", ledgerRoot: "/l" },
+      minioff: { enabled: false, cap: 3, ssh: "example-mini", repo: "/r", worktreeRoot: "/w", ledgerRoot: "/l" },
+      cloud: { enabled: true, cap: 4, kind: "cloud", os: "linux", credProfile: "/tmp/wr-profile-cloud" },
+      cloudoff: { enabled: false, cap: 4, kind: "cloud", os: "linux", credProfile: "/tmp/wr-profile-off" },
+    },
+  };
+  // `rotate-lead` legs, run on a unit with NO WORKTREE. That is what makes the positive control honest:
+  // every leg stops before any dispatch for the SAME structural reason, so the only thing that varies is
+  // whether the disabled guard fired — read off `rotation_prepared.blocked`, not off `spawned` (which is
+  // false in every leg). A `--dry-run` version of this looked simpler and was WRONG: dry-run skips writing
+  // the rotation brief, so the enabled leg died on a missing brief and would have "passed" as a refusal.
+  for (const [host, expectRefusal] of [["cloud", false], ["cloudoff", true], ["minioff", true]]) {
+    const s = await mkCloudSandbox({ cfg: CFG });
+    try {
+      const isCloudHost = host.startsWith("cloud");
+      for (const ev of [
+        { actor: "orch", type: "lead_spawned", issue: "DER-9", host, ...(isCloudHost ? { host_kind: "cloud", cloudSessionId: "session_01Old" } : {}) },
+        { actor: "lead", type: "pr_opened", issue: "DER-9", pr: 5 },
+      ]) await appendEvent(s.runDir, ev);
+      const out = await runSubcommand(["rotate-lead", "--run", s.runId, "DER-9", "--runs-root", s.runsRoot, "--repo-root", s.repo]);
+      const prepared = (await readEvents(s.runDir)).filter((e) => e.type === "rotation_prepared");
+      assert.equal(prepared.length, 1, `every leg must stop at rotation_prepared (${host})`);
+      if (expectRefusal) {
+        assert.equal(prepared[0].blocked, "host_disabled", `rotate-lead must refuse a disabled host (${host}) — the rule is about a MANUFACTURED host, not about cloud`);
+        assert.match(out.stdout, /enabled:false/, `…and say so (${host})`);
+        assert.match(out.stdout, new RegExp(`--host ${host}`), `…and hand back the command a human would run (${host})`);
+      } else {
+        assert.equal(prepared[0].blocked, undefined, `an ENABLED host must NOT be blocked — the positive control proving the guard is what stops the others (${host})`);
+        assert.ok(!/enabled:false/.test(out.stdout), `…and must not claim it is disabled (${host})`);
+      }
+    } finally { await rm(s.dir, { recursive: true, force: true }); }
+  }
+});
+
 test("THE FAMILY (DER-4050): a ledger-resolved DISABLED host refuses, and the SAME call with --host goes through", async () => {
   // Three legs per command, because only the trio proves the guard rather than a coincidence:
   //   1. enabled host, no --host        → DISPATCHES  (the positive control: this path CAN record a dispatch)
@@ -12534,10 +12587,15 @@ test("rotation_prepared (DER-4050): a blocked rotation FOLDS into state, with it
     assert.equal(b.reason, "host_disabled");
     assert.equal(b.host, "cloudoff");
     assert.ok(b.brief && b.brief.endsWith("DER-9.rot1.md"), "…including WHERE the already-written brief is");
-    // And it clears when the human runs the dispatch the refusal printed.
+    // An UNRELATED spawn must NOT clear it (round 5 #4): a kickback respawn has nothing to do with the
+    // owed rotation, and clearing on any spawn erased the banner and the path to the already-written brief.
+    await appendEvent(s.runDir, { actor: "orch", type: "lead_spawned", issue: "DER-9", host: "cloudoff", host_kind: "cloud", worktree: s.wt, kickback: 1, cloudSessionId: "session_01Kb" });
+    assert.equal(materializeState(await readEvents(s.runDir)).lead_rotation_blocked.length, 1,
+      "a kickback respawn is not the owed rotation — the block must survive it");
+    // The MATCHING rotation spawn clears it.
     await appendEvent(s.runDir, { actor: "orch", type: "lead_spawned", issue: "DER-9", host: "cloudoff", host_kind: "cloud", worktree: s.wt, rotation: 1, cloudSessionId: "session_01New" });
     assert.deepEqual(materializeState(await readEvents(s.runDir)).lead_rotation_blocked, [],
-      "a landed spawn clears the block — otherwise the banner becomes permanent furniture and stops meaning anything");
+      "the matching rotation clears the block — otherwise the banner becomes permanent furniture and stops meaning anything");
   } finally { await rm(s.dir, { recursive: true, force: true }); }
 });
 
@@ -12597,4 +12655,24 @@ test("deriveCloudPrEvents (DER-4051): identity is RANKED, and genuine ambiguity 
   // group's first element (the primary) may win, so the answer still cannot depend on candidate order.
   assert.equal(f(pr("fix: DER-1 + DER-2 together"), ["DER-2", "DER-1"], { "DER-1": ["DER-1", "DER-2"], "DER-2": ["DER-1", "DER-2"] }), "DER-1",
     "a non-primary member must not claim its own bundle's PR");
+});
+
+test("deriveCloudPrEvents (round 5 #2): an already-BOUND PR does not go dark when its title gains a second run id", () => {
+  // The dangerous half of refusing ambiguity is not the refusal, it is that a PR which folded fine for
+  // hours can vanish the moment someone edits its title to cross-reference another unit — the operator
+  // then sees a live unit with no lead_online and dispatches a REPLACEMENT onto a branch that already has
+  // work on it. `boundIssue` is the durable evidence (`state.issues[id].pr`, set once anything resolved
+  // this PR) and outranks anything the text says.
+  const o = { trustedPrAuthors: ["dwiedeman"], repoOwner: "acme" };
+  const pr = (t) => ({ number: 7, title: t, headRefName: "claude/session-42", isDraft: true, body: "", author: { login: "dwiedeman" }, headRepositoryOwner: { login: "acme" }, isCrossRepository: false });
+  const f = (p, ids, extra = {}) => deriveCloudPrEvents({ pr: p, runIssues: ids, ...o, ...extra })[0]?.issue ?? null;
+  const crossRef = pr("fix(DER-2): preserve DER-1 compatibility");
+  // Unbound: still refused — that residual is DER-4051's remaining design work, not a claim of correctness.
+  assert.equal(f(crossRef, ["DER-1", "DER-2"]), null, "an unbound ambiguous PR is still refused");
+  // Bound: the binding wins, in BOTH ledger orders.
+  assert.equal(f(crossRef, ["DER-1", "DER-2"], { boundIssue: "DER-2" }), "DER-2", "the durable binding outranks the title");
+  assert.equal(f(crossRef, ["DER-2", "DER-1"], { boundIssue: "DER-2" }), "DER-2", "…independently of ledger order");
+  assert.equal(f(crossRef, ["DER-1", "DER-2"], { boundIssue: "DER-1" }), "DER-1", "…and it resolves to whichever unit actually owns the PR");
+  // A binding to a unit the PR does not name at all must NOT rescue it — that is a real conflict.
+  assert.equal(f(crossRef, ["DER-1", "DER-2"], { boundIssue: "DER-9" }), null, "a binding outside the tied set is a conflict, not an answer");
 });

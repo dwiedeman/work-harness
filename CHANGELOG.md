@@ -15,6 +15,43 @@ run materially different harness code against **one shared ledger** with no way 
 gate itself gained the missing half below — attesting the *acting* process's own version, not only
 versions already recorded in the ledger — in DER-2779.
 
+## [0.8.6] — 2026-08-18
+
+Round 5 of the pre-PR gate (`turn.completed = 1`, 67 command executions, verdict **not ready**: 2×P1, 4×P2)
+— the THIRD consecutive round dominated by defects the previous round's fixes created. This release is
+deliberately **narrow**: it takes the subset of round 5's findings that is mechanically correct and leaves
+the two genuine design questions open rather than reflexively patching them, because "fix everything the
+reviewer named, immediately" is the loop that produced rounds 3, 4 and 5.
+
+- **An already-bound PR could go dark when its title gained a second run id** (round 5 #2, the dangerous
+  half of 0.8.5's ambiguity refusal). `deriveCloudPrEvents` now resolves from the **durable binding**
+  (`state.issues[id].pr`, passed as `boundIssue`) before considering the text, so a PR that has folded
+  before cannot be detached by an edit like `fix(DER-2): preserve DER-1 compatibility`. This mattered more
+  than it looks: a detached PR reads as a lead that never started, which routes the operator to a
+  REPLACEMENT SPAWN onto a branch that already has work on it. A never-yet-bound ambiguous PR is **still
+  refused, still silently** — that residual is DER-4051's remaining design work and is not fixed here.
+- **Any spawn cleared a still-owed blocked rotation** (round 5 #4). A kickback respawn has nothing to do
+  with the owed rotation, but it erased `lead_rotation_blocked` and the path to the already-written brief —
+  "prepared then forgotten" one level up from the bug the banner was added for. The block now clears only
+  on a spawn carrying the **matching** rotation number.
+- **The disabled-host rule now covers every host KIND, not just cloud** (round 5 #6). `rotate-lead`
+  synthesizes its host for every kind, so a disabled **mini** still took an automatic rotation spawn while a
+  disabled cloud host was refused — the guard had been written `isCloud && …` for the one kind the round-4
+  reviewer happened to name, which is the same one-instance-at-a-time mistake one level up. A disabled ssh
+  host is also no longer contacted at all: the kill probe used to run first and die on an unverifiable
+  verdict, so the operator got "fix your ssh" instead of "this host is disabled".
+- **`THE FAMILY` test now iterates every ledger-resolved member** instead of hardcoding `steer-cloud`
+  (round 5 #6). Its `rotate-lead` legs run on a no-worktree unit so every leg stops at the same structural
+  point and the only variable is whether the guard fired — a `--dry-run` version of this was written first
+  and was WRONG (dry-run skips writing the brief, so the enabled leg died on a missing brief and would have
+  "passed" as a refusal).
+
+**Known open, deliberately not fixed here** — both are design questions, filed rather than patched:
+DER-4053 (reaping an ACTIVE cloud unit skips the only kill/probe step and records a clean teardown while
+the session may still be running; and a failed local worktree removal still reports a clean reap) and
+DER-4051 (durable primary attribution, so an unbound ambiguous PR surfaces as an observable state instead
+of an empty array). Every cloud host remains `enabled:false`.
+
 ## [0.8.5] — 2026-08-18
 
 Round 4 of the pre-PR gate (`turn.completed = 1`, 94 command executions, verdict **not ready**: 4×P1, 5×P2).
