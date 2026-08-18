@@ -15,6 +15,51 @@ run materially different harness code against **one shared ledger** with no way 
 gate itself gained the missing half below — attesting the *acting* process's own version, not only
 versions already recorded in the ledger — in DER-2779.
 
+## [0.7.0] — 2026-08-18
+
+**Cloud leads run the pre-PR codex gate themselves.** 0.6.0 made `codex exec` the gate for every lead
+type; cloud leads were the standing exception, because a cloud session had no `codex` binary and the
+brief told them to say so at hand-off while the orchestrator supplied the gate leg locally. That
+exception is retired for a **codex-provisioned** cloud environment.
+
+### Changed — the cloud brief renders the gate (policy)
+
+- `renderCloudBrief` gains **step 6, the pre-PR codex gate** — the real `codex exec --json --sandbox
+  read-only` invocation with model and effort pinned on the command, the re-run-on-new-head rule, and
+  the three silent failure modes (`< /dev/null` or it hangs to timeout at ~0% CPU; run it inside the
+  repo or it refuses the trusted-directory check; `codex login status` returns an EOF parse error even
+  when auth is healthy, so judge by a positive `turn.completed`). Hand-off (now step 8) requires that
+  `turn.completed` on the head being handed off.
+  **This step did not previously exist in the cloud renderer at all** — the cloud brief went targeted
+  verify → self-review → telemetry → hand-off, so a grep for the old "no codex" carve-out found the
+  *local* renderer's copy and missed that the cloud path emitted no gate instruction whatsoever. The
+  regression test for this is to render a brief and assert on its text, never to grep the source.
+- `renderBrief` step 7 and `cloud-lead-brief-template.md` flip the carve-out: codex **is** present on a
+  provisioned env (`/opt/node22/bin/codex` 0.147.0, auth materialized at session start by a
+  `SessionStart` hook, effort pinned `high`). The old rule survives only for its true case — a
+  genuinely empty `command -v codex` on a non-provisioned env, where the lead must still say so at
+  hand-off rather than substituting the panel silently.
+
+### Added — the cloud-only classifier trap
+
+- Both cloud briefs now warn that the auto-mode **classifier denies bash that reads or executes
+  credential material, and three consecutive denials halt the session waiting on a human**. `codex exec`
+  itself is not denied, so the gate must be run directly and never wrapped in a script that touches
+  auth. A lead stalled this way is invisible except through the liveness rule.
+
+### Evidence
+
+Measured 2026-08-18 against a codex-provisioned environment: real `turn.completed` from a web session
+(`session_01HkfM3t5kg96ppBoRjxJghL`) and from a CLI-dispatched one
+(`session_01FWCKuvj9ga9NMbTb2Ude2R`), the latter also proving a synchronous session-id receipt from
+`claude --cloud`. Paired repo-side with the ADR-0027 §2 amendment.
+
+### Known-stale after this release
+
+- `SKILL.md` still says the adversarial **panel** is the pre-PR gate ("superseding DER-2375's codex
+  gate"), which has contradicted ADR-0027 §2 since its 2026-08-12 amendment. Pre-existing divergence,
+  not introduced here; it needs its own pass.
+
 ## [0.6.2] — 2026-08-12
 
 ### Fixed — a report mixing priced and unpriced models no longer reads as fully priced
