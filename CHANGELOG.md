@@ -15,6 +15,21 @@ run materially different harness code against **one shared ledger** with no way 
 gate itself gained the missing half below — attesting the *acting* process's own version, not only
 versions already recorded in the ledger — in DER-2779.
 
+## [0.8.3] — 2026-08-18
+
+Two stale claims in the deployed skill, both found by the pre-PR gate reviewing the config change that
+depended on them:
+
+- **"Cloud is the default lead host … `preferHosts: [\"cloud\"]`"** — false since the 2026-08-13 directive,
+  and it taught the wrong mental model besides: `pickHost`'s order is `[...preferHosts, ...EVERY other
+  host]`, so omitting a host from the list does not stop it receiving work once the preferred ones fill.
+  Only `enabled:false` does that — and `--host <name>` then bypasses it, by design. The section now says
+  to read `preferHosts` back rather than assume it, and states what the list does not do.
+- **Cloud PR attribution was listed under "Proven behavior".** It was proven on the RETIRED routine path.
+  On the CLI path a 2026-08-18 probe got as far as `GH_TOKEN` being present in-session and no further
+  (DER-4036 stopped it), and presence is not attribution — the check is a real draft PR's author login,
+  canonical head repository, and `isCrossRepository:false`.
+
 ## [0.8.2] — 2026-08-18
 
 Two defects the round-2 pre-PR gate **executed** rather than argued, both in code the cloud migration made
