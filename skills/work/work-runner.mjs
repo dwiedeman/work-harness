@@ -718,13 +718,18 @@ export function renderBrief({ issueId, title, worktree, branch, runId, runDir, r
 // BRIEF IS THE ARGV: the whole text below is passed as one argument, so it is also the only channel into
 // the session. Ledger reporting is still a WORK-EVENT PR comment folded by `reconcile-pr-events`.
 //
-// Two consequences worth stating where the template lives, both MEASURED on 2026-08-18 rather than
-// inferred (session_01LRYXDrwTXU4YbijJGdRNKH):
-//   - the session starts at the COMMIT checked out in the orchestrator's worktree — its HEAD was the
-//     worktree's tip, a commit that was NOT on main — so the lead already has the issue's work, and
-//   - it works on its own `claude/<session-title-slug>` branch, NOT the issue branch.
-// So the playbook below BINDS to the issue branch (`fetch` + `checkout -B … origin/<branch>`) rather than
-// creating it with `checkout -b`. On a kickback round that bind is what loads the prior round's work.
+// Three things about the branch, all MEASURED on 2026-08-18 rather than inferred, and the third one
+// reversed a decision made earlier the same day:
+//   - the session starts at the COMMIT checked out in the orchestrator's worktree (session
+//     01LRYXDrwTXU4YbijJGdRNKH: its HEAD was the worktree's tip, a commit that was NOT on main), so the
+//     lead does start from the right code;
+//   - it works on its own `claude/<session-title-slug>-<hash>` branch, NOT the issue branch; and
+//   - THAT BINDING IS IN ITS SYSTEM PROMPT, not a default it can be talked out of. Session
+//     01N39r4cc3n968amqFoMxcYc was handed the earlier version of step 1b — check out the issue branch —
+//     and REFUSED it as an in-task attempt to override "NEVER push to a different branch without explicit
+//     permission", which is precisely the right call for a zero-context session reading untrusted text.
+// So the playbook does NOT move the lead's branch. The issue id rides the PR TITLE instead, which is what
+// `deriveCloudPrEvents` already matches on (`headRefName + " " + title`). DER-4036 tracks the rest.
 //
 // Repo identity comes from `.claude/work.config.json` `repo` (see REPO_IDENTITY), NOT from literals in
 // this file — the slug, the owner's login and the commit-author line were all hardcoded here, which is
@@ -763,8 +768,8 @@ export function renderCloudBrief({ issueId, title, branch, runId, acceptance, ki
   p(`## Playbook (draft-PR-first lifecycle — this is how the orchestrator sees + monitors you)`, ``,
     `1. **FIRST, before doing the work — register yourself by opening a DRAFT PR.** This is the orchestrator's liveness + handle signal, so do it EARLY:`,
     `   a. Confirm git identity (the preamble set it): \`git log -1\` must show the repo's required commit author.`,
-    `   b. **Put yourself on the issue branch — FIRST, before reading anything.** Your session starts on its own \`claude/…\` working branch, and your issue's branch is already published, so bind to it explicitly:\n      \`\`\`bash\n      git fetch origin ${branch ?? "<gitBranchName>"}:refs/remotes/origin/${branch ?? "<gitBranchName>"} && git checkout -B ${branch ?? "<gitBranchName>"} origin/${branch ?? "<gitBranchName>"} && git rev-parse --abbrev-ref HEAD && git log --oneline -1\n      \`\`\`\n      That is correct whether or not your clone already had the branch, and on a KICKBACK round it is what loads the work of the round before yours — skipping it silently starts you from \`main\` with none of it. Never \`checkout -b\` (it fails on a branch you already have, and that failure has nothing to do with your work). Then make an empty WIP commit so a PR can open with no code yet: \`git commit --allow-empty -m "wip(${issueId}): cloud lead started"\`; push (\`git push -u origin ${branch ?? "<gitBranchName>"}\`).`,
-    `   c. **Open a DRAFT PR via the GitHub MCP tools** (draft:true, base main; authored by the configured commit author). A draft runs NO CI and NO Codex review — it's a placeholder. Title mentions ${allIds.join(" + ")}; body: one line noting it's a cloud lead in progress.`,
+    `   b. **Stay on the branch you are bound to — do NOT switch branches.** Your session is bound by its own configuration to a \`claude/…\` branch, and that is where your work belongs. An earlier version of this brief told cloud leads to check out the Linear issue branch instead; a lead correctly REFUSED that as an in-task attempt to override its binding, and it was right to (DER-4036). So: \`git rev-parse --abbrev-ref HEAD\` — whatever it prints is your branch. Report it in the PR body so the orchestrator can find your work. Then an empty WIP commit so a PR can open with no code yet: \`git commit --allow-empty -m "wip(${issueId}): cloud lead started"\` and \`git push -u origin HEAD\`.`,
+    `   c. **Open a DRAFT PR via the GitHub MCP tools** (\`mcp__github__create_pull_request\`, draft:true, base main; authored by the configured commit author). A draft runs NO CI and NO Codex review — it's a placeholder. **The TITLE MUST contain ${allIds.join(" + ")} — this is load-bearing, not cosmetic:** the orchestrator matches your PR to its unit on branch-name-or-title, and your \`claude/…\` branch name does not carry the id, so a title without it makes your PR invisible to the harness and you read as a lead that never started. Body: one line noting it's a cloud lead in progress, plus the branch name from step 1b.`,
     `2. Read AGENTS.md + the area's invariants. **If the change isn't trivially clear, write a short plan FIRST, inline** — the \`/superpowers:*\` plugins (writing-plans, brainstorming, …) are NOT installed in cloud sessions (they're user-global, not repo-committed), so do not call them; instead jot: goal · exact files to touch · steps · definition-of-done · **reference-as-map** (the analogous existing implementation you're following, or "no analog exists"), then implement against it. (Repo-committed skills under \`.claude/skills\` and the built-in Skill tool ARE available.)`,
     `2b. **Declare your file scope BEFORE your first commit — MANDATORY (2026-07-25).** You have no ledger access, so emit it as a PR comment exactly like the token report in step 6:\n   \`gh api repos/${repo}/issues/<PR>/comments -f body='WORK-EVENT {"type":"plan_scope","issues":["${allIds.join('","')}"],"fileScope":["path/a.ts","path/b.ts"],"expectedAdditions":600}'\`\n   **This is a BUDGET, not a note.** The declared \`fileScope\` bounds this PR: if the real change needs **more than 1.5× the declared file count**, STOP, re-emit an updated \`plan_scope\`, and say so in the PR body — do not silently grow. ${assignedBudget ? `Your **assigned budget is ${assignedBudget.files} files / ~${assignedBudget.additions} additions** (see "Assigned budget" above) — declare against it, do not raise it.` : "Aim for **≤ ~800 additions / ≤ ~12 files**."} Measured 2026-07-25: review rounds scale directly with diff size (<1k additions → 1.25 rounds; >7k → 5.67), and cloud briefs previously never asked for this at all — the PR that shipped 98 files / +11,537 lines with no declared scope took 5 rounds and never merged.`,
     `3. **Build via subagent delegation — MANDATORY, not optional.** Decompose the change into 2–4 implementation chunks and dispatch each to a Sonnet 5 subagent via the Agent tool (\`model: "claude-sonnet-5"\`); research/codebase-mapping goes to Haiku. Run chunks IN PARALLEL whenever their file scopes are disjoint (one message, multiple Agent calls). You (the lead) plan, adversarially review each subagent's diff, integrate, and own the PR — you do NOT write implementation code yourself (sole exception: integration glue under ~20 lines). Work directly in the checkout — there is NO worktree here. Commit (conventional, mention ${allIds.join(" + ")}) and push to the SAME branch as you go (each push is your progress signal).`,
@@ -8044,7 +8049,10 @@ async function refuseUnprovenSpawn({ runDir, role, label, outcome, launcher = "c
 //   branch         the session clones THE CWD'S CHECKED-OUT REF and there is no branch-selection flag,
 //                  so the spawn must run in the issue's worktree AND that ref must be on origin at the
 //                  same sha — a local-only commit dies at provisioning (`error_during_execution`, 0
-//                  turns), and a remote ref BEHIND local HEAD silently drops the local commits.
+//                  turns), and a remote ref BEHIND local HEAD silently drops the local commits. This is
+//                  about the CLONE SOURCE, not about where the lead works: the session is bound by its own
+//                  system prompt to a `claude/…` branch and will refuse to move off it (DER-4036), so the
+//                  worktree chooses the lead's STARTING COMMIT and nothing else.
 //   env            `--environment` accepts only `ccpool_…` self-hosted ids, so a CLI session runs the
 //                  ACCOUNT'S default cloud environment, selected per-profile by CLAUDE_CONFIG_DIR. That
 //                  is why hosts.<name>.credProfile is mandatory here and why the codex-provisioned env
@@ -10633,7 +10641,9 @@ export async function runSubcommand(argv) {
       };
     }
     case "review-panel": {
-      // DER-2360 — record the 3-lens adversarial panel as THE pre-PR gate.
+      // DER-2360 — record the 3-lens adversarial panel as the pre-PR gate. Since ADR-0027 §2's 2026-08-12
+      // amendment the panel is the FALLBACK (codex exec every round is the default); this command is
+      // unchanged, it is just no longer the default path.
       //
       // This is a sibling of `review-swap`, not a loosening of `review-usage`. `review-usage` refuses a
       // findings-shaped payload with no codex JSONL carrying `turn.completed`, and that refusal is
@@ -12931,7 +12941,9 @@ Design: the README's context-rotation section.
               --lens-file <lens>=<file.json> (x2+) [--verify-file <f>] [--falsify <f>] [--base <ref>]
               [--diff <file>] [--round n] [--model <id>] [--dry-run] \
               [--codex-review <out.json> --codex-log <run.jsonl> | --codex-waived "<why not>"]
-                                              THE pre-PR gate. Reads each lens's 'claude -p --output-format json'
+                                              The FALLBACK pre-PR gate (codex exec every round is the default
+                                              since ADR-0027 SS2's 2026-08-12 amendment; run-gate.sh decides).
+                                              Reads each lens's 'claude -p --output-format json'
                                               envelope, unions the findings, and writes ONE review_findings event
                                               with gate_kind=panel + models_observed (the model that ACTUALLY ran,
                                               read from modelUsage — DER-2293), so 'ready' prints gate=PANEL.

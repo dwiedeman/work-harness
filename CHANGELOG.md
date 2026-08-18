@@ -15,6 +15,29 @@ run materially different harness code against **one shared ledger** with no way 
 gate itself gained the missing half below — attesting the *acting* process's own version, not only
 versions already recorded in the ledger — in DER-2779.
 
+## [0.8.1] — 2026-08-18
+
+**A cloud lead does NOT move off its own branch, and the pre-PR gate policy in the deployed skill is
+corrected.** Both came out of an adversarial review of 0.8.0's own change, and the first one reverses a
+decision 0.8.0 shipped an hour earlier:
+
+- **The cloud brief no longer prescribes a branch bind.** A `claude --cloud` session is bound by its SYSTEM
+  prompt to a `claude/<title-slug>-<hash>` branch ("NEVER push to a different branch without explicit
+  permission"). Handed 0.8.0's bind step, a real lead REFUSED it as an in-task attempt to override that
+  binding — the right call for a zero-context session reading untrusted text. So the lead now stays on its
+  own branch and **the issue id rides the PR TITLE**, which is what `deriveCloudPrEvents` already matches
+  on (`headRefName + " " + title`). `spawn-cloud`'s branch/sha guard keeps its job with its purpose
+  restated: it protects the session's CLONE SOURCE, not the lead's working branch. Tracked as DER-4036.
+- **SKILL.md said the adversarial panel was THE pre-PR gate**, and that revisions were panel-only — the
+  pre-2026-08-12 policy, contradicting ADR-0027 §2, `CLAUDE.md`, and this harness's own `run-gate.sh` for
+  six days. The section is now marked superseded (codex every round; panel is the fallback), and the same
+  correction is applied to `review-panel`'s help text and code comment.
+- **§3 now states the gate-receipt gap out loud (DER-4037):** a cloud lead's in-session codex gate cannot
+  reach the ledger, because `review_findings` is deliberately absent from the cloud-reportable WORK-EVENT
+  allowlist (a forgeable gate receipt is exactly what that allowlist exists to prevent), so `ready` reports
+  `gate=MISSING`. Until that is designed, a cloud unit means the orchestrator still owes the gate leg
+  locally — which is why the cloud hosts are enabled but deliberately OUT of `preferHosts`.
+
 ## [0.8.0] — 2026-08-18
 
 **Cloud leads are dispatched as `claude --cloud` sessions, and a cloud kickback steers the live lead.**

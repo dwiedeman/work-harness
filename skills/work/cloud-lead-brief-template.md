@@ -4,9 +4,9 @@ Template for a `/work` lead running as a Claude Code **cloud session** (dispatch
 `work-runner.mjs spawn-cloud`, which wraps `claude --cloud`; before 2026-08-18 it was a claude.ai
 RemoteTrigger one-shot routine). THE WHOLE BRIEF IS ONE ARGV STRING — it is the only channel into the
 session, so nothing here may rely on a file the lead cannot fetch. The session starts at the COMMIT
-checked out in the orchestrator's worktree but on its own `claude/<title-slug>` branch (both measured
-2026-08-18), which is why step 1 BINDS to the issue branch with `fetch` + `checkout -B … origin/<branch>`
-rather than creating it with `checkout -b`. Fill the `<…>` slots. This mirrors the
+checked out in the orchestrator's worktree but on its own `claude/<title-slug>` branch, and that branch is
+bound by its SYSTEM prompt (all three measured 2026-08-18) — so step 1 leaves the branch alone and the
+issue id rides the PR TITLE instead. Fill the `<…>` slots. This mirrors the
 local `/work-lead` brief but adapts to the cloud sandbox's constraints (learned 2026-07-15 across 6
 qualification probes). Keep the **Provenance & authorization** block — zero-context cloud sessions
 have refused injection-shaped briefs without it.
@@ -70,7 +70,7 @@ fi
 ## Draft-PR-first lifecycle (how the orchestrator sees you — DER-1838)
 There is no local ledger file, and you must NOT enumerate/report session or env identifiers (that
 reads as recon and gets refused). Instead the orchestrator derives everything from your **PR state**:
-1. **At boot, before doing the work:** bind to the issue branch — `git fetch origin <gitBranchName>:refs/remotes/origin/<gitBranchName> && git checkout -B <gitBranchName> origin/<gitBranchName>` (your session starts on its own `claude/…` branch; on a kickback round this bind is what loads the prior round's work), never `checkout -b` → empty WIP commit
+1. **At boot, before doing the work:** STAY on the branch your session is bound to (a `claude/…` branch — do not switch: a lead correctly refuses an in-task instruction to move off it, DER-4036), report it in the PR body, and put the issue id in the PR **TITLE** (that is what the harness matches on) → empty WIP commit
    (`git commit --allow-empty -m "wip(<DER-id>): cloud lead started"`) → push → **open a DRAFT PR via
    the GitHub MCP tools** (draft:true, base main). A draft runs **no CI and no Codex**. Its footer
    carries your `session_01…` handle automatically — that's the orchestrator's liveness signal + the
