@@ -8703,10 +8703,15 @@ export function deriveCloudPrEvents({ pr, runIssues = null, bundles = {}, status
       // only the bundle case, by finding a primary whose list covers every winner. Otherwise emit NOTHING:
       // folding a lifecycle onto the wrong unit is strictly worse than not folding it, and the missing
       // `lead_online` is already caught by the deadline/failed-to-start safety net.
-      issue = winners.find((cand) => {
+      // The covering candidate must be its group's PRIMARY (`bundles[primary]` is documented "primary
+      // first", and the fold only ever stamps `bundle` on the primary's unit). Requiring that rather than
+      // "any candidate whose group covers the winners" keeps the answer independent of `runIssues` order
+      // even if a future fold starts stamping `bundle` on every member.
+      const covers = (cand) => {
         const grp = Array.isArray(bundles[cand]) ? bundles[cand] : null;
-        return grp && winners.every((w) => grp.includes(w));
-      });
+        return grp && grp[0] === cand && winners.every((w) => grp.includes(w));
+      };
+      issue = winners.find(covers);
       if (!issue) return [];
     }
   }

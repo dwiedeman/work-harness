@@ -12591,4 +12591,10 @@ test("deriveCloudPrEvents (DER-4051): identity is RANKED, and genuine ambiguity 
   // …but a BUNDLE legitimately names several of its own ids, and must still resolve to the covering primary.
   assert.equal(f(pr("fix: DER-1 + DER-2 together"), ["DER-1", "DER-2"], { "DER-1": ["DER-1", "DER-2"] }), "DER-1",
     "a bundle is not ambiguity: one primary covers every winner");
+  assert.equal(f(pr("fix: DER-1 + DER-2 together"), ["DER-2", "DER-1"], { "DER-1": ["DER-1", "DER-2"] }), "DER-1",
+    "…and the bundle resolves to its PRIMARY regardless of ledger order");
+  // Belt-and-braces for the shape a future fold could create: `bundle` stamped on every member. Only the
+  // group's first element (the primary) may win, so the answer still cannot depend on candidate order.
+  assert.equal(f(pr("fix: DER-1 + DER-2 together"), ["DER-2", "DER-1"], { "DER-1": ["DER-1", "DER-2"], "DER-2": ["DER-1", "DER-2"] }), "DER-1",
+    "a non-primary member must not claim its own bundle's PR");
 });
