@@ -107,9 +107,30 @@ The launcher re-reads `headRefOid` before accepting any verdict and stamps `stal
 quiet push cannot slip a stale gate through — it just burns the round and it gets paid for twice. If a
 push is genuinely unavoidable, say so in a hand-off comment naming the new sha.
 
-**You have NO `codex` binary.** `which codex` returns nothing in a cloud session, and the pre-PR gate is
-`codex exec`. Say so explicitly in your hand-off note so the orchestrator supplies the gate leg locally.
-Do NOT quietly substitute the Claude panel, and do NOT hand off ungated while implying it was gated.
+**You HAVE a `codex` binary — run the pre-PR gate yourself.** On a codex-provisioned cloud environment
+`command -v codex` resolves to `/opt/node22/bin/codex` (0.147.0), auth is materialized at session start
+by a `SessionStart` hook, and effort is pinned to `high`. Verified 2026-08-18 with a real
+`turn.completed` from a CLI-dispatched session (`session_01FWCKuvj9ga9NMbTb2Ude2R`). Run it from the
+repo root, after targeted verify is green and BEFORE hand-off:
+
+```bash
+codex exec --json --sandbox read-only -m gpt-5.6-sol -c model_reasoning_effort="high" '<search-mandating review prompt>' < /dev/null
+```
+
+Three ways this fails **silently**: (a) omit `< /dev/null` and codex hangs to timeout on "Reading
+additional input from stdin…" at ~0% CPU, byte-identical to a quota wall; (b) run it outside the repo
+and it refuses on the trusted-directory check; (c) `codex login status` returns an EOF parse error even
+when auth is perfectly healthy — judge the run by a positive `turn.completed` in the JSONL, never by
+that command and never by absence of complaint.
+
+One cloud-only trap: the auto-mode **classifier** denies bash that reads or executes credential
+material, and **three consecutive denials stop your session waiting for a human**. `codex exec` itself
+is not denied — so run it directly and never wrap it in a script that touches auth.
+
+**Only if `command -v codex` is genuinely empty** (you are on a non-provisioned environment) does the
+old rule apply: say so explicitly in your hand-off note so the orchestrator supplies the gate leg
+locally. Either way, do NOT quietly substitute the Claude panel, and do NOT hand off ungated while
+implying it was gated.
 
 **Kickback re-spawn (item 1):** if this brief has a "⚠ Kickback" block, the PR already exists and the
 shepherd **converted it back to draft** when kicking it back (so your fix pushes run no CI). Skip the
