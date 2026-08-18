@@ -36,7 +36,9 @@ decision 0.8.0 shipped an hour earlier:
   reach the ledger, because `review_findings` is deliberately absent from the cloud-reportable WORK-EVENT
   allowlist (a forgeable gate receipt is exactly what that allowlist exists to prevent), so `ready` reports
   `gate=MISSING`. Until that is designed, a cloud unit means the orchestrator still owes the gate leg
-  locally — which is why the cloud hosts are enabled but deliberately OUT of `preferHosts`.
+  locally — which is why the cloud hosts stay `enabled:false`, the harness's own "forced-only" state
+  (`pickHost` skips a disabled host automatically but honors `--host <name>`; merely omitting a host
+  from `preferHosts` does NOT stop an automatic spill, since the order is preferred-then-everything).
 
 ## [0.8.0] — 2026-08-18
 
