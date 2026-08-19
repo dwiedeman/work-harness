@@ -281,28 +281,57 @@ fi
 STARTED=""
 
 memgate() {
-  # Prints `clear` or `TIMEOUT` FROM THE LOOP'S EXIT CONDITION. The prior version printed "clear"
-  # unconditionally after the loop, so a reader of driver.log could not tell "gate satisfied" from
-  # "gate gave up after 15 minutes" — and the `||` let a lens start at 54MB free RAM on swap headroom.
+  # Prints `clear` or `TIMEOUT` FROM THE LOOP'S EXIT CONDITION, so a reader of driver.log can tell
+  # "gate satisfied" from "gate gave up".
   #
-  # WORK_GATE_MEMGATE_TRIES=0 disables the wait entirely. This exists because the gate is otherwise
-  # untestable: on a box that is already memory-starved, the default is a 15-MINUTE silent block PER
-  # LENS, and the first control set written against this script hung for 45 minutes before anyone saw
-  # a single assertion. A knob a test can turn is also a knob an operator can turn when they know the
-  # box is busy and want the panel to start anyway.
-  local lens="$1" g=0 freemb swapfree
-  local tries="${WORK_GATE_MEMGATE_TRIES:-90}"
+  # ── 2026-08-19: this gate had NEVER ONCE PASSED, and that is the defect ──────────────────────────
+  # Every MEMGATE line ever logged on the operator's box is a TIMEOUT: freeRAM=15MB, 19MB, 33MB. It
+  # read `vm_stat`'s "Pages free", which macOS deliberately keeps near zero — it lends idle RAM to the
+  # cache and reclaims on demand. Measured the same day: killing three stale processes reclaimed ~1.0GB
+  # (`vm.swapusage used` 12,796MB -> 11,797MB) and "Pages free" went DOWN, 31MB -> 15MB.
+  #
+  # So the threshold could not be met on a healthy box, and the gate degenerated into a flat
+  # 15-minutes-per-lens sleep: on #1357 it burned 30 of 55 wall-clock minutes doing nothing. A check
+  # that can never return its PASSING answer is as useless as one that can never fail — the same rule,
+  # pointed the other way — and it is worse than absent, because it looks like protection.
+  #
+  # AVAILABLE is what Activity Monitor means by available and what a new process can actually get:
+  # free + inactive + purgeable + speculative. Measured together at the same instant above: free=19MB
+  # but AVAILABLE=838MB. The wait is also capped far lower — real starvation does not clear in 15
+  # minutes, so a long wait only delays the same decision.
+  local lens="$1" g=0 availmb swapfree
+  local tries="${WORK_GATE_MEMGATE_TRIES:-24}"      # 24 x 5s = 2 min, was 90 x 10s = 15 min
+  local floor="${WORK_GATE_MEMGATE_AVAIL_MB:-500}"
+  # The swap floor is a SECOND way this gate could never pass, found by its own first control run:
+  # availableRAM=810MB cleared a 1MB floor and it still timed out, because `vm.swapusage` free was
+  # 744MB against a hardcoded 900MB. macOS grows the swapfile on demand, so a low free-swap figure is
+  # usually "not grown yet", not "starved". Configurable, defaulted to something reachable.
+  local swapfloor="${WORK_GATE_MEMGATE_SWAP_MB:-256}"
   if [ "$tries" -eq 0 ]; then log "MEMGATE $lens SKIPPED (WORK_GATE_MEMGATE_TRIES=0)"; return 0; fi
   while [ "$g" -lt "$tries" ]; do
-    freemb=$(( $(vm_stat 2>/dev/null | awk '/Pages free/ {gsub("\\.","",$3); print $3+0}') * 4096 / 1048576 ))
-    swapfree=$(sysctl -n vm.swapusage 2>/dev/null | awk '{gsub("M","",$9); print $9+0}')
-    if [ "${freemb:-0}" -ge 250 ] && [ "${swapfree:-0}" -ge 900 ]; then
-      log "MEMGATE $lens clear freeRAM=${freemb}MB swapfree=${swapfree}MB"
+    availmb=$(vm_stat 2>/dev/null | awk '
+      /Pages free/         {gsub("\\.","",$3); f=$3}
+      /Pages inactive/     {gsub("\\.","",$3); i=$3}
+      /Pages purgeable/    {gsub("\\.","",$3); p=$3}
+      /Pages speculative/  {gsub("\\.","",$3); s=$3}
+      END {printf "%d", (f+i+p+s)*4096/1048576}')
+    # printf "%d", not print: `vm.swapusage` free is "524.50M" -> awk's $9+0 yields the FLOAT 524.5,
+    # and `[ 524.5 -ge 900 ]` is an INTEGER test that errors ("integer expression expected") and
+    # evaluates FALSE. So the swap half of this gate could never be satisfied at ANY threshold — that,
+    # not the 250MB RAM figure, is why every MEMGATE line since 0.6.0 was a TIMEOUT. Found by the
+    # CLEAR control the first time one was written: it reported blocked_by=swapfree against a floor
+    # of 0. bash's error went to stderr and nothing read it.
+    swapfree=$(sysctl -n vm.swapusage 2>/dev/null | awk '{gsub("M","",$9); printf "%d", $9+0}')
+    if [ "${availmb:-0}" -ge "$floor" ] && [ "${swapfree:-0}" -ge "$swapfloor" ]; then
+      log "MEMGATE $lens clear availableRAM=${availmb}MB (floor ${floor}MB) swapfree=${swapfree}MB (floor ${swapfloor}MB)"
       return 0
     fi
-    g=$((g + 1)); sleep 10
+    g=$((g + 1)); sleep 5
   done
-  log "MEMGATE $lens TIMEOUT freeRAM=${freemb:-?}MB swapfree=${swapfree:-?}MB — starting anyway, but this run is memory-starved and the verdict may be truncated."
+  local blocked=""
+  [ "${availmb:-0}" -ge "$floor" ] || blocked="availableRAM"
+  [ "${swapfree:-0}" -ge "$swapfloor" ] || blocked="${blocked:+$blocked+}swapfree"
+  log "MEMGATE $lens TIMEOUT blocked_by=${blocked:-unknown} availableRAM=${availmb:-?}MB (floor ${floor}MB) swapfree=${swapfree:-?}MB (floor ${swapfloor}MB) — starting anyway after $((tries * 5))s; the verdict may be truncated."
   return 1
 }
 

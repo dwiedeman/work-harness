@@ -87,6 +87,9 @@ async function scenario(opts = {}) {
       // where several installs run the same suite against one fixed /tmp path — a collision the
       // script now makes impossible rather than one the test tiptoes around.
       WORK_GATE_SCRATCH: join(dir, "gate-scratch"),
+      // Per-scenario env overrides, so a test can exercise the memgate itself rather than only ever
+      // disabling it. Last-wins, so `env` can override the defaults above.
+      ...(opts.env ?? {}),
     },
   });
   const D = join(dir, "gate-scratch");
@@ -336,4 +339,53 @@ test("run-gate: CONTROL — an unbriefed PANEL round says so in its receipt", as
   assert.equal(verdict.scope_contract, "absent",
     "a panel round with no contract must NOT record itself as briefed");
   await rm(dir, { recursive: true, force: true });
+});
+
+
+// ── DER-4055 sibling: the memgate had never once PASSED ───────────────────────────────────────────
+// Every MEMGATE line ever logged on the operator's box was a TIMEOUT (freeRAM 15/19/33MB) because it
+// read `vm_stat`'s "Pages free", which macOS keeps near zero by design. It degenerated into a flat
+// 15-min-per-lens sleep — 30 of 55 wall-clock minutes on #1357. A check that can never return its
+// PASSING answer is as useless as one that can never fail, and worse than absent because it looks
+// like protection. Both directions are pinned here; neither existed before, which is exactly why the
+// defect survived. The first run of the CLEAR control immediately found a SECOND unmeetable
+// condition (a hardcoded 900MB swap floor) that the RAM fix alone had left in place.
+
+const CLAUDE_BIG = [
+  "#!/bin/bash",
+  `printf '{"subtype":"success","is_error":false,"result":"%s"}' "$(head -c 3000 /dev/zero | tr '\\0' 'x')"`,
+  "exit 0",
+].join("\n");
+
+test("run-gate: memgate CLEARS on a healthy box — the passing path exists at all", async () => {
+  const { res } = await scenario({
+    codex: CODEX_DEAD, claude: CLAUDE_BIG, extraArgs: ["--lenses", "correctness security"],
+    // Floors any machine running this suite clears. tries>0 so the gate really evaluates rather than
+    // taking the SKIPPED shortcut — a skip would prove nothing about the passing path.
+    env: {
+      WORK_GATE_MEMGATE_TRIES: "3",
+      WORK_GATE_MEMGATE_AVAIL_MB: "1",
+      WORK_GATE_MEMGATE_SWAP_MB: "0",
+    },
+  });
+  assert.match(res.stdout, /MEMGATE correctness clear availableRAM=\d+MB/,
+    "the gate must be ABLE to report CLEAR — in production it never did, not once");
+  assert.doesNotMatch(res.stdout, /MEMGATE correctness TIMEOUT/);
+  assert.equal(res.status, 0, res.stderr);
+});
+
+test("run-gate: memgate TIMES OUT on an unreachable floor, names what blocked it, and proceeds", async () => {
+  const { res } = await scenario({
+    codex: CODEX_DEAD, claude: CLAUDE_BIG, extraArgs: ["--lenses", "correctness security"],
+    // One try, so this costs 5s rather than 15 minutes: the OUTCOME is what is pinned, not duration.
+    env: {
+      WORK_GATE_MEMGATE_TRIES: "1",
+      WORK_GATE_MEMGATE_AVAIL_MB: "99999999",
+      WORK_GATE_MEMGATE_SWAP_MB: "0",
+    },
+  });
+  assert.match(res.stdout, /MEMGATE correctness TIMEOUT blocked_by=availableRAM/,
+    "a timed-out gate must name WHICH condition blocked — reporting both numbers and no verdict is how a 900MB swap floor hid behind a RAM fix");
+  assert.match(res.stdout, /starting anyway/, "a starved box still gets a review, never a hang");
+  assert.equal(res.status, 0, "the timeout is a warning, never a refusal");
 });

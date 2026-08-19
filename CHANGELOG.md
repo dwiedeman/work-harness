@@ -15,6 +15,43 @@ run materially different harness code against **one shared ledger** with no way 
 gate itself gained the missing half below — attesting the *acting* process's own version, not only
 versions already recorded in the ledger — in DER-2779.
 
+## [0.8.9] — 2026-08-19
+
+**`memgate` had never once passed, and it was costing 15 minutes per lens.**
+
+Every MEMGATE line ever logged was a TIMEOUT — `freeRAM=15MB`, `19MB`, `33MB`. On #1357 the gate burned
+**30 of 55 wall-clock minutes doing nothing**: 15 minutes of sleep before each of two lenses that then
+took 17.5 and 7.9 minutes to actually review. A check that can never return its PASSING answer is as
+useless as one that can never fail — the same rule pointed the other way — and worse than absent,
+because it looks like protection.
+
+**Two independent reasons it could not pass, and the second was the real one:**
+
+1. It read `vm_stat`'s *Pages free*, which macOS keeps near zero by design (idle RAM is lent to the
+   cache). Measured the same day: killing three stale processes reclaimed ~1.0 GB — `vm.swapusage used`
+   12,796 → 11,797 MB — and *Pages free* went **down**, 31 → 15 MB. Now measures **available** =
+   free + inactive + purgeable + speculative, which is what Activity Monitor means and what a new
+   process can actually get. Same instant: free 19 MB, available 838 MB.
+2. **`[ 524.5 -ge 900 ]` is an integer test on a float.** `vm.swapusage` free is `"524.50M"`, and awk's
+   `$9+0` yields `524.5`; bash errors with *"integer expression expected"* — to stderr, unread — and the
+   condition evaluates FALSE. **So the swap half could not be satisfied at any threshold, and had not
+   been since 0.6.0.** Fixed with `printf "%d"`.
+
+Reason 2 was found by the CLEAR control the first time one was ever written: it reported
+`blocked_by=swapfree` against a floor of **0**. Without the `blocked_by` field the RAM fix alone would
+have shipped, still never passed, and looked correct.
+
+- **Available-RAM measurement**, floors configurable (`WORK_GATE_MEMGATE_AVAIL_MB` default 500,
+  `WORK_GATE_MEMGATE_SWAP_MB` default 256). On the operator's box right now: available 812 MB, swapfree
+  540 MB → **clears immediately, 0s wait**, where the old gate slept 15 minutes.
+- **Wait capped at 2 min** (24 × 5s, was 90 × 10s). Real starvation does not clear in 15 minutes; a long
+  wait only delays the same decision.
+- **A timeout now names what blocked it** — `blocked_by=availableRAM+swapfree`. Reporting both numbers
+  and no verdict is precisely how a dead swap comparison hid for four minor versions.
+- **Two controls, one per direction** — that it CLEARS on a healthy box, and that it TIMES OUT on an
+  unreachable floor, names the blocker, and still proceeds. Neither existed before, which is why a gate
+  that never passed went unnoticed.
+
 ## [0.8.8] — 2026-08-19
 
 **The scope contract reached codex and not the panel** — found while preparing to run a panel-only
