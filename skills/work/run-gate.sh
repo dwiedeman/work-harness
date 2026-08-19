@@ -28,7 +28,34 @@
 # Usage:
 #   run-gate.sh --pr 1293 --repo owner/name --sha <40-char> --tree /path/to/worktree \
 #               [--round 1] [--issue DER-3487] [--runner /path/to/work-runner.mjs] \
-#               [--lenses "correctness security repro"] [--force-panel] [--panel-model claude-opus-5]
+#               [--lenses "correctness security repro"] [--force-panel] [--panel-model claude-opus-5] \
+#               [--contract /path/to/contract.md] [--tests "<vitest file args>"]
+#
+# ── Scope + test-evidence additions (2026-08-15, U4 post-mortem) ─────────────────────────────────
+#   --contract FILE  appends the unit's frozen contract/scope block (in_scope, known_dependent_units,
+#                    ship_blocking_rule) to the codex prompt. Measured on #1314: 2 of 3 gate rounds
+#                    were spent on out-of-contract findings (a naming dispute r2; an already-planned
+#                    dependent unit's file r3). The scope block is generated from the unit's contract
+#                    table, never hand-written per round.
+#   --tests "FILES"  pre-runs the named Vitest suites in the tree (normal permissions, OUTSIDE the
+#                    review sandbox) and attaches the tail of the output — bound to the reviewed sha —
+#                    to the prompt. The read-only sandbox EPERMs Vitest's temp-dir creation, so every
+#                    U4 round fell back to ad-hoc probes and hunted a fresh counterexample family.
+#                    The reviewer is told the suites already ran and must verify by reading +
+#                    targeted probes, not by re-running Vitest.
+#   TMPDIR is also pointed at gate scratch for the codex leg — harmless if the sandbox still blocks
+#   it, sufficient if the profile honors it.
+#
+# ── Why the receipt names its own scope (2026-08-19, DER-4055) ───────────────────────────────────
+# The two flags above were written on 2026-08-15 and lived only in ~/.claude — never committed here —
+# so the first `install.sh` of 2026-08-18 copied the pre-W0 file back over them. Rounds on #1353,
+# #1354 and #1356 then ran with NO scope contract for a full day. Nothing exposed it: an unscoped
+# round exits 0 and returns a well-formed, high-confidence findings payload that is byte-shaped
+# exactly like a scoped one, and one of its P1s was a scoping the diff itself disclosed.
+# `gate-verdict.json` therefore records `scope_contract` (applied|absent) and `test_evidence`
+# (attached-exit<N>|skipped-wrong-sha|absent). The receipt now answers "was this round briefed?",
+# which no surface could answer before. The controls for both flags live in run-gate.test.mjs, so
+# the same revert reddens in CI instead of going a day unnoticed.
 #
 # Exit codes: 0 = a verdict was produced and validated · 1 = usage/setup error · 2 = the gate did not
 # produce a usable verdict (walled, dead, or stale) — NEVER silently 0. A gate that dies exits 0 is the
@@ -37,7 +64,8 @@
 set -uo pipefail
 
 # ── args ──────────────────────────────────────────────────────────────────────────────────────────
-PR=""; REPO=""; SHA=""; TREE=""; ROUND="1"; ISSUE=""; RUNNER=""
+PR=""; REPO=""; SHA=""; TREE=""; ROUND="1"; ISSUE=""; RUNNER=""; CONTRACT=""; TESTS=""
+SCOPED="absent"; TEST_EVIDENCE="absent"
 LENSES="correctness security repro"; FORCE_PANEL=0; PANEL_MODEL="claude-opus-5"
 CODEX_MODEL="${WORK_CODEX_MODEL:-gpt-5.6-sol}"; CODEX_EFFORT="${WORK_CODEX_EFFORT:-high}"
 
@@ -52,6 +80,8 @@ while [ $# -gt 0 ]; do
     --runner) RUNNER="$2"; shift 2 ;;
     --lenses) LENSES="$2"; shift 2 ;;
     --panel-model) PANEL_MODEL="$2"; shift 2 ;;
+    --contract) CONTRACT="$2"; shift 2 ;;
+    --tests) TESTS="$2"; shift 2 ;;
     --force-panel) FORCE_PANEL=1; shift ;;
     -h|--help) sed -n '1,40p' "$0"; exit 0 ;;
     *) echo "run-gate: unknown argument $1" >&2; exit 1 ;;
@@ -151,9 +181,52 @@ else
   if [ ! -s "$D/codex.prompt.md" ]; then
     log "CODEX_PROMPT_MISSING — panel-prompt produced nothing (need --runner and --issue). Falling back to the panel."
   else
+    # ── contract/scope block (2026-08-15). Appended AFTER prompt generation so the runner's prompt
+    # stays canonical and the scope block is visibly last-word. A named-but-missing contract file is
+    # a hard error, not a silent unscoped review — an unscoped round costs a full remediation cycle.
+    if [ -n "$CONTRACT" ]; then
+      if [ ! -s "$CONTRACT" ]; then
+        log "CONTRACT_MISSING — --contract $CONTRACT is empty or absent. Refusing an unscoped gate."
+        exit 1
+      fi
+      {
+        printf '\n\n## Review scope contract (binding — generated from the unit contract table)\n\n'
+        cat "$CONTRACT"
+        printf '\n\nship_blocking_rule: a P1 must demonstrate either (a) a regression introduced by THIS diff, or (b) a violated acceptance criterion of THIS unit'"'"'s contract table above. A finding in an untouched file already assigned to a listed known_dependent_unit is reported as "planned follow-up" severity P2, not P1 — unless this diff worsens it or falsely claims to fix it. Findings outside in_scope are still reported, at the severity the rule assigns.\n'
+      } >> "$D/codex.prompt.md"
+      SCOPED="applied"
+      log "CONTRACT_APPENDED $(wc -c < "$CONTRACT")B from $CONTRACT"
+    else
+      log "CONTRACT_ABSENT — no --contract given. This round carries NO in_scope / known_dependent_units / ship_blocking_rule, so out-of-contract findings will arrive as P1. Intended only for units with no frozen contract table."
+    fi
+    # ── pre-sandbox test evidence (2026-08-15). The read-only sandbox EPERMs Vitest; run the unit's
+    # named suites OUTSIDE it, at the reviewed sha, and attach the result. Runs from repo-root config
+    # (package-local vitest configs are not CI-parity). Failure of the suite is attached verbatim —
+    # a red suite is exactly what the reviewer must see.
+    if [ -n "$TESTS" ]; then
+      TREE_SHA="$(cd "$TREE" && git rev-parse HEAD 2>/dev/null)"
+      if [ "$TREE_SHA" != "$SHA" ]; then
+        log "TESTS_SKIPPED — tree HEAD $TREE_SHA != reviewed sha $SHA; refusing to attach evidence from the wrong code."
+        TEST_EVIDENCE="skipped-wrong-sha"
+      else
+        log "TESTS_START files=[$TESTS]"
+        ( cd "$TREE" && pnpm exec vitest run --config vitest.config.fast.ts $TESTS ) \
+          > "$D/tests.out" 2>&1
+        TESTS_EXIT=$?
+        log "TESTS_DONE exit=$TESTS_EXIT bytes=$(wc -c < "$D/tests.out" 2>/dev/null || echo 0)"
+        TEST_EVIDENCE="attached-exit${TESTS_EXIT}"
+        {
+          printf '\n\n## Executed test evidence (run by the gate at reviewed sha %s, exit=%s)\n\n' "$SHA" "$TESTS_EXIT"
+          printf 'The review sandbox cannot run Vitest (temp-dir EPERM). These suites were executed outside it, at the exact reviewed head. Do NOT attempt to run Vitest; verify claims by reading code and by targeted node probes. Last 80 lines:\n\n```\n'
+          tail -80 "$D/tests.out"
+          printf '\n```\n'
+        } >> "$D/codex.prompt.md"
+      fi
+    fi
     SCHEMA="$(dirname "$0")/codex-review-schema.json"
+    mkdir -p "$D/tmp"
     log "CODEX_START"
-    ( cd "$TREE" && "$CODEX_BIN" exec --json --sandbox read-only \
+    ( cd "$TREE" && TMPDIR="$D/tmp" "$CODEX_BIN" exec --json --sandbox read-only \
         -m "$CODEX_MODEL" -c model_reasoning_effort="$CODEX_EFFORT" \
         --output-schema "$SCHEMA" --output-last-message "$D/codex.json" \
         - < "$D/codex.prompt.md" > "$D/codex.jsonl" 2> "$D/codex.err" )
@@ -178,8 +251,8 @@ if [ "$CODEX_OK" -eq 1 ] && [ "$FORCE_PANEL" -eq 0 ]; then
     printf '{"verdict":"stale","reviewed":"%s","head":"%s","phase":"end","gate":"codex"}\n' "$SHA" "$HEAD_AT_END" > "$D/gate-verdict.json"
     exit 2
   fi
-  printf '{"verdict":"ok","gate":"codex","reviewed":"%s","round":%s,"model":"%s","effort":"%s","artifacts":"%s"}\n' \
-    "$SHA" "$ROUND" "$CODEX_MODEL" "$CODEX_EFFORT" "$D" > "$D/gate-verdict.json"
+  printf '{"verdict":"ok","gate":"codex","reviewed":"%s","round":%s,"model":"%s","effort":"%s","scope_contract":"%s","test_evidence":"%s","artifacts":"%s"}\n' \
+    "$SHA" "$ROUND" "$CODEX_MODEL" "$CODEX_EFFORT" "$SCOPED" "$TEST_EVIDENCE" "$D" > "$D/gate-verdict.json"
   log "GATE=codex OK. Panel NOT run (that is the point — it costs ~36 min and ~\$17 for breadth, not depth)."
   exit 0
 fi

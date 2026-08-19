@@ -15,6 +15,37 @@ run materially different harness code against **one shared ledger** with no way 
 gate itself gained the missing half below — attesting the *acting* process's own version, not only
 versions already recorded in the ledger — in DER-2779.
 
+## [0.8.7] — 2026-08-19
+
+**`run-gate.sh` lost its scope contract to `install.sh` and nothing noticed for a day** (DER-4055).
+
+The `--contract` (§0.3 scope block) and `--tests` (§0.4 pre-sandbox test evidence) flags were written on
+2026-08-15 for the pre-beta gate wave and shipped **only into `~/.claude`** — never committed here.
+`install.sh` is a one-way `cp -R skills/. $DEST/skills/`, so its first run on 2026-08-18 copied the
+pre-W0 file back over them. Measured: every gate prompt from #1333 through #1345 carries
+`in_scope` / `known_dependent_units` / `ship_blocking_rule`; every prompt from #1353 onward carries
+**zero**, and the prompt shrank from ~9–21 KB to ~6–7 KB. Three units (#1353, #1354, #1356) were gated
+with no scope contract at all, and one of the P1s that parked #1353 was a scoping its own diff disclosed.
+
+Nothing exposed it. An unscoped round exits 0 and returns a well-formed, high-confidence findings payload
+shaped exactly like a scoped one — `gate-verdict.json` could not distinguish the two.
+
+- **Restored** `--contract FILE` and `--tests "<vitest args>"`, plus the `TMPDIR` redirect for the codex
+  leg, byte-for-byte as they ran on #1333–#1345.
+- **The receipt now names its own briefing.** `gate-verdict.json` carries `scope_contract`
+  (`applied` | `absent`) and `test_evidence` (`attached-exit<N>` | `skipped-wrong-sha` | `absent`), and a
+  round with no contract logs a loud `CONTRACT_ABSENT`. The question "was this round briefed?" had no
+  answer on any surface before; now it is in the artifact the recorder already reads.
+- **Five controls in `run-gate.test.mjs`**, each mutation-proved to return the failing answer: dropping
+  the `--contract` case (the exact revert shape) kills 2; hardcoding `scope_contract=applied` kills the
+  negative control; removing the `--tests` sha guard kills 1; flipping `STALE_AT_START` to `exit 0`
+  kills 2. CI already runs this suite, so the same revert now reds here instead of in a review round.
+
+**Correction to DER-4055 as filed:** `STALE_AT_START` does *not* return exit 0. It returns 2, it always
+has, and the pre-existing "refuses to START" test covered it — verified with a stubbed `gh` reporting a
+head that differs from `--sha`, and re-verified by mutating the exit code and watching two tests fail.
+Only the scope-contract half of that issue was real.
+
 ## [0.8.6] — 2026-08-18
 
 Round 5 of the pre-PR gate (`turn.completed = 1`, 67 command executions, verdict **not ready**: 2×P1, 4×P2)

@@ -61,9 +61,18 @@ async function scenario(opts = {}) {
   await mkdir(tree, { recursive: true });
   const bin = await fakeBin(dir, opts);
   const runner = await fakeRunner(dir);
+  // `contract: "<text>"` writes a contract file and passes --contract for it. Kept beside the other
+  // stubs so a scenario states its scope in one place rather than juggling paths in extraArgs.
+  const contractArgs = [];
+  if (opts.contract) {
+    const cf = join(dir, "contract.md");
+    await writeFile(cf, opts.contract, "utf8");
+    contractArgs.push("--contract", cf);
+  }
   const res = spawnSync("bash", [GATE,
     "--pr", "1293", "--repo", "o/r", "--sha", opts.sha ?? SHA_A, "--tree", tree,
     "--round", "1", "--issue", "DER-1", "--runner", runner,
+    ...contractArgs,
     ...(opts.extraArgs ?? []),
   ], {
     encoding: "utf8",
@@ -200,5 +209,86 @@ test("run-gate: drops a REVIEW-TARGET identity file in the tree", async () => {
   const rt = await readFile(join(dir, "tree", "REVIEW-TARGET"), "utf8");
   assert.match(rt, /pr=1293/);
   assert.match(rt, new RegExp(`reviewed_sha=${SHA_A}`), "lens trees were POOLED across PRs; the tree name lies, so the identity must be IN the tree");
+  await rm(dir, { recursive: true, force: true });
+});
+
+// ── DER-4055: the scope contract (§0.3) and test evidence (§0.4) ──────────────────────────────────
+// These flags shipped 2026-08-15 into ~/.claude and were never committed here, so `install.sh` —
+// a one-way `cp -R skills/. $DEST/skills/` — reverted them on its next run. Three units were then
+// gated with no in_scope / known_dependent_units / ship_blocking_rule for a day, and no surface
+// showed it: an unscoped round exits 0 with a well-formed high-confidence payload. These controls
+// are what make the same revert red in CI rather than in a review round.
+
+const CONTRACT_BODY = [
+  "in_scope: the widget loader and its two callers",
+  "known_dependent_units: DER-9999 (the other loader — filed, named in the body)",
+].join("\n");
+
+test("run-gate: --contract appends the scope block and the RECEIPT says it was applied", async () => {
+  const { res, verdict, D, dir } = await scenario({
+    codex: CODEX_LIVE,
+    contract: CONTRACT_BODY,
+  });
+  assert.equal(res.status, 0, res.stderr);
+  const prompt = await readFile(join(D, "codex.prompt.md"), "utf8");
+  assert.match(prompt, /in_scope: the widget loader/, "the unit's own scope must reach the reviewer");
+  assert.match(prompt, /known_dependent_units: DER-9999/);
+  assert.match(prompt, /ship_blocking_rule: a P1 must demonstrate/,
+    "the downgrade rule is the half that stops an already-owned follow-up arriving as a P1");
+  assert.equal(verdict.scope_contract, "applied",
+    "the receipt must be able to state that the round WAS briefed — that is the whole DER-4055 fix");
+  assert.match(res.stdout, /CONTRACT_APPENDED/);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("run-gate: CONTROL — with NO --contract the block is absent and the receipt SAYS so", async () => {
+  // The control that can return the failing answer. If run-gate.sh is ever reverted to a build
+  // without --contract, the test above fails; if the flag survives but silently no-ops, this one
+  // catches it by pinning the negative. Both directions were unobservable on 2026-08-18.
+  const { res, verdict, D, dir } = await scenario({ codex: CODEX_LIVE });
+  assert.equal(res.status, 0, res.stderr);
+  const prompt = await readFile(join(D, "codex.prompt.md"), "utf8");
+  assert.doesNotMatch(prompt, /ship_blocking_rule/, "an unbriefed round must not look briefed");
+  assert.equal(verdict.scope_contract, "absent");
+  assert.match(res.stdout, /CONTRACT_ABSENT/,
+    "silence is what let three units gate unscoped for a day; the unscoped state must be LOUD");
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("run-gate: --contract naming a missing file is a hard error, never a silent unscoped gate", async () => {
+  const { res, dir } = await scenario({
+    codex: CODEX_LIVE,
+    extraArgs: ["--contract", "/nonexistent/contract.md"],
+  });
+  assert.equal(res.status, 1, "a named-but-absent contract must refuse, not fall through to an unscoped review");
+  assert.match(res.stdout, /CONTRACT_MISSING/);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("run-gate: --tests refuses to attach evidence from a tree that is not at the reviewed sha", async () => {
+  // The scenario tree is not a git checkout, so `git rev-parse HEAD` yields nothing — which is
+  // exactly the "tree HEAD is not the reviewed sha" case. Attaching a green suite run against the
+  // wrong code is a green from an adjacent question.
+  const { res, verdict, D, dir } = await scenario({
+    codex: CODEX_LIVE,
+    extraArgs: ["--tests", "packages/web/src/thing.test.ts"],
+  });
+  assert.equal(res.status, 0, res.stderr);
+  assert.match(res.stdout, /TESTS_SKIPPED/);
+  assert.equal(verdict.test_evidence, "skipped-wrong-sha");
+  const prompt = await readFile(join(D, "codex.prompt.md"), "utf8");
+  assert.doesNotMatch(prompt, /Executed test evidence/,
+    "no evidence section may appear when the suites were never run at the reviewed head");
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("run-gate: STALE_AT_START exits 2 — the refusal code, not the success code", async () => {
+  // DER-4055 was filed claiming this path returns 0. It does not, and never did: measured here with
+  // a `gh` that reports a DIFFERENT head than --sha. Pinned by exact code because "non-zero" would
+  // not distinguish exit 1 (usage) from exit 2 (no usable verdict), and the caller branches on it.
+  const { res, verdict, dir } = await scenario({ codex: CODEX_LIVE, ghHeads: [SHA_B] });
+  assert.equal(res.status, 2, "a gate that refuses to start must report 'no usable verdict', not success");
+  assert.equal(verdict.verdict, "stale");
+  assert.equal(verdict.phase, "start");
   await rm(dir, { recursive: true, force: true });
 });
