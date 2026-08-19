@@ -131,6 +131,21 @@ EOF
 
 log() { echo "[$(date -u +%H:%M:%SZ)] $*" | tee -a "$D/driver.log"; }
 
+# ── the §0.3 scope contract, appended to ONE prompt ────────────────────────────────────────────────
+# A function rather than an inline block because it has two callers — the codex leg and every panel
+# lens. It was codex-only until 2026-08-19, so a round that fell back to the panel reviewed UNSCOPED
+# while `scope_contract: applied` was still recorded: the fallback quietly reproduced the very defect
+# (DER-4055) the flag exists to prevent, and on the leg that costs ~$17 rather than ~$0.
+append_contract() {
+  local target="$1"
+  [ -n "$CONTRACT" ] || return 1
+  {
+    printf '\n\n## Review scope contract (binding — generated from the unit contract table)\n\n'
+    cat "$CONTRACT"
+    printf '\n\nship_blocking_rule: a P1 must demonstrate either (a) a regression introduced by THIS diff, or (b) a violated acceptance criterion of THIS unit'"'"'s contract table above. A finding in an untouched file already assigned to a listed known_dependent_unit is reported as "planned follow-up" severity P2, not P1 — unless this diff worsens it or falsely claims to fix it. Findings outside in_scope are still reported, at the severity the rule assigns.\n'
+  } >> "$target"
+}
+
 # ── the head re-bind ──────────────────────────────────────────────────────────────────────────────
 # THE check the lens cannot perform. Reads GitHub, not the local clone, so it can actually return the
 # failing answer. Called at gate start AND before any verdict is accepted.
@@ -189,11 +204,7 @@ else
         log "CONTRACT_MISSING — --contract $CONTRACT is empty or absent. Refusing an unscoped gate."
         exit 1
       fi
-      {
-        printf '\n\n## Review scope contract (binding — generated from the unit contract table)\n\n'
-        cat "$CONTRACT"
-        printf '\n\nship_blocking_rule: a P1 must demonstrate either (a) a regression introduced by THIS diff, or (b) a violated acceptance criterion of THIS unit'"'"'s contract table above. A finding in an untouched file already assigned to a listed known_dependent_unit is reported as "planned follow-up" severity P2, not P1 — unless this diff worsens it or falsely claims to fix it. Findings outside in_scope are still reported, at the severity the rule assigns.\n'
-      } >> "$D/codex.prompt.md"
+      append_contract "$D/codex.prompt.md"
       SCOPED="applied"
       log "CONTRACT_APPENDED $(wc -c < "$CONTRACT")B from $CONTRACT"
     else
@@ -298,6 +309,9 @@ memgate() {
 for L in $LENSES; do
   node "$RUNNER" panel-prompt --issue "$ISSUE" --lens "$L" --diff "$D/diff" > "$D/$L.prompt.md" 2>/dev/null || true
   if [ ! -s "$D/$L.prompt.md" ]; then log "LENS_SKIP $L — empty prompt"; continue; fi
+  # Same scope contract the codex leg gets. A lens told nothing about in_scope reports an already-owned
+  # dependent unit's file as a P1 exactly like an unbriefed codex does.
+  if append_contract "$D/$L.prompt.md"; then SCOPED="applied"; log "CONTRACT_APPENDED_LENS $L"; fi
   memgate "$L"
   log "LENS_START $L"
   STARTED="$STARTED $L"
@@ -343,7 +357,7 @@ if [ "$USABLE" -lt 2 ]; then
   printf '{"verdict":"incomplete","usable_lenses":%s,"missing":"%s"}\n' "$USABLE" "${MISSING# }" > "$D/gate-verdict.json"
   exit 2
 fi
-printf '{"verdict":"ok","gate":"panel","reviewed":"%s","round":%s,"usable_lenses":%s,"artifacts":"%s"}\n' \
-  "$SHA" "$ROUND" "$USABLE" "$D" > "$D/gate-verdict.json"
+printf '{"verdict":"ok","gate":"panel","reviewed":"%s","round":%s,"usable_lenses":%s,"scope_contract":"%s","test_evidence":"%s","artifacts":"%s"}\n' \
+  "$SHA" "$ROUND" "$USABLE" "$SCOPED" "$TEST_EVIDENCE" "$D" > "$D/gate-verdict.json"
 log "GATE=panel OK usable=$USABLE. Record with review-panel --lens-file <lens>=<file> plus --codex-waived \"<why codex could not run>\"."
 exit 0

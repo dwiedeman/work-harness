@@ -292,3 +292,48 @@ test("run-gate: STALE_AT_START exits 2 — the refusal code, not the success cod
   assert.equal(verdict.phase, "start");
   await rm(dir, { recursive: true, force: true });
 });
+
+test("run-gate: PANEL lenses get the SAME scope contract as codex", async () => {
+  // Added 2026-08-19. The contract was appended to the codex prompt only, so a round that fell back
+  // to the panel — the leg that costs ~$17 rather than ~$0 — reviewed UNSCOPED while the receipt still
+  // said `scope_contract: applied`. Both legs now call one `append_contract`, and this pins it: codex
+  // is dead here, so the panel is what runs, and every lens prompt must carry the block.
+  const CLAUDE_OK = [
+    "#!/bin/bash",
+    `printf '{"subtype":"success","is_error":false,"result":"%s"}' "$(head -c 3000 /dev/zero | tr '\\0' 'x')"`,
+    "exit 0",
+  ].join("\n");
+  const { res, verdict, D, dir } = await scenario({
+    codex: CODEX_DEAD,
+    claude: CLAUDE_OK,
+    contract: CONTRACT_BODY,
+    extraArgs: ["--lenses", "correctness security"],
+  });
+  assert.equal(res.status, 0, res.stderr);
+  for (const lens of ["correctness", "security"]) {
+    const prompt = await readFile(join(D, `${lens}.prompt.md`), "utf8");
+    assert.match(prompt, /in_scope: the widget loader/, `${lens} must be told what is in scope`);
+    assert.match(prompt, /ship_blocking_rule: a P1 must demonstrate/,
+      `${lens} must get the downgrade rule — without it an already-owned dependent unit's file arrives as a P1`);
+  }
+  assert.equal(verdict.gate, "panel");
+  assert.equal(verdict.scope_contract, "applied",
+    "the panel receipt must carry the same provenance the codex receipt does");
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("run-gate: CONTROL — an unbriefed PANEL round says so in its receipt", async () => {
+  const CLAUDE_OK = [
+    "#!/bin/bash",
+    `printf '{"subtype":"success","is_error":false,"result":"%s"}' "$(head -c 3000 /dev/zero | tr '\\0' 'x')"`,
+    "exit 0",
+  ].join("\n");
+  const { verdict, D, dir } = await scenario({
+    codex: CODEX_DEAD, claude: CLAUDE_OK, extraArgs: ["--lenses", "correctness security"],
+  });
+  const prompt = await readFile(join(D, "correctness.prompt.md"), "utf8");
+  assert.doesNotMatch(prompt, /ship_blocking_rule/, "no contract given means no block — the negative half");
+  assert.equal(verdict.scope_contract, "absent",
+    "a panel round with no contract must NOT record itself as briefed");
+  await rm(dir, { recursive: true, force: true });
+});

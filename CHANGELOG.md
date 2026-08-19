@@ -15,6 +15,27 @@ run materially different harness code against **one shared ledger** with no way 
 gate itself gained the missing half below — attesting the *acting* process's own version, not only
 versions already recorded in the ledger — in DER-2779.
 
+## [0.8.8] — 2026-08-19
+
+**The scope contract reached codex and not the panel** — found while preparing to run a panel-only
+round on #1358 (codex quota-walled until 08-20 14:50).
+
+0.8.7 restored `--contract` but appended the block inside the codex leg only. A round that fell back to
+the panel therefore reviewed **unscoped** — while `gate-verdict.json` still said nothing at all, since
+the panel receipt had no `scope_contract` field to carry. The fallback quietly reproduced the exact
+defect DER-4055 is about, on the leg that costs ~$17 instead of ~$0.
+
+- **One `append_contract` function, two callers.** The codex leg and every panel lens now share one
+  implementation, so the two prompts cannot drift again. A lens logs `CONTRACT_APPENDED_LENS <lens>`.
+- **The panel receipt carries `scope_contract` and `test_evidence`**, like the codex receipt.
+- **Two controls**, mutation-proved: deleting the panel-leg call reddens "PANEL lenses get the SAME
+  scope contract as codex"; the negative control pins that an unbriefed panel round records
+  `scope_contract: "absent"` rather than silently reading as briefed.
+
+Found by asking what a *fallback* round would actually send, rather than trusting that restoring the
+flag had restored the behaviour on both paths — the same "verify the sibling, not just the member the
+reporter named" rule the reviewed repo applies to families.
+
 ## [0.8.7] — 2026-08-19
 
 **`run-gate.sh` lost its scope contract to `install.sh` and nothing noticed for a day** (DER-4055).
