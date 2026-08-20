@@ -269,6 +269,33 @@ node ~/.claude/skills/prep-for-work/prep-runner.mjs calibrate plan.json \
 `--run` is required, and self-comparison is refused: a measurement cannot confirm itself. The table
 moves only when a ratio holds across **two independent runs**.
 
+### What a real run looks like
+
+From a production run (2026-08-13, 14 issues dispatched), exactly as `work-metrics.mjs` printed it:
+
+| Metric | Value |
+| --- | --- |
+| PRs merged | 8 |
+| Issues closed | 8 |
+| Leads spawned | 42 (14 distinct issues) |
+| Hand-offs | 35 |
+| Total tokens (ledger fold) | 3,869,918,152 |
+| Run duration | 46.51 h (first→last ledger event) |
+
+`work-runner.mjs usage --run <id>` prices that at **~$2,225 estimated floor** ("FLOOR ONLY" — the
+report names which models lacked rates rather than quietly excluding them). Expectation-setting: a
+10–14-issue run typically lands ~8 merged PRs over a day or two of wall clock for a few billion
+tokens of subscription-equivalent spend. If those numbers surprise you in either direction, that is
+what the metrics exist to show.
+
+### Starting from an empty repo
+
+The harness assumes an existing repo with a backlog, but greenfield works through **spec mode**: write
+a plan file (`prep-runner.mjs scaffold` → `size` → `validate`), give every unit a budget (`init-run`
+refuses a unit without one), pass the mandatory `plan-review` gate, then `init-run --spec plan.json`.
+Budget roughly an hour of planning before the first dispatch — the plan gates exist because unsized
+units are how diffs grow past the review-round cliff.
+
 ---
 
 ## Design notes worth knowing before you extend it
@@ -364,4 +391,4 @@ you do not control — including how to report a vulnerability privately.
 
 ## License
 
-TBD.
+[MIT](LICENSE).

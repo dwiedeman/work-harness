@@ -403,6 +403,7 @@ export function computeMetricsFromEvents(
   } = {},
 ) {
   let runStartedTs = null;
+  let lastEventTs = null;
   // Spec mode (2026-07-29): recorded so a spec-mode run and an issue-mode run can be compared on the
   // SAME metrics. Without it the two modes are indistinguishable in the trend table and the A/B this
   // mode was added to answer — does carving units in a plan beat filing Linear children? — is unaskable.
@@ -431,6 +432,7 @@ export function computeMetricsFromEvents(
 
   for (const e of events) {
     const ts = parseTs(e.ts);
+    if (!Number.isNaN(ts) && ts !== null && (lastEventTs === null || ts > lastEventTs)) lastEventTs = ts;
     const pr = normalizePr(e.pr);
 
     switch (e.type) {
@@ -622,6 +624,13 @@ export function computeMetricsFromEvents(
     runDir,
     runStartedTs,
     runStartedIso: runStartedTs !== null ? new Date(runStartedTs).toISOString() : null,
+    // Run duration is first→last ledger event, not "time agents were busy" — a run that idled
+    // overnight still counts the night. That is the honest wall-clock number a reader wants.
+    runEndedIso: lastEventTs !== null ? new Date(lastEventTs).toISOString() : null,
+    runDurationHours:
+      runStartedTs !== null && lastEventTs !== null && lastEventTs >= runStartedTs
+        ? round2((lastEventTs - runStartedTs) / 3_600_000)
+        : null,
     mode: runMode,
     tracking: runTracking,
     eventCount: events.length,
@@ -745,6 +754,8 @@ export function renderRunMarkdown(m) {
   const lines = [];
   lines.push(`# Run-quality report: ${m.run}`);
   if (m.runStartedIso) lines.push(`Run started: ${m.runStartedIso}`);
+  if (m.runDurationHours !== null && m.runDurationHours !== undefined)
+    lines.push(`Run duration: ${m.runDurationHours} h (first→last ledger event, ended ${m.runEndedIso})`);
   lines.push("");
   lines.push("## Summary");
   lines.push("");

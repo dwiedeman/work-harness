@@ -15,6 +15,21 @@ run materially different harness code against **one shared ledger** with no way 
 gate itself gained the missing half below — attesting the *acting* process's own version, not only
 versions already recorded in the ledger — in DER-2779.
 
+## [0.8.10] — 2026-08-20
+
+**A metrics report that never said how long the run took, and a README that said "License: TBD" over an MIT LICENSE file.**
+
+- `work-metrics.mjs` now reports **Run duration** (first→last ledger event, with the end timestamp) in
+  `renderRunMarkdown` and exposes `runEndedIso` / `runDurationHours` on the metrics object. The label is
+  honest about what it measures: a run that idled overnight still counts the night.
+- README `## License` now says MIT and links the LICENSE file — it had said "TBD.", which contradicted
+  the shipped MIT license and was the single most likely line to stop an evaluator from adopting.
+- README gained "What a real run looks like" (a pasted production metrics table with cost and duration
+  expectation-setting) and "Starting from an empty repo" (the spec-mode path for greenfield use).
+- `skills/work/SKILL.md` no longer names the maintainer's GitHub login/noreply address in the DER-1838
+  cloud-attribution note — the README's own rule says nothing in `skills/` may carry a login; the note
+  now states the proven check generically (token owner, `is_bot:false`, owner's noreply address).
+
 ## [0.8.9] — 2026-08-19
 
 **`memgate` had never once passed, and it was costing 15 minutes per lens.**
